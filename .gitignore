@@ -1,0 +1,7 @@
+build/
+intel/
+*.bak
+.DS_Store
+tools/screen_grab
+tools/window_list
+tools/host_symbol

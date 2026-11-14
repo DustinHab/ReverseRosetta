@@ -1,0 +1,218 @@
+# ReverseRosetta
+
+ReverseRosetta runs Intel (i386) Mac OS X programs on PowerPC Macs. It is a user-mode binary translator for
+Mac OS X 10.5 Leopard: it loads an i386 Mach-O program, translates its machine code to PowerPC at run time and
+passes system calls and Mach messages to the PowerPC kernel and system services. This is the reverse direction of
+Apple's Rosetta, which ran PowerPC programs on Intel Macs.
+
+> **Translated Intel code runs at up to native speed on a PowerPC G4.** Integer code reaches 102 % of the speed of the
+> same program compiled natively for PowerPC, call-heavy code 81 %, control flow 72 %, libm code 69 %, packed SSE2
+> code 67 %, floating point 59 %. A Foundation program starts in 66 ms (native: 46 ms).
+
+![Transmission 2.42 (x86_64/i386 only) running on an iBook G4](docs/transmission-on-ibook-g4.png)
+
+Transmission 2.42 is an Intel-only build (`file` lists x86_64 and i386, no ppc). Above it runs on an iBook G4 with a
+PowerPC G4 at 1.33 GHz; `ps` shows the translator process. Both windows are real captures from the same session,
+placed at their screen positions.
+
+## Performance
+
+Measured on an iBook G4 (PowerPC 7447A, 1.33 GHz). Each benchmark is a C program built twice from the same source
+with gcc-4.2 -O2: once for i386 and run translated, once natively for PowerPC. Both builds print the same result,
+which the measurement compares.
+
+| Benchmark | What it does | Translated | Native | Speed vs. native |
+|---|---|---|---|---|
+| `bench_integer` | integer arithmetic, loops, arrays: sieve, hashing, sorting, Collatz | 1932 MIPS | 1886 MIPS | **102 %** |
+| `bench_calls` | direct calls, calls through function pointers (one and changing targets), recursion | 1161 MIPS | 1427 MIPS | **81 %** |
+| `bench_control_flow` | recursion, qsort with a compare callback, a switch-table machine, strtok | 912 MIPS | 1261 MIPS | **72 %** |
+| `bench_libm` | sin, cos, exp, log, pow, atan2, fmod, floor, sqrt with x87 return values | 273 MIPS | 397 MIPS | **69 %** |
+| `bench_sse2` | packed SSE2 doubles: daxpy, dot product, complex multiply, sqrt/div, min/max, compares | 210 MIPS | 315 MIPS | **67 %** |
+| `bench_float` | matrix product, n-body with sqrt, float vectors, int/float conversions | 258 MIPS | 434 MIPS | **59 %** |
+
+MIPS is the number of i386 instructions per round (counted by the interpreter) divided by the time per round; the
+time per round is the slope between a short and a long run, so startup costs drop out. The native column uses the
+same instruction count with the native run time, so the last column is the ratio of the run times. Fastest of 3
+runs; the values vary by a few percent between measurement runs. `tests/measure_all.sh` repeats the measurement.
+
+Startup time, translated against native, fastest of 7 runs with the translation cache filled:
+
+| Program | Translated | Native |
+|---|---|---|
+| hello world (libSystem) | 22 ms | 12 ms |
+| CoreFoundation test | 40 ms | 18 ms |
+| Objective-C test | 28 ms | 14 ms |
+| Foundation test | 66 ms | 46 ms |
+| `/bin/ls -la /usr/lib` (i386 part of the universal binary) | 76 ms | 42 ms |
+
+## What runs
+
+- Command-line programs: the i386 parts of the universal binaries in Mac OS X (`ls`, `cat`, `wc`, `sort`, `grep`,
+  `awk`, `sed`, `find`, `bc`) produce byte-identical output to the native PowerPC versions. Intel `perl` runs with
+  libperl from the update.
+- C programs with libSystem, libm, pthreads, signals, sockets, `select`/`poll`.
+- CoreFoundation, Objective-C and Foundation, taken from Apple's Intel frameworks (see below), including
+  `NSThread` and `NSOperationQueue`.
+- Cocoa programs with windows, events and text: Calculator.app (Intel build from the 10.5.8 update) and Transmission
+  2.42. Text rendering goes through the system's PowerPC font server; font metrics, glyph outlines and paths are
+  identical to a native build (`tests/fonts.c`).
+- x87, SSE and SSE2 (scalar and packed double), including Apple's Intel vDSP/vForce code.
+
+![Calculator.app, Intel build from the 10.5.8 update, translated](docs/calculator.png)
+
+## How it works
+
+- An interpreter runs code the first few times; blocks that run often are translated to PowerPC (block chaining,
+  inner jumps, lazily computed x86 flags, x87 and SSE values kept in PowerPC floating-point registers within a block,
+  AltiVec for byte swapping and packed bitwise operations, native stubs for frequent libSystem string and math
+  functions).
+- Translated code is stored in a translation cache under `~/Library/Caches/rosetta` and mapped back in on the next
+  start of the same program.
+- System calls (BSD and Mach traps) are converted between the byte orders. Mach messages are converted header by
+  header; MIG messages are converted by MIG itself (NDR record). Messages to the font server (ATS) are converted
+  field by field from a layout table.
+- The i386 dyld, libSystem and frameworks run translated. They talk to the native PowerPC services: WindowServer,
+  ATSServer, securityd, launchd, syslogd.
+- Threads run one at a time under a global lock; a watchdog thread interrupts long loops for signal delivery.
+
+[DESIGN.md](DESIGN.md) describes the design, the measurements behind each decision and the problems found on the way.
+
+## Requirements
+
+- A PowerPC Mac with a G4 or G5 (AltiVec is required; the build uses -mcpu=7450) and Mac OS X 10.5.8. Developed and
+  tested on an iBook G4 (7447A, 1.33 GHz, 1.25 GB RAM) with Mac OS X 10.5.9 (build 9L31b, based on 10.5.8).
+  G3 Macs are not supported. G5 Macs are untested; the optimizations are tuned to the costs of the 7447A.
+- The Intel frameworks come from the 10.5.8 update and talk to the system's own WindowServer, font server and
+  securityd. Earlier Leopard versions are untested and likely to fail; Mac OS X 10.4 is not supported.
+- Xcode 3.1 with gcc-4.2 and the Mac OS X 10.5 SDK. The SDK contains the i386 stub libraries needed to link i386
+  test programs.
+- About 3 GB of free disk space for the Intel libraries.
+
+## Getting the Intel libraries
+
+Mac OS X 10.5 on PowerPC contains i386 code only for a few command-line tools and system libraries. The Intel
+frameworks (CoreFoundation, Foundation, AppKit, CoreGraphics ...) come from Apple's Mac OS X 10.5.8 Combo Update,
+which is a universal package. It is unpacked, not installed; the running system is not changed. No Apple software is
+part of this repository.
+
+1. Download `MacOSXUpdCombo10.5.8.dmg` (797 MB) from Apple's support download page "Mac OS X 10.5.8 Combo Update"
+   (support.apple.com/106460) and put it into `intel/download/`.
+2. Unpack it (shows the package signature, which chains up to Apple Root CA):
+
+   ```
+   tools/intel_unpack.sh intel/download/MacOSXUpdCombo10.5.8.dmg
+   ```
+
+3. Build the Intel root `intel/root` from it. The translator redirects the guest's file accesses below
+   `/System/Library`, `/usr/lib` and `/Library` to this directory when a file exists there:
+
+   ```
+   tools/intel_root.sh            # thin i386 copies of every Mach-O file of the update
+   tools/intel_links.sh           # symbolic links of the framework bundles
+   tools/intel_prune.sh           # remove what the system already provides as i386 (libSystem, libobjc, dyld)
+   tools/intel_replacements.sh    # vImage, libBLAS, libLAPACK replacements (missing from the update)
+   tools/intel_umbrellas.sh       # umbrella frameworks (CoreServices, ApplicationServices, Carbon, Cocoa)
+   tools/intel_rebase.sh          # fixed load addresses for all i386 libraries
+   tools/intel_prebind.sh         # prebinding (binding in dyld for Foundation: 14.3 ms -> 1.8 ms)
+   tools/intel_patch.sh           # three patches, see below
+   ```
+
+   Run `tools/intel_patch.sh` again after every `intel_rebase.sh` or `intel_prebind.sh`.
+
+The three patches change copies in `intel/root`, never the system. Each one checks the original bytes and keeps a
+backup in `intel/backup/`:
+
+1. CoreGraphics 409.3 (10.5.8) refuses to connect to the WindowServer of a different version (409.8 on the test
+   machine). The version check is relaxed.
+2. Security.framework sends its protocol version to the PowerPC securityd in a form that securityd's byte-swapping
+   mode reads correctly.
+3. LaunchServices waits forever for the EFI device tree entry (`IODeviceTree:/efi`), which a PowerPC Mac does not
+   have. The wait is skipped.
+
+## Building
+
+```
+./build.sh          # builds build/rosetta
+./build.sh tests    # also the test programs, each as i386 and as native PowerPC build
+```
+
+## Running programs
+
+```
+build/rosetta /usr/bin/sort -n numbers.txt
+build/rosetta build/hello a b
+```
+
+Programs with windows need the login session: start them from Terminal on the Mac. From an SSH login,
+`tests/in_session.sh SCRIPT` runs a shell script inside the login session (`launchctl submit` on the session's
+launchd, no root needed).
+
+Application bundles are assembled in `intel/apps/`:
+
+```
+tools/intel_app.sh Calculator          # Intel build from the Combo Update plus resources from /Applications
+tools/app_deps.sh Calculator           # i386 libraries that are still missing
+tools/stubs_rebuild.sh                 # stub libraries for libraries the update does not contain
+build/rosetta intel/apps/Calculator.app/Contents/MacOS/Calculator
+```
+
+Third-party programs that are Intel-only:
+
+```
+tools/thirdparty_unpack.sh Transmission-2.42.dmg Transmission
+tools/intel_umbrellas.sh Quartz
+tools/stubs_rebuild.sh
+tests/transmission_setup.sh            # Transmission: no router port mapping, no update check
+build/rosetta intel/apps/Transmission.app/Contents/MacOS/Transmission
+```
+
+Stub libraries stand in for i386 libraries that are neither in the update nor in the system (CoreVideo, QuickTime,
+QTKit, SpeechRecognition ...). Their functions report `rosetta-stub: NAME missing` on the first call and return an
+error code.
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `ROSETTA_INTEL=DIR` | Intel root (default: `intel/root` next to the `build` directory); `-` disables the redirection |
+| `ROSETTA_INTERP=1` | interpreter only, no translation |
+| `ROSETTA_THRESHOLD=N` | number of executions before a block is translated |
+| `ROSETTA_NO_CACHE=1` | do not read or write the translation cache |
+| `ROSETTA_CACHE_SHOW=1` | report why a cached translation is used or rejected (`=2`: every new block) |
+| `ROSETTA_STATS=1` | translator counters and times at exit |
+| `ROSETTA_LOG=1` | log of system calls and Mach traps |
+| `ROSETTA_ATS_LOG=1` | every message to the font server, in the server's byte order |
+| `ROSETTA_HALT=ADDR,...` | interpreter only; show registers and stack at these guest addresses |
+
+`ROSETTA_NO_*` switches turn off single optimizations; they are listed at the top of `jit.c`.
+
+## Tests
+
+```
+tests/run_tests.sh      # 33 comparisons against native builds, real Intel output or the interpreter
+tests/measure_all.sh    # the benchmark loads above
+```
+
+`run_tests.sh` compares each test program translated against the same source built for PowerPC (or against the
+interpreter, or against output recorded on an Intel Mac). The font test runs only when a login session exists.
+
+## Limitations
+
+- i386 only; x86_64 code is not supported.
+- Synchronous faults of the guest (SIGSEGV, SIGBUS, SIGILL, SIGFPE) are not yet passed to the guest's signal handlers.
+- Threads do not run in parallel (global lock). The test machine has one CPU core.
+- Multiprocessor Macs (dual G4, dual and quad G5) are untested. The handshake between the watchdog thread and
+  running translated code assumes a single CPU and uses no memory barriers; rare crashes or hangs are possible there.
+- `kqueue` is missing; libevent falls back to `poll`/`select`.
+- Accessibility (System Events, assistive devices) does not see the windows of translated programs.
+- Frameworks that the 10.5.8 update does not contain as i386 (QuickTime, QTKit, CoreVideo, the Calculate engine of
+  Calculator ...) are stubs; features that need them do not work. Calculator shows its window but does not compute.
+- Font server: the reply to a file-reference request (FSRef) is not converted yet; a few rarely used message types
+  are passed through unconverted and reported once.
+
+## License
+
+All rights reserved. The source is published for viewing only; see [LICENSE](LICENSE).
+
+Apple, Mac, Mac OS X, macOS and Rosetta are trademarks of Apple Inc. This project is not affiliated with or
+endorsed by Apple. Transmission is a trademark of its respective owners.

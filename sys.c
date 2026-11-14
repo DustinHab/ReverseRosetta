@@ -1,0 +1,1428 @@
+/* sys.c - BSD system calls of the guest.
+ *
+ * i386 Darwin: "int $0x80" or sysenter, eax = number, arguments from esp+4 (or ecx+4), 64-bit arguments in two
+ * stack slots (low word first). Result in eax (64-bit results also in edx), error: CF and eax = errno
+ * (BSD numbers, flag and ioctl values are the same on both sides). Pointers point into the same address space;
+ * structures are converted field by field into the guest byte order. Layouts of the i386 structures:
+ * tests/raw_layout.c (built by the i386 compiler, printed in the interpreter).
+ */
+#include "sys.h"
+#include "interp.h"
+#include "macho.h"
+#include "mach_msg.h"
+#include "jit.h"
+#include "thread.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <sys/syscall.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <sys/mman.h>
+#include <sys/uio.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <poll.h>
+#include <sys/sysctl.h>
+#include <sys/mount.h>
+#include <sys/attr.h>
+#include <sys/wait.h>
+#include <termios.h>
+#include <signal.h>
+#include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <mach/mach_time.h>
+
+int g_log;                        /* ROSETTA_LOG: print system calls */
+
+/* ---------- shared read-only file mappings ----------
+ * mmap(MAP_PRIVATE) of a file whose pages are already in memory costs, under Leopard, time per page of the whole
+ * file (the kernel protects all of them for later copy-on-write, vm_object_copy_delayed): Foundation's __TEXT
+ * ~200 us, with MAP_SHARED 5 us (tools/mmap_cost.c). Without PROT_WRITE the guest sees no difference; this is how
+ * dyld maps __TEXT and __LINKEDIT. If the guest wants to write later (mprotect, vm_protect: text relocations of a
+ * moved library), the range first becomes private memory with the same content. ROSETTA_NO_SHARED=1 */
+#define SHARED_N 1024
+static struct { uint32_t start, end; int prot; } g_shared[SHARED_N];
+static int g_nshared, g_shared_on = -1;
+static unsigned long g_st_shared, g_st_private;
+
+static void shared_forget(uint32_t a, uint32_t len)
+{
+    int i;
+    for (i = 0; i < g_nshared; i++)
+        if (g_shared[i].start >= a && g_shared[i].end <= a + len) g_shared[i--] = g_shared[--g_nshared];
+}
+
+/* before write access to [a, a + len): replace shared mappings in it with private copies */
+void sys_make_private(uint32_t a, uint32_t len)
+{
+    int i;
+    for (i = 0; i < g_nshared; i++) {
+        uint32_t s = g_shared[i].start, n = g_shared[i].end - s;
+        void *copy;
+        if (s >= a + len || g_shared[i].end <= a) continue;
+        if ((copy = malloc(n)) == 0) continue;
+        mprotect((void *)(uintptr_t)s, n, PROT_READ);
+        memcpy(copy, (void *)(uintptr_t)s, n);
+        if (mmap((void *)(uintptr_t)s, n, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0) == (void *)(uintptr_t)s) {
+            memcpy((void *)(uintptr_t)s, copy, n);
+            mprotect((void *)(uintptr_t)s, n, g_shared[i].prot);
+            g_st_private++;
+        }
+        free(copy);
+        g_shared[i--] = g_shared[--g_nshared];
+    }
+}
+
+static uint32_t g_arg_base;
+
+static inline uint32_t arg(int i) { return ld32(g_arg_base + 4 + 4 * (uint32_t)i); }
+static inline uint64_t arg64(int i) { return (uint64_t)arg(i) | (uint64_t)arg(i + 1) << 32; }
+#define PTR_ARG(i) ((void *)(uintptr_t)arg(i))
+
+static void set_result(Cpu *c, uint32_t r, int errnum)
+{
+    uint32_t f = flags_fetch(c) & ~F_CF;
+    if (errnum == EINTR && getenv("ROSETTA_HPROFILE")) fprintf(stderr, "rosetta: EINTR for the guest\n");
+    if (errnum) { c->r[EAX] = (uint32_t)errnum; f |= F_CF; }
+    else c->r[EAX] = r;
+    flags_set(c, f);
+}
+
+#define HOST(expr) do { long r_ = (long)(expr); set_result(c, (uint32_t)r_, r_ == -1 ? errno : 0); } while (0)
+
+/* Blocking host calls release the guest thread lock (thread.c) so other threads run in the meantime. The
+   arguments are already evaluated when the wrapper is called; afterwards g_arg_base (another thread may have made
+   system calls in the meantime) and errno hold their previous values again */
+#define FREE_ON uint32_t from_ = g_arg_base; Cpu *fc_ = glock_release()
+#define FREE_OFF do { int e_ = errno; glock_acquire(fc_); g_arg_base = from_; errno = e_; } while (0)
+static ssize_t f_read(int d, void *b, size_t n) { ssize_t r; FREE_ON; r = read(d, b, n); FREE_OFF; return r; }
+static ssize_t f_write(int d, const void *b, size_t n) { ssize_t r; FREE_ON; r = write(d, b, n); FREE_OFF; return r; }
+static ssize_t f_readv(int d, const struct iovec *v, int n) { ssize_t r; FREE_ON; r = readv(d, v, n); FREE_OFF; return r; }
+static ssize_t f_writev(int d, const struct iovec *v, int n) { ssize_t r; FREE_ON; r = writev(d, v, n); FREE_OFF; return r; }
+static int f_select(int n, fd_set *a, fd_set *b, fd_set *e, struct timeval *t)
+{ int r; FREE_ON; r = select(n, a, b, e, t); FREE_OFF; return r; }
+static int f_poll(struct pollfd *f, unsigned n, int t) { int r; FREE_ON; r = poll(f, n, t); FREE_OFF; return r; }
+static pid_t f_wait4(pid_t p, int *st, int o) { pid_t r; FREE_ON; r = wait4(p, st, o, 0); FREE_OFF; return r; }
+static int f_accept(int d, struct sockaddr *a, socklen_t *l) { int r; FREE_ON; r = accept(d, a, l); FREE_OFF; return r; }
+static int f_connect(int d, const struct sockaddr *a, socklen_t l) { int r; FREE_ON; r = connect(d, a, l); FREE_OFF; return r; }
+static ssize_t f_recvfrom(int d, void *b, size_t n, int fl, struct sockaddr *a, socklen_t *l)
+{ ssize_t r; FREE_ON; r = recvfrom(d, b, n, fl, a, l); FREE_OFF; return r; }
+static ssize_t f_sendto(int d, const void *b, size_t n, int fl, const struct sockaddr *a, socklen_t l)
+{ ssize_t r; FREE_ON; r = sendto(d, b, n, fl, a, l); FREE_OFF; return r; }
+static ssize_t f_recvmsg(int d, struct msghdr *m, int fl) { ssize_t r; FREE_ON; r = recvmsg(d, m, fl); FREE_OFF; return r; }
+static ssize_t f_sendmsg(int d, const struct msghdr *m, int fl) { ssize_t r; FREE_ON; r = sendmsg(d, m, fl); FREE_OFF; return r; }
+static long f_semwait(int n, int a, int b, int d, int e, long f, int g)
+{ long r; FREE_ON; r = syscall(n, a, b, d, e, f, g); FREE_OFF; return r; }
+static void f_short_wait(void) { FREE_ON; usleep(1000); FREE_OFF; }
+
+void sys_signal(Cpu *c, int sig, const char *reason)
+{
+    state_show(c, reason);
+    fprintf(stderr, "rosetta: signal %d to the program, terminated\n", sig);
+    c->finished = 1;
+    c->end_code = 128 + sig;
+}
+
+/* ---------- structures ---------- */
+
+static void ts_write(uint32_t a, struct timespec t) { st32(a, (uint32_t)t.tv_sec); st32(a + 4, (uint32_t)t.tv_nsec); }
+
+static void stat_write(uint32_t a, const struct stat *s)
+{
+    memset((void *)(uintptr_t)a, 0, 0x60);
+    st32(a + 0x00, (uint32_t)s->st_dev);
+    st32(a + 0x04, (uint32_t)s->st_ino);
+    st16(a + 0x08, s->st_mode);
+    st16(a + 0x0a, s->st_nlink);
+    st32(a + 0x0c, s->st_uid);
+    st32(a + 0x10, s->st_gid);
+    st32(a + 0x14, (uint32_t)s->st_rdev);
+    ts_write(a + 0x18, s->st_atimespec);
+    ts_write(a + 0x20, s->st_mtimespec);
+    ts_write(a + 0x28, s->st_ctimespec);
+    st64(a + 0x30, (uint64_t)s->st_size);
+    st64(a + 0x38, (uint64_t)s->st_blocks);
+    st32(a + 0x40, (uint32_t)s->st_blksize);
+    st32(a + 0x44, s->st_flags);
+    st32(a + 0x48, s->st_gen);
+}
+
+static void stat64_write(uint32_t a, const struct stat64 *s)
+{
+    memset((void *)(uintptr_t)a, 0, 0x6c);
+    st32(a + 0x00, (uint32_t)s->st_dev);
+    st16(a + 0x04, s->st_mode);
+    st16(a + 0x06, s->st_nlink);
+    st64(a + 0x08, s->st_ino);
+    st32(a + 0x10, s->st_uid);
+    st32(a + 0x14, s->st_gid);
+    st32(a + 0x18, (uint32_t)s->st_rdev);
+    ts_write(a + 0x1c, s->st_atimespec);
+    ts_write(a + 0x24, s->st_mtimespec);
+    ts_write(a + 0x2c, s->st_ctimespec);
+    ts_write(a + 0x34, s->st_birthtimespec);
+    st64(a + 0x3c, (uint64_t)s->st_size);
+    st64(a + 0x44, (uint64_t)s->st_blocks);
+    st32(a + 0x4c, (uint32_t)s->st_blksize);
+    st32(a + 0x50, s->st_flags);
+    st32(a + 0x54, s->st_gen);
+}
+
+static void statfs_write(uint32_t a, const struct statfs *s)
+{
+    memset((void *)(uintptr_t)a, 0, 0x110);
+    st16(a + 0x00, 0);
+    st16(a + 0x02, 0);
+    st32(a + 0x04, (uint32_t)s->f_bsize);
+    st32(a + 0x08, (uint32_t)s->f_iosize);
+    st32(a + 0x0c, (uint32_t)s->f_blocks);
+    st32(a + 0x10, (uint32_t)s->f_bfree);
+    st32(a + 0x14, (uint32_t)s->f_bavail);
+    st32(a + 0x18, (uint32_t)s->f_files);
+    st32(a + 0x1c, (uint32_t)s->f_ffree);
+    st32(a + 0x20, (uint32_t)s->f_fsid.val[0]);
+    st32(a + 0x24, (uint32_t)s->f_fsid.val[1]);
+    st32(a + 0x28, s->f_owner);
+    st16(a + 0x2e, (uint32_t)s->f_type);
+    st32(a + 0x30, (uint32_t)s->f_flags);
+    memcpy((void *)(uintptr_t)(a + 0x3c), s->f_fstypename, 15);
+    memcpy((void *)(uintptr_t)(a + 0x4b), s->f_mntonname, 90);
+    memcpy((void *)(uintptr_t)(a + 0xa5), s->f_mntfromname, 90);
+}
+
+static void statfs64_write(uint32_t a, const struct statfs64 *s)
+{
+    memset((void *)(uintptr_t)a, 0, 0x878);
+    st32(a + 0x00, s->f_bsize);
+    st32(a + 0x04, (uint32_t)s->f_iosize);
+    st64(a + 0x08, s->f_blocks);
+    st64(a + 0x10, s->f_bfree);
+    st64(a + 0x18, s->f_bavail);
+    st64(a + 0x20, s->f_files);
+    st64(a + 0x28, s->f_ffree);
+    st32(a + 0x30, (uint32_t)s->f_fsid.val[0]);
+    st32(a + 0x34, (uint32_t)s->f_fsid.val[1]);
+    st32(a + 0x38, s->f_owner);
+    st32(a + 0x3c, s->f_type);
+    st32(a + 0x40, s->f_flags);
+    st32(a + 0x44, s->f_fssubtype);
+    memcpy((void *)(uintptr_t)(a + 0x48), s->f_fstypename, 16);
+    memcpy((void *)(uintptr_t)(a + 0x58), s->f_mntonname, 1024);
+    memcpy((void *)(uintptr_t)(a + 0x458), s->f_mntfromname, 1024);
+}
+
+#define MEMRING 64
+static struct { uint32_t a, len, eip, caller, chain[3]; char kind; } g_memring[MEMRING];
+static volatile uint32_t g_njump;
+
+void sys_mem_note(Cpu *c, char kind, uint32_t a, uint32_t len)
+{
+    uint32_t i = g_njump++ % MEMRING;
+    g_memring[i].a = a; g_memring[i].len = len; g_memring[i].eip = c->eip; g_memring[i].caller = ld32(c->r[ESP]);
+    g_memring[i].kind = kind;
+    {   /* three return addresses via ebp (mach_msg -> MIG stub -> caller) */
+        uint32_t bp = c->r[EBP], k;
+        for (k = 0; k < 3; k++) {
+            g_memring[i].chain[k] = 0;
+            if (!bp || (bp & 3) || bp < 0x1000 || bp >= 0xc0000000u) continue;
+            g_memring[i].chain[k] = ld32(bp + 4);
+            bp = ld32(bp);
+        }
+    }
+}
+
+static void line_hex(char **p, uint32_t v) { int i; for (i = 28; i >= 0; i -= 4) *(*p)++ = "0123456789abcdef"[(v >> i) & 15]; }
+
+void sys_mem_show(uint32_t addr)
+{
+    uint32_t n = g_njump, i, k;
+    for (k = 0; k < MEMRING && k < n; k++) {
+        char b[160], *p = b;
+        i = (n - 1 - k) % MEMRING;
+        if (k >= 8 && !(addr - g_memring[i].a < g_memring[i].len)) continue;   /* the last 8 and all hits */
+        *p++ = ' '; *p++ = ' '; *p++ = g_memring[i].kind; *p++ = ' ';
+        line_hex(&p, g_memring[i].a); *p++ = '+'; line_hex(&p, g_memring[i].len);
+        *p++ = ' '; line_hex(&p, g_memring[i].eip); *p++ = ' '; line_hex(&p, g_memring[i].caller);
+        *p++ = ' '; line_hex(&p, g_memring[i].chain[0]); *p++ = ' '; line_hex(&p, g_memring[i].chain[1]);
+        *p++ = ' '; line_hex(&p, g_memring[i].chain[2]);
+        if (addr - g_memring[i].a < g_memring[i].len) { *p++ = ' '; *p++ = '*'; }
+        *p++ = '\n';
+        write(2, b, (size_t)(p - b));
+    }
+}
+
+int sys_host_range(Cpu *c, uint32_t a, uint32_t len, const char *was)
+{
+    uint64_t end = (uint64_t)a + (len ? len : 1);
+    if (end <= 0x90000000u || a >= 0xb0000000u) return 0;
+    fprintf(stderr, "rosetta: %s %08x+%x refused in host library range (eip %08x, caller %08x)\n", was, a, len,
+            c->eip, ld32(c->r[ESP]));
+    return 1;
+}
+
+static void ts_read(uint32_t a, struct timeval *t) { t->tv_sec = (time_t)ld32(a); t->tv_usec = (suseconds_t)ld32(a + 4); }
+
+/* ---------- getattrlist ----------
+ * The kernel packs the requested attributes in bit order (common, volume, directory, file, fork), each aligned to
+ * 4 bytes, with the total length in front; references (attrreference_t) point to appended data. The layout is the
+ * same for i386 and PowerPC (32 bit): the buffer is copied raw and every numeric field is swapped.
+ * Kind: 'w' n words, 'q' n 64-bit values, 'r' reference (two words, data raw), 'b' n bytes raw (Finder info: on
+ * disk always big endian, Intel CarbonCore swaps it itself), '-' no data. */
+typedef struct { uint32_t bit; char kind; uint8_t n; } AttrType;
+static const AttrType g_attr_cmn[] = {
+    { 0x1, 'r', 1 }, { 0x2, 'w', 1 }, { 0x4, 'w', 2 }, { 0x8, 'w', 1 }, { 0x10, 'w', 1 }, { 0x20, 'w', 2 },
+    { 0x40, 'w', 2 }, { 0x80, 'w', 2 }, { 0x100, 'w', 1 }, { 0x200, 'w', 2 }, { 0x400, 'w', 2 }, { 0x800, 'w', 2 },
+    { 0x1000, 'w', 2 }, { 0x2000, 'w', 2 }, { 0x4000, 'b', 32 }, { 0x8000, 'w', 1 }, { 0x10000, 'w', 1 },
+    { 0x20000, 'w', 1 }, { 0x40000, 'w', 1 }, { 0x200000, 'w', 1 }, { 0x400000, 'r', 1 }, { 0x800000, 'b', 16 },
+    { 0x1000000, 'b', 16 }, { 0x2000000, 'q', 1 }, { 0x4000000, 'q', 1 }, { 0, 0, 0 } };
+static const AttrType g_attr_vol[] = {
+    { 0x1, 'w', 1 }, { 0x2, 'w', 1 }, { 0x4, 'q', 1 }, { 0x8, 'q', 1 }, { 0x10, 'q', 1 }, { 0x20, 'q', 1 },
+    { 0x40, 'q', 1 }, { 0x80, 'w', 1 }, { 0x100, 'w', 1 }, { 0x200, 'w', 1 }, { 0x400, 'w', 1 }, { 0x800, 'w', 1 },
+    { 0x1000, 'r', 1 }, { 0x2000, 'r', 1 }, { 0x4000, 'w', 1 }, { 0x8000, 'r', 1 }, { 0x10000, 'q', 1 },
+    { 0x20000, 'w', 8 }, { 0x40000000, 'w', 10 }, { 0x80000000u, '-', 0 }, { 0, 0, 0 } };
+static const AttrType g_attr_dir[] = { { 0x1, 'w', 1 }, { 0x2, 'w', 1 }, { 0x4, 'w', 1 }, { 0, 0, 0 } };
+static const AttrType g_attr_file[] = {
+    { 0x1, 'w', 1 }, { 0x2, 'q', 1 }, { 0x4, 'q', 1 }, { 0x8, 'w', 1 }, { 0x10, 'w', 1 }, { 0x20, 'w', 1 },
+    { 0x40, 'w', 1 }, { 0x80, 'w', 1 }, { 0x100, 'r', 1 }, { 0x200, 'q', 1 }, { 0x400, 'q', 1 }, { 0x800, 'w', 16 },
+    { 0x1000, 'q', 1 }, { 0x2000, 'q', 1 }, { 0x4000, 'w', 16 }, { 0, 0, 0 } };
+static const AttrType g_attr_branch[] = { { 0x1, 'q', 1 }, { 0x2, 'q', 1 }, { 0, 0, 0 } };
+
+/* read the guest attrlist (24 bytes) */
+static void attrlist_read(uint32_t a, struct attrlist *l)
+{
+    l->bitmapcount = (u_short)ld16(a);
+    l->reserved = (u_int16_t)ld16(a + 2);
+    l->commonattr = ld32(a + 4);
+    l->volattr = ld32(a + 8);
+    l->dirattr = ld32(a + 12);
+    l->fileattr = ld32(a + 16);
+    l->forkattr = ld32(a + 20);
+}
+
+/* swap the result of one entry (length in front, at guest address a, at most size bytes, already copied raw);
+   returns the length of the entry */
+static uint32_t attr_swap(uint32_t a, uint32_t size, const struct attrlist *l)
+{
+    const AttrType *tab[5] = { g_attr_cmn, g_attr_vol, g_attr_dir, g_attr_file, g_attr_branch };
+    uint32_t masks[5], len, o = 4, rest;
+    int g, k;
+    static int reported;
+    uint8_t *p = (uint8_t *)(uintptr_t)a;
+    if (size < 4) return 0;
+    masks[0] = l->commonattr; masks[1] = l->volattr; masks[2] = l->dirattr; masks[3] = l->fileattr; masks[4] = l->forkattr;
+    len = *(uint32_t *)p;                /* host byte order */
+    st32(a, len);
+    if (len > size) len = size;
+    for (g = 0; g < 5; g++) {
+        rest = masks[g];
+        for (k = 0; tab[g][k].bit && rest; k++) {
+            const AttrType *t = &tab[g][k];
+            uint32_t i;
+            if (!(rest & t->bit)) continue;
+            rest &= ~t->bit;
+            switch (t->kind) {
+            case 'w': for (i = 0; i < t->n && o + 4 <= len; i++, o += 4) st32(a + o, *(uint32_t *)(p + o)); break;
+            case 'q': for (i = 0; i < t->n && o + 8 <= len; i++, o += 8) st64(a + o, *(uint64_t *)(p + o)); break;
+            case 'r': if (o + 8 <= len) { st32(a + o, *(uint32_t *)(p + o)); st32(a + o + 4, *(uint32_t *)(p + o + 4)); } o += 8; break;
+            case 'b': o += t->n; break;
+            default: break;
+            }
+        }
+        if (rest) {                         /* unknown attribute: size unknown, the rest stays in host byte order */
+            if (!reported++) fprintf(stderr, "rosetta: getattrlist: unknown attributes %u:%08x\n", g, rest);
+            break;
+        }
+    }
+    return len;
+}
+
+/* ---------- sysctl ---------- */
+
+/* guest OID "sysctl.proc_native" (tag for the Rosetta mode of CoreGraphics etc.) */
+#define OID_PROC_NATIVE 0x7e57001u
+
+/* type of an OID (for swapping); remembered per OID: the query was a second system call per guest sysctl */
+static int sysctl_type(const int *name, unsigned n)
+{
+    static struct { unsigned n; int name[8], type; } memo[32];
+    static int nmemo;
+    int q[CTL_MAXNAME + 2], k, type;
+    char buf[256];
+    size_t l = sizeof buf;
+    if (n > CTL_MAXNAME) return 0;
+    for (k = 0; k < nmemo; k++)
+        if (memo[k].n == n && !memcmp(memo[k].name, name, n * sizeof(int))) return memo[k].type;
+    q[0] = 0; q[1] = 4;                     /* oidfmt */
+    memcpy(q + 2, name, n * sizeof(int));
+    if (sysctl(q, n + 2, buf, &l, 0, 0) < 0 || l < 4) return 0;
+    type = *(int *)buf & 0xf;                /* CTLTYPE */
+    if (n <= 8) {
+        k = nmemo < 32 ? nmemo++ : (int)(name[n - 1] & 31);
+        memo[k].n = n;
+        memcpy(memo[k].name, name, n * sizeof(int));
+        memo[k].type = type;
+    }
+    return type;
+}
+
+static void sys_sysctl(Cpu *c)
+{
+    uint32_t gname = arg(0), n = arg(1), prev = arg(2), oldlen = arg(3), fresh = arg(4), newlen = arg(5), i;
+    int name[CTL_MAXNAME];
+    size_t l = 0;
+    int r, type;
+    if (n == 0 || n > CTL_MAXNAME) { set_result(c, 0, EINVAL); return; }
+    for (i = 0; i < n; i++) name[i] = (int)ld32(gname + 4 * i);
+    if (oldlen) l = ld32(oldlen);
+    if (g_log) {
+        fprintf(stderr, "[sysctl");
+        for (i = 0; i < n; i++) fprintf(stderr, " %d", name[i]);
+        if (fresh && n == 2 && name[0] == 0 && name[1] == 3) fprintf(stderr, " \"%.*s\"", (int)newlen, (const char *)(uintptr_t)fresh);
+        fprintf(stderr, "] old %s, %u bytes\n", prev ? "yes" : "no", (unsigned)l);
+    }
+
+    /* names to OIDs (0.3): intercept the Rosetta tag, otherwise convert the result OIDs */
+    if (n == 2 && name[0] == 0 && name[1] == 3) {
+        if (fresh && newlen >= 18 && !strncmp((const char *)(uintptr_t)fresh, "sysctl.proc_native", newlen)) {
+            if (l < 8) { set_result(c, 0, ENOMEM); return; }
+            st32(prev, 0); st32(prev + 4, OID_PROC_NATIVE);
+            st32(oldlen, 8);
+            set_result(c, 0, 0);
+            return;
+        }
+        r = sysctl(name, n, (void *)(uintptr_t)prev, prev ? &l : 0, (void *)(uintptr_t)fresh, newlen);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        for (i = 0; prev && i + 4 <= l; i += 4) st32(prev + i, *(uint32_t *)(uintptr_t)(prev + i));
+        if (oldlen) st32(oldlen, (uint32_t)l);
+        set_result(c, 0, 0);
+        return;
+    }
+    if (n == 2 && name[0] == 0 && (uint32_t)name[1] == OID_PROC_NATIVE) {
+        if (prev && l >= 4) st32(prev, 0);    /* not native: the frameworks switch to Rosetta mode */
+        if (oldlen) st32(oldlen, 4);
+        set_result(c, 0, 0);
+        return;
+    }
+    /* values an Intel program expects */
+    if (n == 2 && name[0] == CTL_KERN && name[1] == 45) {
+        /* KERN_EXEC/KERN_CLASSICHANDLER: on an Intel Mac the path of the PowerPC translator. The i386 libobjc reads
+           Objective-C categories only if something is here (the PowerPC kernel returns an empty string) */
+        static const char t[] = "/usr/libexec/oah/translate";
+        if (prev) { if (l < sizeof t) { set_result(c, 0, ENOMEM); return; } memcpy((void *)(uintptr_t)prev, t, sizeof t); }
+        if (oldlen) st32(oldlen, sizeof t);
+        set_result(c, 0, 0);
+        return;
+    }
+    if (n == 2 && name[0] == CTL_HW && name[1] == HW_MACHINE) {
+        static const char m[] = "i386";
+        if (prev && l >= sizeof m) memcpy((void *)(uintptr_t)prev, m, sizeof m);
+        if (oldlen) st32(oldlen, sizeof m);
+        set_result(c, 0, 0);
+        return;
+    }
+    r = sysctl(name, n, (void *)(uintptr_t)prev, prev ? &l : 0, (void *)(uintptr_t)fresh, newlen);
+    if (r < 0) { set_result(c, 0, errno); return; }
+    type = prev && l ? sysctl_type(name, n) : 0;
+    if (prev) {
+        if (type == CTLTYPE_INT)
+            for (i = 0; i + 4 <= l; i += 4) st32(prev + i, *(uint32_t *)(uintptr_t)(prev + i));
+        else if (type == CTLTYPE_QUAD)
+            for (i = 0; i + 8 <= l; i += 8) st64(prev + i, *(uint64_t *)(uintptr_t)(prev + i));
+        else if (type != CTLTYPE_STRING && l == 4)
+            st32(prev, *(uint32_t *)(uintptr_t)prev);
+        else if (type != CTLTYPE_STRING && l == 8 && name[0] == CTL_KERN && name[1] == KERN_BOOTTIME) {
+            st32(prev, *(uint32_t *)(uintptr_t)prev); st32(prev + 4, *(uint32_t *)(uintptr_t)(prev + 4));
+        }
+    }
+    if (oldlen) st32(oldlen, (uint32_t)l);
+    set_result(c, 0, 0);
+}
+
+/* ---------- directories ---------- */
+
+/* getdirentries (old dirent): d_ino (4), d_reclen (2), d_type, d_namlen, name */
+static void dirent_convert(uint32_t a, long n)
+{
+    uint32_t p = a, end = a + (uint32_t)n;
+    while (p + 8 <= end) {
+        uint32_t ino = *(uint32_t *)(uintptr_t)p;
+        uint16_t len = *(uint16_t *)(uintptr_t)(p + 4);
+        st32(p, ino);
+        st16(p + 4, len);
+        if (len == 0) break;
+        p += len;
+    }
+}
+
+/* getdirentries64: d_ino (8), d_seekoff (8), d_reclen (2), d_namlen (2), d_type, name */
+static void dirent64_convert(uint32_t a, long n)
+{
+    uint32_t p = a, end = a + (uint32_t)n;
+    while (p + 21 <= end) {
+        uint64_t ino = *(uint64_t *)(uintptr_t)p, off = *(uint64_t *)(uintptr_t)(p + 8);
+        uint16_t len = *(uint16_t *)(uintptr_t)(p + 16), nl = *(uint16_t *)(uintptr_t)(p + 18);
+        st64(p, ino); st64(p + 8, off); st16(p + 16, len); st16(p + 18, nl);
+        if (len == 0) break;
+        p += len;
+    }
+}
+
+/* ---------- signals to the guest ----------
+ * sigaction records handler, trampoline (_sigtramp of libc), mask and flags. For signals with a handler a host
+ * handler catches the signal and only marks it pending (g_sig_pending); SIG_IGN/SIG_DFL also apply in the host
+ * (SIGPIPE ignored -> EPIPE). Own signals (kill, __pthread_kill) are marked pending the same way. Delivery happens
+ * at the dispatcher (jit.c, jit_run) with a stack frame like the kernel's (xnu sendsig, 32 bit): mcontext32
+ * (600 bytes), siginfo (64), ucontext32 (32), sigframe32 (retaddr -1, catcher, sigstyle, sig, sinfo, uctx; esp
+ * points to it, aligned to 16 bytes after the return word), eip = trampoline. libc calls the handler and then
+ * sigreturn(uctx, sigstyle).
+ * Limit: a loop in translated code without a system call never passes the dispatcher. */
+
+static uint32_t g_handler[32], g_handler_mask[32], g_handler_flags[32], g_tramp;
+volatile uint32_t g_sig_pending;
+uint32_t g_sig_mask;
+static uint32_t g_sig_after, g_sig_after_valid;   /* sigsuspend: mask that applies again after the handler */
+static int g_sig_eip_set;                   /* sigreturn has set eip/esp: sysenter leaves them as they are */
+static struct { int code, pid, uid, status; uint32_t addr, val; } g_sig_info[32];
+
+#define MCTX32 600
+#define UC_TRAD 1
+#define UC_FLAVOR 30
+#define SIG_BIT(s) (1u << ((s) - 1))           /* like sigmask(): signal n = bit n-1 (also g_sig_pending) */
+#define SIG_NEVER (SIG_BIT(SIGKILL) | SIG_BIT(SIGSTOP))
+
+static void sig_host(int sig, siginfo_t *si, void *k)
+{
+    (void)k;
+    if (sig <= 0 || sig >= 32) return;
+    if (si) {
+        g_sig_info[sig].code = si->si_code; g_sig_info[sig].pid = si->si_pid; g_sig_info[sig].uid = (int)si->si_uid;
+        g_sig_info[sig].status = si->si_status; g_sig_info[sig].addr = (uint32_t)(uintptr_t)si->si_addr;
+        g_sig_info[sig].val = (uint32_t)si->si_value.sival_int;
+    }
+    __sync_fetch_and_or(&g_sig_pending, SIG_BIT(sig));
+}
+
+/* signals the translator needs itself (fault catcher, sampling profile) or that nobody catches */
+static int sig_own(int sig)
+{
+    return sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGKILL || sig == SIGSTOP ||
+           (sig == SIGALRM && getenv("ROSETTA_HPROFILE"));
+}
+
+/* host behavior after the guest handler */
+static void sig_host_set(int sig)
+{
+    struct sigaction sa;
+    if (sig_own(sig)) return;
+    memset(&sa, 0, sizeof sa);
+    if (g_handler[sig] == 0) sa.sa_handler = SIG_DFL;
+    else if (g_handler[sig] == 1) sa.sa_handler = SIG_IGN;
+    else {
+        sa.sa_sigaction = sig_host;
+        sa.sa_flags = SA_SIGINFO | ((g_handler_flags[sig] & SA_RESTART) ? SA_RESTART : 0);
+    }
+    sigaction(sig, &sa, 0);
+}
+
+static void sig_schedule(int sig, int code)
+{
+    if (sig <= 0 || sig >= 32) return;
+    g_sig_info[sig].code = code; g_sig_info[sig].pid = getpid(); g_sig_info[sig].uid = (int)getuid();
+    g_sig_info[sig].status = 0; g_sig_info[sig].addr = 0; g_sig_info[sig].val = 0;
+    __sync_fetch_and_or(&g_sig_pending, SIG_BIT(sig));
+}
+
+/* SIG_DFL: ignore, stop or terminate the host with the same signal (exit status to the shell as with native) */
+static void sig_default(Cpu *c, int sig)
+{
+    sigset_t m;
+    switch (sig) {
+    case SIGCHLD: case SIGURG: case SIGCONT: case SIGWINCH: case SIGINFO: case SIGIO:
+        return;
+    case SIGTSTP: case SIGTTIN: case SIGTTOU:
+        kill(getpid(), SIGSTOP);
+        return;
+    }
+    fflush(stdout);
+    main_profile_save();
+    if (!sig_own(sig)) {
+        signal(sig, SIG_DFL);
+        sigemptyset(&m);
+        sigaddset(&m, sig);
+        sigprocmask(SIG_UNBLOCK, &m, 0);
+        kill(getpid(), sig);
+    }
+    c->finished = 1;                         /* still alive (own signal): report as terminated */
+    c->end_code = 128 + sig;
+}
+
+/* deliver a pending, unblocked signal (called at the dispatcher, guest state complete in Cpu) */
+void sig_deliver(Cpu *c)
+{
+    uint32_t ready = g_sig_pending & ~g_sig_mask, h, sp, mctx, sinfo, uctx, fp, f, saved, fl;
+    int sig, k;
+    if (!ready) return;
+    for (sig = 1; sig < 32 && !(ready & SIG_BIT(sig)); sig++) ;
+    if (sig >= 32) return;
+    __sync_fetch_and_and(&g_sig_pending, ~SIG_BIT(sig));
+    h = g_handler[sig];
+    if (h == 1) return;                     /* SIG_IGN */
+    if (h == 0) { sig_default(c, sig); return; }
+    saved = g_sig_after_valid ? g_sig_after : g_sig_mask;
+    g_sig_after_valid = 0;
+    xmm_intel(c);
+    fl = flags_fetch(c);
+    sp = c->r[ESP];
+    sp -= MCTX32; mctx = sp;
+    sp -= 64; sinfo = sp;
+    sp -= 32; uctx = sp;
+    sp -= 24;
+    fp = (sp & ~15u) - 4;
+    /* sigframe32 */
+    st32(fp, 0xffffffffu); st32(fp + 4, h);
+    st32(fp + 8, (g_handler_flags[sig] & SA_SIGINFO) ? UC_FLAVOR : UC_TRAD);
+    st32(fp + 12, (uint32_t)sig); st32(fp + 16, sinfo); st32(fp + 20, uctx);
+    /* ucontext32 */
+    st32(uctx, 0); st32(uctx + 4, saved); st32(uctx + 8, fp); st32(uctx + 12, 0); st32(uctx + 16, 0);
+    st32(uctx + 20, 0); st32(uctx + 24, MCTX32); st32(uctx + 28, mctx);
+    /* mcontext32: exception (12), registers (64): eax ebx ecx edx edi esi ebp esp ss eflags eip cs ds es fs gs */
+    memset((void *)(uintptr_t)mctx, 0, MCTX32);
+    st32(mctx + 12, c->r[EAX]); st32(mctx + 16, c->r[EBX]); st32(mctx + 20, c->r[ECX]); st32(mctx + 24, c->r[EDX]);
+    st32(mctx + 28, c->r[EDI]); st32(mctx + 32, c->r[ESI]); st32(mctx + 36, c->r[EBP]); st32(mctx + 40, c->r[ESP]);
+    st32(mctx + 44, 0x1f); st32(mctx + 48, fl); st32(mctx + 52, c->eip); st32(mctx + 56, 0x17);
+    st32(mctx + 60, 0x1f); st32(mctx + 64, 0x1f); st32(mctx + 68, 0x1f); st32(mctx + 72, 0x37);
+    /* floating point (524 from +76): fcw +8, fsw +10, mxcsr +32, stmm0 +40 (here: double in guest byte order),
+       xmm0 +168; TOP and depth of the x87 stack in the reserved area (+296) for sigreturn */
+    f = mctx + 76;
+    st16(f + 8, c->fpu_ctl); st16(f + 10, c->fpu_status); st32(f + 32, c->mxcsr); st32(f + 36, 0xffff);
+    for (k = 0; k < 8; k++) {
+        uint64_t w;
+        memcpy(&w, &c->st[k], 8);
+        st64(f + 40 + 16 * (uint32_t)k, w);
+        memcpy((void *)(uintptr_t)(f + 168 + 16 * (uint32_t)k), c->xmm[k].b, 16);
+    }
+    st32(f + 296, 0x524f5354u); st32(f + 300, (uint32_t)c->st_top); st32(f + 304, c->x87_depth);
+    /* siginfo: si_signo, si_errno, si_code, si_pid, si_uid, si_status, si_addr, si_value */
+    memset((void *)(uintptr_t)sinfo, 0, 64);
+    st32(sinfo, (uint32_t)sig); st32(sinfo + 8, (uint32_t)g_sig_info[sig].code);
+    st32(sinfo + 12, (uint32_t)g_sig_info[sig].pid); st32(sinfo + 16, (uint32_t)g_sig_info[sig].uid);
+    st32(sinfo + 20, (uint32_t)g_sig_info[sig].status); st32(sinfo + 24, g_sig_info[sig].addr);
+    st32(sinfo + 28, g_sig_info[sig].val);
+    /* mask in the handler, SA_RESETHAND */
+    g_sig_mask = (g_sig_mask | g_handler_mask[sig] | ((g_handler_flags[sig] & SA_NODEFER) ? 0 : SIG_BIT(sig))) & ~SIG_NEVER;
+    if (g_handler_flags[sig] & SA_RESETHAND) { g_handler[sig] = 0; sig_host_set(sig); }
+    c->r[ESP] = fp;
+    c->eip = g_tramp;
+    if (g_log) fprintf(stderr, "[signal %d] handler %08x via %08x, frame %08x\n", sig, h, g_tramp, fp);
+}
+
+/* sigreturn(uctx, sigstyle): state from the stack frame (the handler may have changed it) */
+static void sig_back(Cpu *c, uint32_t uctx)
+{
+    uint32_t mctx = ld32(uctx + 28), f = mctx + 76;
+    int k;
+    g_sig_mask = ld32(uctx + 4) & ~SIG_NEVER;
+    c->r[EAX] = ld32(mctx + 12); c->r[EBX] = ld32(mctx + 16); c->r[ECX] = ld32(mctx + 20); c->r[EDX] = ld32(mctx + 24);
+    c->r[EDI] = ld32(mctx + 28); c->r[ESI] = ld32(mctx + 32); c->r[EBP] = ld32(mctx + 36); c->r[ESP] = ld32(mctx + 40);
+    flags_set(c, ld32(mctx + 48) & ~F_TF);
+    c->eip = ld32(mctx + 52);
+    c->fpu_ctl = ld16(f + 8); c->fpu_status = ld16(f + 10); c->mxcsr = ld32(f + 32);
+    for (k = 0; k < 8; k++) memcpy(c->xmm[k].b, (const void *)(uintptr_t)(f + 168 + 16 * (uint32_t)k), 16);
+    if (ld32(f + 296) == 0x524f5354u) {     /* written by us: restore the x87 stack */
+        for (k = 0; k < 8; k++) { uint64_t w = ld64(f + 40 + 16 * (uint32_t)k); memcpy(&c->st[k], &w, 8); }
+        c->st_top = (int)(ld32(f + 300) & 7); c->x87_depth = ld32(f + 304) > 8 ? 8 : ld32(f + 304);
+    }
+    g_sig_eip_set = 1;
+}
+
+/* ---------- Intel versions of the system libraries (stage 4) ----------
+ * On the PowerPC system the frameworks exist only for PowerPC; the i386 versions from Apple's Combo Update are
+ * under $ROSETTA_INTEL (default ~/tools/rosetta/intel/root) with the same paths. If the guest opens or checks a
+ * file under /System/Library, /usr/lib or /Library that exists there, it gets that file; directories, resources
+ * and everything else come from the system. ROSETTA_INTEL=- switches this off. */
+static char g_intel[PATH_MAX];
+static int g_intel_on = -1;
+static unsigned long g_st_redirected;
+
+static const char *gpath(uint32_t a);
+const char *sys_guest_path(const char *p) { return gpath((uint32_t)(uintptr_t)p); }
+
+/* remembered answers (dyld queries the same path several times with stat, open, ...): per path, whether it exists
+   in the Intel root */
+#define GPATH_N 512
+static struct { uint32_t h; char *path; char ja; } g_gpath[GPATH_N];
+static int g_ngpath;
+
+static const char *gpath(uint32_t a)
+{
+    static char fresh[2][1200];
+    static int which;
+    const char *p = (const char *)(uintptr_t)a;
+    struct stat st;
+    char *z;
+    uint32_t h, i;
+    const unsigned char *q;
+    int ja;
+    if (g_intel_on < 0) {
+        const char *e = getenv("ROSETTA_INTEL");
+        char exe[1024], cand[1200];
+        uint32_t en = sizeof exe;
+        if (e) snprintf(g_intel, sizeof g_intel, "%s", e);
+        else if (_NSGetExecutablePath(exe, &en) == 0 && strrchr(exe, '/')) {
+            *strrchr(exe, '/') = 0;
+            snprintf(cand, sizeof cand, "%s/../intel/root", exe);
+            if (!realpath(cand, g_intel)) g_intel[0] = 0;
+        }
+        g_intel_on = g_intel[0] == '/' && stat(g_intel, &st) == 0 && S_ISDIR(st.st_mode);
+    }
+    if (!g_intel_on || !p || p[0] != '/') return p;
+    if (strncmp(p, "/System/Library/", 16) && strncmp(p, "/usr/lib/", 9) && strncmp(p, "/Library/", 9)) return p;
+    z = fresh[which ^= 1];                   /* two buffers: calls with two paths */
+    if ((size_t)snprintf(z, sizeof fresh[0], "%s%s", g_intel, p) >= sizeof fresh[0]) return p;
+    for (h = 2166136261u, q = (const unsigned char *)p; *q; q++) h = (h ^ *q) * 16777619u;
+    for (i = h & (GPATH_N - 1); g_gpath[i].path; i = (i + 1) & (GPATH_N - 1))
+        if (g_gpath[i].h == h && !strcmp(g_gpath[i].path, p)) break;
+    if (g_gpath[i].path) ja = g_gpath[i].ja;
+    else {
+        ja = stat(z, &st) == 0 && !S_ISDIR(st.st_mode);
+        if (g_ngpath < GPATH_N / 2 && (g_gpath[i].path = strdup(p)) != 0) { g_gpath[i].h = h; g_gpath[i].ja = (char)ja; g_ngpath++; }
+    }
+    if (!ja) return p;
+    g_st_redirected++;
+    if (g_log) fprintf(stderr, "[intel] %s\n", z);
+    return z;
+}
+
+/* ---------- system call switch ---------- */
+
+static const char *sys_name(uint32_t n)
+{
+    switch (n) {
+    case SYS_open: return "open"; case SYS_close: return "close"; case SYS_read: return "read"; case SYS_write: return "write";
+    case SYS_mmap: return "mmap"; case SYS_munmap: return "munmap"; case SYS_mprotect: return "mprotect";
+    case 188: return "stat"; case 189: return "fstat"; case 190: return "lstat";
+    case 338: return "stat64"; case 339: return "fstat64"; case 340: return "lstat64";
+    case SYS___sysctl: return "sysctl"; case SYS_ioctl: return "ioctl"; case SYS_fcntl: return "fcntl";
+    case SYS_sigaction: return "sigaction"; case SYS_sigprocmask: return "sigprocmask";
+    default: return "";
+    }
+}
+
+/* *_nocancel versions (396..423) mapped to the normal calls */
+static uint32_t no_nocancel(uint32_t n)
+{
+    static const uint16_t base[] = {
+        SYS_read, SYS_write, SYS_open, SYS_close, SYS_wait4, SYS_recvmsg, SYS_sendmsg, SYS_recvfrom, SYS_accept,
+        SYS_msync, SYS_fcntl, SYS_select, SYS_fsync, SYS_connect, SYS_sigsuspend, SYS_readv, SYS_writev, SYS_sendto,
+        SYS_pread, SYS_pwrite, SYS_waitid, SYS_poll, 0, 0, 0, 0, 0, 0
+    };
+    if (n >= 396 && n <= 423 && base[n - 396]) return base[n - 396];
+    return n;
+}
+
+void sys_bsd(Cpu *c, int sysenter)
+{
+    /* i386 libSystem puts the length of the arguments in the upper 16 bits */
+    uint32_t n = no_nocancel(c->r[EAX] & 0xffff);
+    if (!sysenter) g_arg_base = c->r[ESP];
+    if (g_log)
+        fprintf(stderr, "[bsd %u %s] %08x %08x %08x %08x\n", n, sys_name(n), arg(0), arg(1), arg(2), arg(3));
+    switch (n) {
+    case SYS_exit:
+        c->finished = 1;
+        c->end_code = (int)arg(0);
+        return;
+    case SYS_read: HOST(f_read((int)arg(0), PTR_ARG(1), arg(2))); return;
+    case SYS_write: HOST(f_write((int)arg(0), PTR_ARG(1), arg(2))); return;
+    case SYS_open: { int r = open(gpath(arg(0)), (int)arg(1), (int)arg(2)); if (r >= 0) jit_fd_off(r); HOST(r); return; }
+    case SYS_close: jit_fd_off((int)arg(0)); HOST(close((int)arg(0))); return;
+    case SYS_unlink: HOST(unlink((const char *)PTR_ARG(0))); return;
+    case SYS_chdir: HOST(chdir((const char *)PTR_ARG(0))); return;
+    case SYS_fchdir: HOST(fchdir((int)arg(0))); return;
+    case SYS_getpid: set_result(c, (uint32_t)getpid(), 0); return;
+    case SYS_getppid: set_result(c, (uint32_t)getppid(), 0); return;
+    case SYS_getuid: set_result(c, getuid(), 0); return;
+    case SYS_geteuid: set_result(c, geteuid(), 0); return;
+    case SYS_getgid: set_result(c, getgid(), 0); return;
+    case SYS_getegid: set_result(c, getegid(), 0); return;
+    case SYS_issetugid: set_result(c, 0, 0); return;
+    case SYS_getpgrp: set_result(c, (uint32_t)getpgrp(), 0); return;
+    case SYS_access: HOST(access(gpath(arg(0)), (int)arg(1))); return;
+    case SYS_dup: HOST(dup((int)arg(0))); return;
+    case SYS_dup2: jit_fd_off((int)arg(1)); HOST(dup2((int)arg(0), (int)arg(1))); return;
+    case SYS_umask: set_result(c, umask((mode_t)arg(0)), 0); return;
+    case SYS_getdtablesize: set_result(c, (uint32_t)getdtablesize(), 0); return;
+    case SYS_readlink: HOST(readlink(gpath(arg(0)), PTR_ARG(1), arg(2))); return;
+    case SYS_mkdir: HOST(mkdir((const char *)PTR_ARG(0), (mode_t)arg(1))); return;
+    case SYS_rmdir: HOST(rmdir((const char *)PTR_ARG(0))); return;
+    case SYS_rename: HOST(rename((const char *)PTR_ARG(0), (const char *)PTR_ARG(1))); return;
+    case SYS_fsync: HOST(fsync((int)arg(0))); return;
+    case SYS_pipe: {
+        int p[2];
+        if (pipe(p) < 0) { set_result(c, 0, errno); return; }
+        c->r[EDX] = (uint32_t)p[1];
+        set_result(c, (uint32_t)p[0], 0);
+        return;
+    }
+    case SYS_pread: HOST(pread((int)arg(0), PTR_ARG(1), arg(2), (off_t)arg64(3))); return;
+    case SYS_pwrite: HOST(pwrite((int)arg(0), PTR_ARG(1), arg(2), (off_t)arg64(3))); return;
+    case SYS_lseek: {
+        off_t r = lseek((int)arg(0), (off_t)arg64(1), (int)arg(3));
+        if (r < 0) { set_result(c, 0, errno); return; }
+        c->r[EDX] = (uint32_t)((uint64_t)r >> 32);
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case SYS_mmap: {
+        uint32_t a = arg(0), len = arg(1), flags = arg(3);
+        int prot = (int)arg(2), shared;
+        void *r;
+        if (flags & MAP_FIXED) sys_mem_note(c, 'm', a, len);
+        if ((flags & MAP_FIXED) && sys_host_range(c, a, len, "mmap")) { set_result(c, 0, EINVAL); return; }
+        if ((flags & MAP_FIXED) && a < RESERVE_END && a >= 0x1000)
+            vm_deallocate(mach_task_self(), a, len);         /* space in the guest reserve */
+        if (g_shared_on < 0) g_shared_on = !getenv("ROSETTA_NO_SHARED");
+        /* file read-only, private: map it shared (see above) */
+        shared = g_shared_on && !(flags & MAP_ANON) && (flags & MAP_PRIVATE) && !(prot & PROT_WRITE) && (int)arg(4) >= 0 &&
+                  g_nshared < SHARED_N;
+        r = MAP_FAILED;
+        if (shared) {
+            r = mmap((void *)(uintptr_t)a, len, prot, (int)((flags & ~MAP_PRIVATE) | MAP_SHARED), (int)arg(4), (off_t)arg64(5));
+            if (r != MAP_FAILED) {
+                g_shared[g_nshared].start = (uint32_t)(uintptr_t)r;
+                g_shared[g_nshared].end = (uint32_t)(uintptr_t)r + ((len + 4095) & ~4095u);
+                g_shared[g_nshared++].prot = prot;
+                g_st_shared++;
+            }
+        }
+        if (r == MAP_FAILED) r = mmap((void *)(uintptr_t)a, len, prot, (int)flags, (int)arg(4), (off_t)arg64(5));
+        if (r == MAP_FAILED) { set_result(c, 0, errno); return; }
+        /* Code at this address may have changed; not when dyld places a library from the translation cache at its
+           address (jit_mapping_expected) */
+        if (flags & MAP_FIXED) jit_flush_schedule(a, jit_mapping_expected(a, len, (int)arg(4)) ? 0 : len);
+        else jit_new_mapped((uint32_t)(uintptr_t)r, len);
+        set_result(c, (uint32_t)(uintptr_t)r, 0);
+        return;
+    }
+    case SYS_munmap:
+        sys_mem_note(c, 'u', arg(0), arg(1));
+        if (sys_host_range(c, arg(0), arg(1), "munmap")) { set_result(c, 0, EINVAL); return; }
+        jit_flush_schedule(arg(0), arg(1)); shared_forget(arg(0), arg(1)); HOST(munmap(PTR_ARG(0), arg(1))); return;
+    case SYS_mprotect:
+        sys_mem_note(c, 'p', arg(0), arg(1));
+        if (sys_host_range(c, arg(0), arg(1), "mprotect")) { set_result(c, 0, EINVAL); return; }
+        jit_flush_schedule(arg(0), arg(1));
+        if (arg(2) & PROT_WRITE) sys_make_private(arg(0), arg(1));
+        HOST(mprotect(PTR_ARG(0), arg(1), (int)arg(2)));
+        return;
+    case SYS_madvise: HOST(madvise(PTR_ARG(0), arg(1), (int)arg(2))); return;
+    case SYS_msync: HOST(msync(PTR_ARG(0), arg(1), (int)arg(2))); return;
+    case 188: case 190: {                   /* stat, lstat */
+        struct stat s;
+        int r = n == 188 ? stat(gpath(arg(0)), &s) : lstat(gpath(arg(0)), &s);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        stat_write(arg(1), &s);
+        set_result(c, 0, 0);
+        return;
+    }
+    case 189: {                             /* fstat */
+        struct stat s;
+        if (fstat((int)arg(0), &s) < 0) { set_result(c, 0, errno); return; }
+        stat_write(arg(1), &s);
+        set_result(c, 0, 0);
+        return;
+    }
+    case 338: case 340: {                   /* stat64, lstat64 */
+        struct stat64 s;
+        int r = n == 338 ? stat64(gpath(arg(0)), &s) : lstat64(gpath(arg(0)), &s);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        stat64_write(arg(1), &s);
+        set_result(c, 0, 0);
+        return;
+    }
+    case 339: {                             /* fstat64 */
+        struct stat64 s;
+        if (fstat64((int)arg(0), &s) < 0) { set_result(c, 0, errno); return; }
+        stat64_write(arg(1), &s);
+        set_result(c, 0, 0);
+        return;
+    }
+    case SYS_statfs: case SYS_fstatfs: {
+        struct statfs s;
+        int r = n == SYS_statfs ? statfs((const char *)PTR_ARG(0), &s) : fstatfs((int)arg(0), &s);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        statfs_write(arg(1), &s);
+        set_result(c, 0, 0);
+        return;
+    }
+    case 345: case 346: {                   /* statfs64, fstatfs64 */
+        struct statfs64 s;
+        int r = n == 345 ? statfs64((const char *)PTR_ARG(0), &s) : fstatfs64((int)arg(0), &s);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        statfs64_write(arg(1), &s);
+        set_result(c, 0, 0);
+        return;
+    }
+    case 18: {                              /* getfsstat(buf, size, flags), old statfs (0x110 bytes) */
+        uint32_t target = arg(0), count = arg(1) / 0x110, i;
+        int r;
+        struct statfs *s = count ? calloc(count, sizeof *s) : 0;
+        r = getfsstat(s, (int)(count * sizeof *s), (int)arg(2));
+        if (r < 0) { free(s); set_result(c, 0, errno); return; }
+        for (i = 0; s && i < (uint32_t)r && i < count; i++) statfs_write(target + i * 0x110, &s[i]);
+        free(s);
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case 220: {                             /* getattrlist(path, list, buffer, size, options) */
+        struct attrlist l;
+        uint32_t size = arg(3);
+        void *b = malloc(size ? size : 4);
+        int r;
+        attrlist_read(arg(1), &l);
+        r = getattrlist(gpath(arg(0)), &l, b, size, (unsigned)arg(4));
+        if (r < 0) { free(b); set_result(c, 0, errno); return; }
+        memcpy(PTR_ARG(2), b, size);
+        free(b);
+        attr_swap(arg(2), size, &l);
+        set_result(c, 0, 0);
+        return;
+    }
+    case 222: {                             /* getdirentriesattr(fd, list, buffer, size, *count, *base, *state, opt) */
+        struct attrlist l;
+        uint32_t size = arg(3), i, o = 0;
+        unsigned long count = ld32(arg(4)), base = 0, state = 0;     /* 10.5: unsigned long */
+        uint8_t *b = malloc(size ? size : 4);
+        int r;
+        attrlist_read(arg(1), &l);
+        r = getdirentriesattr((int)arg(0), &l, b, size, &count, &base, &state, (unsigned)arg(7));
+        if (r < 0) { free(b); set_result(c, 0, errno); return; }
+        memcpy(PTR_ARG(2), b, size);
+        for (i = 0; i < count && o + 4 <= size; i++) {    /* entries one after another, each with the length in front */
+            uint32_t lg = *(uint32_t *)(b + o);
+            attr_swap(arg(2) + o, size - o, &l);
+            if (!lg) break;
+            o += (lg + 3) & ~3u;
+        }
+        free(b);
+        st32(arg(4), (uint32_t)count);
+        if (arg(5)) st32(arg(5), (uint32_t)base);
+        if (arg(6)) st32(arg(6), (uint32_t)state);
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case 347: {                             /* getfsstat64(buf, size, flags) */
+        uint32_t target = arg(0), count = arg(1) / 0x878, i;
+        int r;
+        struct statfs64 *s = count ? calloc(count, sizeof *s) : 0;
+        r = getfsstat64(s, (int)(count * sizeof *s), (int)arg(2));
+        if (r < 0) { free(s); set_result(c, 0, errno); return; }
+        for (i = 0; s && i < (uint32_t)r && i < count; i++) statfs64_write(target + i * 0x878, &s[i]);
+        free(s);
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case 341: case 342: case 343: {         /* stat64_extended, lstat64_extended, fstat64_extended */
+        struct stat64 s;
+        int r = n == 341 ? stat64((const char *)PTR_ARG(0), &s) : n == 342 ? lstat64((const char *)PTR_ARG(0), &s)
+                                                                           : fstat64((int)arg(0), &s);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        stat64_write(arg(1), &s);
+        if (arg(3)) st32(arg(3), 0);        /* no ACL reported */
+        set_result(c, 0, 0);
+        return;
+    }
+    case 234: HOST(syscall(234, PTR_ARG(0), PTR_ARG(1), PTR_ARG(2), arg(3), arg(4), (int)arg(5))); return;   /* getxattr */
+    case 235: HOST(syscall(235, (int)arg(0), PTR_ARG(1), PTR_ARG(2), arg(3), arg(4), (int)arg(5))); return; /* fgetxattr */
+    case 236: HOST(syscall(236, PTR_ARG(0), PTR_ARG(1), PTR_ARG(2), arg(3), arg(4), (int)arg(5))); return;   /* setxattr */
+    case 237: HOST(syscall(237, (int)arg(0), PTR_ARG(1), PTR_ARG(2), arg(3), arg(4), (int)arg(5))); return; /* fsetxattr */
+    case 238: HOST(syscall(238, PTR_ARG(0), PTR_ARG(1), (int)arg(2))); return;                              /* removexattr */
+    case 239: HOST(syscall(239, (int)arg(0), PTR_ARG(1), (int)arg(2))); return;                            /* fremovexattr */
+    case 240: HOST(syscall(240, PTR_ARG(0), PTR_ARG(1), arg(2), (int)arg(3))); return;                      /* listxattr */
+    case 241: HOST(syscall(241, (int)arg(0), PTR_ARG(1), arg(2), (int)arg(3))); return;                    /* flistxattr */
+    case 266:                               /* shm_open(name, flags, mode) */
+        HOST(syscall(266, PTR_ARG(0), (int)arg(1), (int)arg(2)));
+        return;
+    case 295:                               /* shared_region_map_file_np: no shared i386 region */
+        set_result(c, 0, EINVAL);
+        return;
+    case SYS___sysctl: sys_sysctl(c); return;
+    case SYS_gettimeofday: {                /* time in eax/edx, like the kernel */
+        struct timeval t;
+        gettimeofday(&t, 0);
+        c->r[EDX] = (uint32_t)t.tv_usec;
+        set_result(c, (uint32_t)t.tv_sec, 0);
+        return;
+    }
+    case SYS_getrlimit: {
+        struct rlimit r;
+        if (getrlimit((int)arg(0), &r) < 0) { set_result(c, 0, errno); return; }
+        st64(arg(1), r.rlim_cur); st64(arg(1) + 8, r.rlim_max);
+        set_result(c, 0, 0);
+        return;
+    }
+    case SYS_setrlimit: {
+        struct rlimit r;
+        r.rlim_cur = ld64(arg(1)); r.rlim_max = ld64(arg(1) + 8);
+        HOST(setrlimit((int)arg(0), &r));
+        return;
+    }
+    case SYS_getrusage: {
+        struct rusage r;
+        uint32_t i, *w = (uint32_t *)&r;
+        if (getrusage((int)arg(0), &r) < 0) { set_result(c, 0, errno); return; }
+        for (i = 0; i < sizeof r / 4; i++) st32(arg(1) + 4 * i, w[i]);
+        set_result(c, 0, 0);
+        return;
+    }
+    case SYS_readv: case SYS_writev: {
+        uint32_t cnt = arg(2), i;
+        struct iovec v[64];
+        if (cnt > 64) { set_result(c, 0, EINVAL); return; }
+        for (i = 0; i < cnt; i++) {
+            v[i].iov_base = (void *)(uintptr_t)ld32(arg(1) + 8 * i);
+            v[i].iov_len = ld32(arg(1) + 8 * i + 4);
+        }
+        if (n == SYS_readv) HOST(f_readv((int)arg(0), v, (int)cnt)); else HOST(f_writev((int)arg(0), v, (int)cnt));
+        return;
+    }
+    case SYS_pathconf: HOST(pathconf(gpath(arg(0)), (int)arg(1))); return;
+    case SYS_fpathconf: HOST(fpathconf((int)arg(0), (int)arg(1))); return;
+    /* Sockets: addresses (sockaddr_un, sockaddr_in) are byte-identical on both sides (length byte, family byte, port
+       and address in network byte order); swapped are length pointers, option values, msghdr/iovec and control data */
+    case SYS_socket: HOST(socket((int)arg(0), (int)arg(1), (int)arg(2))); return;
+    case SYS_connect: HOST(f_connect((int)arg(0), (const struct sockaddr *)PTR_ARG(1), (socklen_t)arg(2))); return;
+    case SYS_bind: HOST(bind((int)arg(0), (const struct sockaddr *)PTR_ARG(1), (socklen_t)arg(2))); return;
+    case SYS_listen: HOST(listen((int)arg(0), (int)arg(1))); return;
+    case SYS_shutdown: HOST(shutdown((int)arg(0), (int)arg(1))); return;
+    case SYS_accept: case SYS_getsockname: case SYS_getpeername: {
+        socklen_t l = arg(2) ? (socklen_t)ld32(arg(2)) : 0;
+        struct sockaddr *sa = (struct sockaddr *)PTR_ARG(1);
+        int r = n == SYS_accept ? f_accept((int)arg(0), sa, arg(2) ? &l : 0) :
+                n == SYS_getsockname ? getsockname((int)arg(0), sa, &l) : getpeername((int)arg(0), sa, &l);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        if (arg(2)) st32(arg(2), (uint32_t)l);
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case SYS_socketpair: {
+        int sv[2];
+        if (socketpair((int)arg(0), (int)arg(1), (int)arg(2), sv) < 0) { set_result(c, 0, errno); return; }
+        st32(arg(3), (uint32_t)sv[0]); st32(arg(3) + 4, (uint32_t)sv[1]);
+        set_result(c, 0, 0);
+        return;
+    }
+    case SYS_setsockopt: case SYS_getsockopt: {   /* swap values made of whole words (int, timeval, linger) */
+        uint32_t val = arg(3), k;
+        uint8_t buf[256];
+        socklen_t l = n == SYS_setsockopt ? (socklen_t)arg(4) : (arg(4) ? (socklen_t)ld32(arg(4)) : 0);
+        int r;
+        if (l > sizeof buf) { set_result(c, 0, EINVAL); return; }
+        if (n == SYS_setsockopt) {
+            if (val) memcpy(buf, (const void *)(uintptr_t)val, l);
+            if (l % 4 == 0 && l <= 16) for (k = 0; k < l; k += 4) { uint32_t w = ld32(val + k); memcpy(buf + k, &w, 4); }
+            HOST(setsockopt((int)arg(0), (int)arg(1), (int)arg(2), val ? buf : 0, l));
+            return;
+        }
+        r = getsockopt((int)arg(0), (int)arg(1), (int)arg(2), buf, &l);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        if (val) {
+            if (l % 4 == 0 && l <= 16) for (k = 0; k < l; k += 4) { uint32_t w; memcpy(&w, buf + k, 4); st32(val + k, w); }
+            else memcpy((void *)(uintptr_t)val, buf, l);
+        }
+        if (arg(4)) st32(arg(4), (uint32_t)l);
+        set_result(c, 0, 0);
+        return;
+    }
+    case SYS_sendto:
+        HOST(f_sendto((int)arg(0), PTR_ARG(1), arg(2), (int)arg(3), arg(4) ? (const struct sockaddr *)PTR_ARG(4) : 0, (socklen_t)arg(5)));
+        return;
+    case SYS_recvfrom: {
+        socklen_t l = arg(5) ? (socklen_t)ld32(arg(5)) : 0;
+        long r = f_recvfrom((int)arg(0), PTR_ARG(1), arg(2), (int)arg(3), arg(4) ? (struct sockaddr *)PTR_ARG(4) : 0, arg(5) ? &l : 0);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        if (arg(5)) st32(arg(5), (uint32_t)l);
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case SYS_sendmsg: case SYS_recvmsg: {
+        /* msghdr (guest, 28 bytes): name, namelen, iov, iovlen, control, controllen, flags; cmsghdr: len, level, type,
+           data (file descriptors for SCM_RIGHTS) */
+        uint32_t a = arg(1), gv = ld32(a + 8), gc = ld32(a + 16), cl = ld32(a + 20), k;
+        struct msghdr m;
+        struct iovec v[64];
+        uint8_t ctl[1024];
+        long r;
+        memset(&m, 0, sizeof m);
+        m.msg_name = (void *)(uintptr_t)ld32(a);
+        m.msg_namelen = ld32(a + 4);
+        m.msg_iovlen = (int)ld32(a + 12);
+        if (m.msg_iovlen > 64 || cl > sizeof ctl) { set_result(c, 0, EINVAL); return; }
+        for (k = 0; k < (uint32_t)m.msg_iovlen; k++) {
+            v[k].iov_base = (void *)(uintptr_t)ld32(gv + 8 * k);
+            v[k].iov_len = ld32(gv + 8 * k + 4);
+        }
+        m.msg_iov = v;
+        m.msg_control = gc && cl ? ctl : 0;
+        m.msg_controllen = gc ? cl : 0;
+        m.msg_flags = (int)ld32(a + 24);
+        if (n == SYS_sendmsg && gc && cl) {     /* control data guest -> host */
+            uint32_t o = 0;
+            memcpy(ctl, (const void *)(uintptr_t)gc, cl);
+            while (o + 12 <= cl) {
+                uint32_t len = ld32(gc + o), lev = ld32(gc + o + 4), type = ld32(gc + o + 8), j;
+                memcpy(ctl + o, &len, 4); memcpy(ctl + o + 4, &lev, 4); memcpy(ctl + o + 8, &type, 4);
+                if (lev == SOL_SOCKET && type == SCM_RIGHTS)
+                    for (j = 12; j + 4 <= len && o + j + 4 <= cl; j += 4) { uint32_t fd = ld32(gc + o + j); memcpy(ctl + o + j, &fd, 4); }
+                if (len < 12) break;
+                o += (len + 3) & ~3u;
+            }
+        }
+        r = n == SYS_sendmsg ? f_sendmsg((int)arg(0), &m, (int)arg(2)) : f_recvmsg((int)arg(0), &m, (int)arg(2));
+        if (r < 0) { set_result(c, 0, errno); return; }
+        if (n == SYS_recvmsg) {
+            if (gc && m.msg_control && m.msg_controllen) {   /* control data host -> guest */
+                uint32_t o = 0, ml = m.msg_controllen;
+                memcpy((void *)(uintptr_t)gc, ctl, ml);
+                while (o + 12 <= ml) {
+                    uint32_t len, lev, type, j;
+                    memcpy(&len, ctl + o, 4); memcpy(&lev, ctl + o + 4, 4); memcpy(&type, ctl + o + 8, 4);
+                    st32(gc + o, len); st32(gc + o + 4, lev); st32(gc + o + 8, type);
+                    if (lev == SOL_SOCKET && type == SCM_RIGHTS)
+                        for (j = 12; j + 4 <= len && o + j + 4 <= ml; j += 4) { uint32_t fd; memcpy(&fd, ctl + o + j, 4); st32(gc + o + j, fd); }
+                    if (len < 12) break;
+                    o += (len + 3) & ~3u;
+                }
+            }
+            st32(a + 4, m.msg_namelen);
+            st32(a + 20, gc ? m.msg_controllen : 0);
+            st32(a + 24, (uint32_t)m.msg_flags);
+        }
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case SYS_select: {                      /* fd_set: swap 32-bit words (bit n%32 in word n/32) */
+        int nfds = (int)arg(0), k, j, w, r;
+        fd_set f[3];
+        struct timeval tv;
+        uint32_t pz[3];
+        pz[0] = arg(1); pz[1] = arg(2); pz[2] = arg(3);
+        if (nfds < 0 || nfds > FD_SETSIZE) { set_result(c, 0, EINVAL); return; }
+        w = (nfds + 31) / 32;
+        for (k = 0; k < 3; k++)
+            if (pz[k]) { FD_ZERO(&f[k]); for (j = 0; j < w; j++) ((uint32_t *)(void *)&f[k])[j] = ld32(pz[k] + 4 * (uint32_t)j); }
+        if (arg(4)) { tv.tv_sec = (time_t)ld32(arg(4)); tv.tv_usec = (suseconds_t)ld32(arg(4) + 4); }
+        r = f_select(nfds, pz[0] ? &f[0] : 0, pz[1] ? &f[1] : 0, pz[2] ? &f[2] : 0, arg(4) ? &tv : 0);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        for (k = 0; k < 3; k++)
+            if (pz[k]) for (j = 0; j < w; j++) st32(pz[k] + 4 * (uint32_t)j, ((uint32_t *)(void *)&f[k])[j]);
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case SYS_poll: {                        /* pollfd: fd (32), events (16), revents (16) */
+        uint32_t a = arg(0), nf = arg(1), k;
+        struct pollfd pf[256];
+        int r;
+        if (nf > 256) { set_result(c, 0, EINVAL); return; }
+        for (k = 0; k < nf; k++) { pf[k].fd = (int)ld32(a + 8 * k); pf[k].events = (short)ld16(a + 8 * k + 4); pf[k].revents = 0; }
+        r = f_poll(pf, nf, (int)arg(2));
+        if (r < 0) { set_result(c, 0, errno); return; }
+        for (k = 0; k < nf; k++) st16(a + 8 * k + 6, (uint16_t)pf[k].revents);
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case SYS_fcntl: {
+        int cmd = (int)arg(1);
+        switch (cmd) {
+        case F_GETPATH: HOST(fcntl((int)arg(0), cmd, PTR_ARG(2))); return;
+        case F_GETLK: case F_SETLK: case F_SETLKW:
+            set_result(c, 0, 0);              /* locks: report success */
+            return;
+        default: HOST(fcntl((int)arg(0), cmd, (int)arg(2))); return;
+        }
+    }
+    case SYS_ioctl: {
+        unsigned long req = arg(1);
+        if (req == TIOCGETA) {
+            struct termios t;
+            uint32_t a = arg(2);
+            if (ioctl((int)arg(0), req, &t) < 0) { set_result(c, 0, errno); return; }
+            st32(a, (uint32_t)t.c_iflag); st32(a + 4, (uint32_t)t.c_oflag); st32(a + 8, (uint32_t)t.c_cflag);
+            st32(a + 12, (uint32_t)t.c_lflag); memcpy((void *)(uintptr_t)(a + 16), t.c_cc, 20);
+            st32(a + 0x24, (uint32_t)t.c_ispeed); st32(a + 0x28, (uint32_t)t.c_ospeed);
+            set_result(c, 0, 0);
+            return;
+        }
+        if (req == TIOCGWINSZ) {
+            struct winsize w;
+            uint32_t a = arg(2);
+            if (ioctl((int)arg(0), req, &w) < 0) { set_result(c, 0, errno); return; }
+            st16(a, w.ws_row); st16(a + 2, w.ws_col); st16(a + 4, w.ws_xpixel); st16(a + 6, w.ws_ypixel);
+            set_result(c, 0, 0);
+            return;
+        }
+        if (req == FIONREAD || req == FIODTYPE) {
+            int v;
+            if (ioctl((int)arg(0), req, &v) < 0) { set_result(c, 0, errno); return; }
+            st32(arg(2), (uint32_t)v);
+            set_result(c, 0, 0);
+            return;
+        }
+        if (req == FIOCLEX || req == FIONCLEX) { HOST(ioctl((int)arg(0), req)); return; }
+        if (req == 0x80086804) { set_result(c, 0, 0); return; }     /* dtrace helper: do not register the guest DOF */
+        fprintf(stderr, "rosetta: ioctl %08lx not implemented yet\n", req);
+        set_result(c, 0, ENOTTY);
+        return;
+    }
+    case 196: {                             /* getdirentries(fd, buf, n, long *basep) */
+        long base = 0;
+        int r = (int)syscall(196, (int)arg(0), PTR_ARG(1), (int)arg(2), &base);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        dirent_convert(arg(1), r);
+        if (arg(3)) st32(arg(3), (uint32_t)base);
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case 344: {                             /* getdirentries64(fd, buf, n, off_t *basep) */
+        off_t base = 0;
+        long r = (long)syscall(344, (int)arg(0), PTR_ARG(1), (int)arg(2), &base);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        dirent64_convert(arg(1), r);
+        if (arg(3)) st64(arg(3), (uint64_t)base);
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case SYS_sigaction: {
+        /* new: struct __sigaction (handler, trampoline, mask, flags); old: struct sigaction (handler, mask, flags) */
+        uint32_t sig = arg(0), fresh = arg(1), prev = arg(2);
+        if (sig == 0 || sig >= 32 || (fresh && (sig == SIGKILL || sig == SIGSTOP))) { set_result(c, 0, EINVAL); return; }
+        if (prev) { st32(prev, g_handler[sig]); st32(prev + 4, g_handler_mask[sig]); st32(prev + 8, g_handler_flags[sig]); }
+        if (fresh) {
+            g_handler[sig] = ld32(fresh);
+            if (ld32(fresh + 4)) g_tramp = ld32(fresh + 4);
+            g_handler_mask[sig] = ld32(fresh + 8);
+            g_handler_flags[sig] = ld32(fresh + 12);
+            sig_host_set((int)sig);
+            if (g_handler[sig] > 1) thread_watchdog_start();  /* handler: deliver the signal also in compute loops */
+        }
+        set_result(c, 0, 0);
+        return;
+    }
+    case SYS_sigprocmask: {
+        uint32_t how = arg(0), fresh = arg(1), prev = arg(2), old = g_sig_mask;
+        if (fresh) {
+            uint32_t m = ld32(fresh);
+            if (how == SIG_BLOCK) g_sig_mask |= m; else if (how == SIG_UNBLOCK) g_sig_mask &= ~m;
+            else if (how == SIG_SETMASK) g_sig_mask = m;
+            else { set_result(c, 0, EINVAL); return; }
+            g_sig_mask &= ~SIG_NEVER;
+        }
+        if (prev) st32(prev, old);
+        set_result(c, 0, 0);              /* pending signals that became unblocked are delivered by the dispatcher right afterwards */
+        return;
+    }
+    case 111: {                             /* sigsuspend(mask): wait until a signal is pending for the guest */
+        sigset_t all, before;
+        g_sig_after = g_sig_mask;
+        g_sig_mask = arg(0) & ~SIG_NEVER;
+        if (g_threads > 1)                   /* the host delivers the signal to any thread: check instead of sleeping */
+            while (!(g_sig_pending & ~g_sig_mask)) f_short_wait();
+        else {
+            sigfillset(&all);
+            sigprocmask(SIG_BLOCK, &all, &before);     /* do not lose a signal between check and wait */
+            while (!(g_sig_pending & ~g_sig_mask)) sigsuspend(&before);
+            sigprocmask(SIG_SETMASK, &before, 0);
+        }
+        g_sig_after_valid = 1;
+        set_result(c, 0, EINTR);
+        return;
+    }
+    case 184:                               /* sigreturn(uctx, sigstyle) */
+        if (arg(1) == 0x40000000u || arg(1) == 0x80000000u) { set_result(c, 0, 0); return; }    /* alternate stack: none */
+        if (!arg(0)) { set_result(c, 0, EINVAL); return; }
+        sig_back(c, arg(0));             /* EJUSTRETURN: no result in eax */
+        return;
+    case 83: case 86: {                     /* setitimer(which, new, old), getitimer(which, old): host clock */
+        struct itimerval fresh, prev;
+        uint32_t pn = n == 83 ? arg(1) : 0, pa = n == 83 ? arg(2) : arg(1);
+        int r;
+        if (pn) {
+            fresh.it_interval.tv_sec = (time_t)ld32(pn); fresh.it_interval.tv_usec = (suseconds_t)ld32(pn + 4);
+            fresh.it_value.tv_sec = (time_t)ld32(pn + 8); fresh.it_value.tv_usec = (suseconds_t)ld32(pn + 12);
+        }
+        r = n == 83 ? setitimer((int)arg(0), pn ? &fresh : 0, &prev) : getitimer((int)arg(0), &prev);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        if (pa) {
+            st32(pa, (uint32_t)prev.it_interval.tv_sec); st32(pa + 4, (uint32_t)prev.it_interval.tv_usec);
+            st32(pa + 8, (uint32_t)prev.it_value.tv_sec); st32(pa + 12, (uint32_t)prev.it_value.tv_usec);
+        }
+        set_result(c, 0, 0);
+        return;
+    }
+    case 333: case 334:                     /* __semwait_signal(_nocancel)(cond, mutex, timeout, relative, sec, nsec):
+                                               usleep, nanosleep, pthread_cond_timedwait; only numbers and port names,
+                                               interruptible (EINTR for the handler). Before, 334 returned ETIMEDOUT
+                                               at once: usleep never slept */
+        HOST(f_semwait((int)n, (int)arg(0), (int)arg(1), (int)arg(2), (int)arg(3), (long)arg(4), (int)arg(5)));
+        return;
+    case 328:                               /* __pthread_kill(thread, sig): only one thread */
+        if (arg(1)) sig_schedule((int)arg(1), 0);
+        set_result(c, 0, 0);
+        return;
+    case SYS_sigaltstack:
+        if (arg(1)) { st32(arg(1), 0); st32(arg(1) + 4, 0); st32(arg(1) + 8, SS_DISABLE); }
+        set_result(c, 0, 0);
+        return;
+    case SYS_kill:
+        if ((pid_t)arg(0) == getpid()) {    /* to itself: mark pending (the dispatcher delivers right afterwards) */
+            if (arg(1) >= 32) { set_result(c, 0, EINVAL); return; }
+            if (arg(1)) sig_schedule((int)arg(1), 0x10001 /* SI_USER */);
+            set_result(c, 0, 0);
+            return;
+        }
+        HOST(kill((pid_t)arg(0), (int)arg(1)));     /* a group (0, <0) also hits us via the host handler */
+        return;
+    case 294:                               /* shared_region_check_np: no shared i386 region */
+        set_result(c, 0, EINVAL);
+        return;
+    case 366:                               /* bsdthread_register(_thread_start, _wqthread, sizeof pthread) */
+        set_result(c, 0, thread_register(arg(0), arg(1), arg(2)));
+        return;
+    case 360: {                             /* bsdthread_create(fn, arg, stack or size, pthread, flags) */
+        uint32_t w = 0;
+        int f = thread_spawn(c, arg(0), arg(1), arg(2), arg(3), arg(4), &w);
+        set_result(c, w, f);
+        return;
+    }
+    case 367:                               /* workq_open: work queues (thread.c) */
+        set_result(c, 0, thread_wq_open());
+        return;
+    case 368:                               /* workq_ops(op, item, prio) */
+        set_result(c, 0, thread_wq_ops(c, arg(0), arg(1), arg(2)));
+        return;
+    case 142: {                             /* gethostuuid(uuid[16], timespec *timeout): CFPreferences per machine */
+        struct timespec ts;
+        if (arg(1)) { ts.tv_sec = (time_t)ld32(arg(1)); ts.tv_nsec = (long)ld32(arg(1) + 4); }
+        HOST(syscall(142, PTR_ARG(0), arg(1) ? &ts : 0));
+        return;
+    }
+    case 331:                               /* __disable_threadsignal (pthread_exit): signals go to the process */
+        set_result(c, 0, 0);
+        return;
+    case 361:                               /* bsdthread_terminate(stack, size, port, sem): only this thread */
+        thread_finish(c, arg(0), arg(1), arg(2), arg(3));
+        return;
+    case SYS_wait4: {
+        int status = 0;
+        pid_t r = f_wait4((pid_t)arg(0), arg(1) ? &status : 0, (int)arg(2));
+        if (r < 0) { set_result(c, 0, errno); return; }
+        if (arg(1)) st32(arg(1), (uint32_t)status);
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case SYS_getlogin: HOST(syscall(SYS_getlogin, PTR_ARG(0), arg(1))); return;
+    case SYS_fchmod: HOST(fchmod((int)arg(0), (mode_t)arg(1))); return;
+    case SYS_chmod: HOST(chmod((const char *)PTR_ARG(0), (mode_t)arg(1))); return;
+    case SYS_ftruncate: HOST(ftruncate((int)arg(0), (off_t)arg64(1))); return;
+    case SYS_symlink: HOST(symlink((const char *)PTR_ARG(0), (const char *)PTR_ARG(1))); return;
+    case SYS_link: HOST(link((const char *)PTR_ARG(0), (const char *)PTR_ARG(1))); return;
+    case SYS_flock: HOST(flock((int)arg(0), (int)arg(1))); return;
+    case SYS_utimes: {
+        struct timeval t[2];
+        if (!arg(1)) { HOST(utimes((const char *)PTR_ARG(0), 0)); return; }
+        ts_read(arg(1), &t[0]); ts_read(arg(1) + 8, &t[1]);
+        HOST(utimes((const char *)PTR_ARG(0), t));
+        return;
+    }
+    case SYS_getgroups: {
+        gid_t g[64];
+        int r = getgroups(arg(0) < 64 ? (int)arg(0) : 64, g), i;
+        if (r < 0) { set_result(c, 0, errno); return; }
+        for (i = 0; i < r && arg(0); i++) st32(arg(1) + 4 * (uint32_t)i, g[i]);
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    default: {
+        static uint8_t reported[1024];      /* report each number only once (retry loops flooded the output) */
+        if (n >= 1024 || !reported[n]++)
+            fprintf(stderr, "rosetta: BSD call %u not implemented yet (eip %08x, arguments %08x %08x %08x)\n", n, c->eip,
+                    arg(0), arg(1), arg(2));
+        set_result(c, 0, ENOSYS);
+        return;
+    }
+    }
+}
+
+/* ---------- machine-dependent (int $0x82) ---------- */
+
+void sys_machine(Cpu *c)
+{
+    uint32_t n = c->r[EAX];
+    g_arg_base = c->r[ESP];
+    if (g_log) fprintf(stderr, "[machine %u] %08x\n", n, arg(0));
+    switch (n) {
+    case 3:                                 /* thread_fast_set_cthread_self: base of gs */
+        c->gs_base = arg(0);
+        c->r[EAX] = 0x37;                   /* selector as under Intel 10.5 */
+        return;
+    default:
+        fprintf(stderr, "rosetta: machine-dependent call %u not implemented yet (eip %08x)\n", n, c->eip);
+        c->r[EAX] = (uint32_t)-1;
+    }
+}
+
+void sys_mach(Cpu *c)
+{
+    g_arg_base = c->r[ESP];
+    mach_trap(c, (int)-(int32_t)c->r[EAX], g_arg_base);
+}
+
+/* time per system call (ROSETTA_STATS): index is the BSD number, Mach traps from 512 */
+static uint64_t g_sys_time[1024];
+static unsigned g_sys_n[1024];
+static int g_sys_measure = -1;
+
+void sys_stats(void)
+{
+    mach_timebase_info_data_t tb;
+    int k, best, z;
+    uint64_t sum = 0;
+    if (g_sys_measure <= 0) return;
+    if (g_intel_on > 0) fprintf(stderr, "rosetta: %lu paths redirected to Intel versions (%s)\n", g_st_redirected, g_intel);
+    fprintf(stderr, "rosetta: %lu file mappings shared, %lu made private later\n", g_st_shared, g_st_private);
+    mach_timebase_info(&tb);
+    for (k = 0; k < 1024; k++) sum += g_sys_time[k];
+    fprintf(stderr, "rosetta: system calls %.2f ms, most expensive:", (double)sum * tb.numer / tb.denom / 1e6);
+    for (z = 0; z < 12; z++) {
+        for (best = -1, k = 0; k < 1024; k++) if (g_sys_n[k] && (best < 0 || g_sys_time[k] > g_sys_time[best])) best = k;
+        if (best < 0) break;
+        fprintf(stderr, " %s%d:%ux/%.2f", best >= 512 ? "mach" : "", best >= 512 ? best - 512 : best, g_sys_n[best],
+                (double)g_sys_time[best] * tb.numer / tb.denom / 1e6);
+        g_sys_n[best] = 0;
+    }
+    fprintf(stderr, " ms\n");
+}
+
+void sys_sysenter(Cpu *c)
+{
+    uint32_t back = c->r[EDX], stack = c->r[ECX];
+    int nr = (int32_t)c->r[EAX] < 0 ? 512 + (int)((-(int32_t)c->r[EAX]) & 511) : (int)(c->r[EAX] & 511);
+    uint64_t t0 = 0;
+    if (g_sys_measure < 0) g_sys_measure = getenv("ROSETTA_STATS") != 0;
+    if (g_sys_measure) t0 = mach_absolute_time();
+    g_arg_base = stack;
+    g_sig_eip_set = 0;
+    if ((int32_t)c->r[EAX] < 0) mach_trap(c, (int)-(int32_t)c->r[EAX], stack);
+    else sys_bsd(c, 1);
+    if (g_sys_measure) { g_sys_time[nr] += mach_absolute_time() - t0; g_sys_n[nr]++; }
+    if (g_sig_eip_set) { g_sig_eip_set = 0; return; }     /* sigreturn: state is already set */
+    c->eip = back;
+    c->r[ESP] = stack;
+}
