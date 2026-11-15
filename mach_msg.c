@@ -12,6 +12,8 @@
 #include "sys.h"
 #include "thread.h"
 #include "jit.h"
+#include <dlfcn.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,7 +107,8 @@ static const AtsType g_ats_types[0x2c] = {
     [0x06] = { "DeactivateFontsInContainer", { H(0x18), W(0x1c), W(0x20), LIST_END }, { LIST_END }, 0 },
     [0x07] = { "GetContainerMapping", { W(0x18), LIST_END }, { W(0x1c), W(0x20), LIST_END }, 0 },
     [0x08] = { "GetAnnexData", { W(0x18), W(0x1c), LIST_END }, { W(0x1c), W(0x20), W(0x28), LIST_END }, 0 },
-    [0x09] = { "GetFSRefForFileToken", { H(0x18), LIST_END }, { LIST_END }, 1 },
+    /* reply: a flattened FSRef from 0x18; ats_reply turns it into the path of the file (ats_fsref_path) */
+    [0x09] = { "GetFSRefForFileToken", { H(0x18), LIST_END }, { LIST_END }, 0 },
     [0x0a] = { "ResolveFileToken", { H(0x18), H(0x1a), LIST_END }, { H(0x18), LIST_END }, 1 },
     [0x0b] = { "ComputeFontSpecs", { W(0x18), LIST_END }, { LIST_END }, 0 },
     [0x0c] = { "MarkFontAsBad", { W(0x18), W(0x1c), LIST_END }, { LIST_END }, 0 },
@@ -373,6 +376,38 @@ static void ats_request(uint8_t *m, uint32_t n, AtsCopy *k)
     if (n >= ATS_SIZE) { w_swap(m, 0x6c0); w_swap(m, 0x6c4); }   /* client ID, server generation */
 }
 
+/* GetFSRefForFileToken: the server sends a flattened FSRef. A client that the rendezvous told about the other byte
+   order expects the path of the file instead (FSPathMakeRef in GetFSRefForFileToken of the Intel ATS), so the host's
+   File Manager turns the FSRef into a path. CarbonCore is loaded only when a program asks for this. */
+static int (*g_unflatten_fsref)(const void *flat, void *ref, void *unused);
+static int (*g_fsref_path)(const void *ref, uint8_t *path, uint32_t size);
+static pthread_once_t g_carbon_once = PTHREAD_ONCE_INIT;
+
+static void carbon_load(void)
+{
+    void *h = dlopen("/System/Library/Frameworks/CoreServices.framework/Frameworks/CarbonCore.framework/CarbonCore",
+                     RTLD_LAZY | RTLD_LOCAL);
+    if (h) {
+        g_unflatten_fsref = (int (*)(const void *, void *, void *))dlsym(h, "_FSUnflattenFSRef");
+        g_fsref_path = (int (*)(const void *, uint8_t *, uint32_t))dlsym(h, "FSRefMakePath");
+    }
+    if (!g_unflatten_fsref || !g_fsref_path) fprintf(stderr, "rosetta: CarbonCore not usable, font files have no path\n");
+}
+
+static void ats_fsref_path(uint8_t *m, uint32_t n)
+{
+    uint8_t ref[80], path[1024];
+    uint32_t room = (n < ATS_SIZE ? n : 0x6c0) - 0x18, len;
+    if (n < 0x18 + 8 + sizeof ref) return;
+    pthread_once(&g_carbon_once, carbon_load);
+    if (!g_unflatten_fsref || !g_fsref_path || g_unflatten_fsref(m + 0x18, ref, 0) ||
+        g_fsref_path(ref, path, sizeof path) || (len = strlen((const char *)path)) >= room) {
+        m[0x18] = 0;
+        return;
+    }
+    memcpy(m + 0x18, path, len + 1);
+}
+
 /* reply (header already in host byte order, content in server byte order) to guest byte order. typ: type of the
    request. The server replies in the buffer of the request; what it does not overwrite is still in its byte order
    and is swapped back as well. */
@@ -392,6 +427,7 @@ static void ats_reply(uint8_t *m, uint32_t n, uint32_t type, AtsCopy *k)
         start = SYNC_END;
     }
     if (t && t->ofa && !is_sync) ofa_reply(m, n, k);
+    else if (type == 9 && !is_sync && ((mach_msg_header_t *)m)->msgh_id == 0) ats_fsref_path(m, n);
     else if (t) {
         ats_fields(m, start, n, t->reply, 0, 0);
         ats_fields(m, start, n, t->request, 0, t->reply);
@@ -663,18 +699,20 @@ void mach_trap(Cpu *c, int n, uint32_t base)
     case 33: c->r[EAX] = (uint32_t)semaphore_signal(arg(0)); return;
     case 34: c->r[EAX] = (uint32_t)semaphore_signal_all(arg(0)); return;
     case 35: c->r[EAX] = (uint32_t)semaphore_signal_thread(arg(0), arg(1)); return;   /* pthread_cond_signal */
-    case 36: case 37: case 38: case 59: case 60: case 61: case 90: {
+    case 36: case 37: case 38: case 39: case 59: case 60: case 61: case 90: {
         /* wait or yield: the thread lock is released so the thread being waited for runs */
-        uint32_t a0 = arg(0), a1 = arg(1), a2 = arg(2), trunc = g_base;
+        uint32_t a0 = arg(0), a1 = arg(1), a2 = arg(2), a3 = n == 39 ? arg(3) : 0, trunc = g_base;
         uint64_t until = n == 90 ? arg64(0) : 0;
-        mach_timespec_t t;
+        mach_timespec_t t, t2;
         Cpu *fc = glock_release();
         kern_return_t k;
         t.tv_sec = a1; t.tv_nsec = (clock_res_t)a2;
+        t2.tv_sec = a2; t2.tv_nsec = (clock_res_t)a3;     /* 39: wait, signal, sec, nsec */
         switch (n) {
         case 36: k = semaphore_wait(a0); break;
         case 37: k = semaphore_wait_signal(a0, a1); break;
         case 38: k = semaphore_timedwait(a0, t); break;
+        case 39: k = semaphore_timedwait_signal(a0, a1, t2); break;
         case 59: k = swtch_pri((int)a0); break;
         case 60: k = swtch(); break;
         case 61: k = thread_switch(a0, (int)a1, a2); break;
@@ -689,6 +727,12 @@ void mach_trap(Cpu *c, int n, uint32_t base)
         vm_offset_t va = ld32(arg(2));
         c->r[EAX] = (uint32_t)map_fd((int)arg(0), arg(1), &va, (boolean_t)arg(3), arg(4));
         if (c->r[EAX] == KERN_SUCCESS) { st32(arg(2), (uint32_t)va); jit_new_mapped((uint32_t)va, arg(4)); }
+        return;
+    }
+    case 44: case 45: {                     /* task_name_for_pid, task_for_pid(target, pid, port *) (ps, top) */
+        mach_port_name_t t = 0;
+        c->r[EAX] = (uint32_t)(n == 45 ? task_for_pid(arg(0), (int)arg(1), &t) : task_name_for_pid(arg(0), (int)arg(1), &t));
+        if (c->r[EAX] == KERN_SUCCESS && arg(2)) st32(arg(2), t);
         return;
     }
     case 46: {                              /* pid_for_task(task, int *pid) */

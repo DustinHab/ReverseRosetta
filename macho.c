@@ -36,32 +36,39 @@ static int slot(uint32_t a, uint32_t n)
     return 0;
 }
 
+#define HEAD_FIRST 4096
+#define HEAD_MAX (1u << 20)
+
+/* The load commands can be longer than the first page (Safari, iCal: many libraries); then they are read again into
+   a buffer of their size */
 int macho_load(const char *path, uint32_t slide, Image *image)
 {
-    uint8_t head[4096], *lc;
+    uint8_t first[HEAD_FIRST], *head = first, *lc;
     uint32_t part = 0, n, i, ncmds, size;
     int fd = open(path, O_RDONLY);
     memset(image, 0, sizeof *image);
     image->slide = slide;
     image->from = 0xffffffff;
     if (fd < 0) { fprintf(stderr, "rosetta: %s not readable\n", path); return -1; }
-    if (pread(fd, head, sizeof head, 0) < 32) goto broken;
+    if (pread(fd, head, HEAD_FIRST, 0) < 32) goto broken;
     if (be(head) == 0xcafebabe) {           /* fat: header in big endian */
         uint32_t k = be(head + 4);
-        for (i = 0; i < k && 8 + 20 * (i + 1) <= sizeof head; i++)
+        for (i = 0; i < k && 8 + 20 * (i + 1) <= HEAD_FIRST; i++)
             if (be(head + 8 + 20 * i) == CPU_I386) { part = be(head + 8 + 20 * i + 8); break; }
         if (i == k) { fprintf(stderr, "rosetta: %s has no Intel part (i386)\n", path); close(fd); return -1; }
-        if (pread(fd, head, sizeof head, part) < 32) goto broken;
+        if (pread(fd, head, HEAD_FIRST, part) < 32) goto broken;
     }
     if (le(head) != 0xfeedface || le(head + 4) != CPU_I386) {
         fprintf(stderr, "rosetta: %s is not a 32-bit Intel program\n", path);
-        close(fd);
-        return -1;
+        goto fail;
     }
     image->filetype = le(head + 12);
     ncmds = le(head + 16);
     size = le(head + 20);
-    if (28 + size > sizeof head) goto broken;
+    if (size > HEAD_MAX) goto broken;
+    if (28 + size > HEAD_FIRST) {
+        if (!(head = malloc(28 + size)) || pread(fd, head, 28 + size, part) != (ssize_t)(28 + size)) goto broken;
+    }
     lc = head + 28;
     for (n = 0; n < ncmds; n++) {
         uint32_t cmd = le(lc), cmdsize = le(lc + 4);
@@ -75,8 +82,7 @@ int macho_load(const char *path, uint32_t slide, Image *image)
             prot = (prot & 7) | PROT_READ;
             if (slot(a, vmsize)) {
                 fprintf(stderr, "rosetta: no space for %s %s at %08x (%u bytes)\n", path, name, a, vmsize);
-                close(fd);
-                return -1;
+                goto fail;
             }
             if (filesize) {
                 uint32_t fileslice = (filesize + 4095) & ~4095u;
@@ -84,17 +90,15 @@ int macho_load(const char *path, uint32_t slide, Image *image)
                 if (mmap((void *)(uintptr_t)a, fileslice, (int)prot, MAP_FIXED | MAP_PRIVATE, fd,
                          (off_t)part + fileoff) == MAP_FAILED) {
                     perror("rosetta: mmap");
-                    close(fd);
-                    return -1;
+                    goto fail;
                 }
                 if (fileslice < vmsize &&
                     mmap((void *)(uintptr_t)(a + fileslice), vmsize - fileslice, (int)prot, MAP_FIXED | MAP_PRIVATE | MAP_ANON,
-                         -1, 0) == MAP_FAILED) { perror("rosetta: mmap"); close(fd); return -1; }
+                         -1, 0) == MAP_FAILED) { perror("rosetta: mmap"); goto fail; }
                 if (fileoff == 0) image->mh = a;
             } else if (mmap((void *)(uintptr_t)a, vmsize, (int)prot, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0) == MAP_FAILED) {
                 perror("rosetta: mmap");
-                close(fd);
-                return -1;
+                goto fail;
             }
             if (a < image->from) image->from = a;
             if (a + vmsize > image->bis) image->bis = a + vmsize;
@@ -111,10 +115,13 @@ int macho_load(const char *path, uint32_t slide, Image *image)
         lc += cmdsize;
     }
     close(fd);
+    if (head != first) free(head);
     if (!image->entrypoint) { fprintf(stderr, "rosetta: %s has no entry point\n", path); return -1; }
     return 0;
 broken:
     fprintf(stderr, "rosetta: %s is corrupt or its header is too large\n", path);
+fail:
     close(fd);
+    if (head != first) free(head);
     return -1;
 }

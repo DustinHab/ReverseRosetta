@@ -34,6 +34,7 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <utmpx.h>
+#include <libproc.h>
 #include <mach/vm_inherit.h>
 
 extern char **environ;
@@ -617,6 +618,35 @@ static void t_sysctl(void)
         }
     endutxent();
     printf("utmpx: %d user entries\n", k);
+    {   /* libproc (proc_info): process list, own process, a descriptor's path */
+        int pids[4096], n, fd;
+        struct proc_bsdinfo bi;
+        struct proc_taskinfo ti;
+        struct vnode_fdinfowithpath vp;
+        char path[PROC_PIDPATHINFO_MAXSIZE];
+        n = proc_listpids(PROC_ALL_PIDS, 0, pids, sizeof pids);
+        for (k = 0; k < n / (int)sizeof(int) && pids[k] != getpid(); k++) ;
+        printf("proc_listpids: plausible %d, own pid in it %d\n", n > 10 * (int)sizeof(int), k < n / (int)sizeof(int));
+        memset(&bi, 0, sizeof bi);
+        n = proc_pidinfo(getpid(), PROC_PIDTBSDINFO, 0, &bi, sizeof bi);
+        printf("PROC_PIDTBSDINFO: size %d, pid %s, ppid %s, uid %s, name %s, started %s\n", n, bi.pbi_pid == (uint32_t)getpid() ? "right" : "wrong",
+               bi.pbi_ppid == (uint32_t)getppid() ? "right" : "wrong", bi.pbi_uid == getuid() ? "right" : "wrong",
+               strncmp(bi.pbi_comm, "syscalls", 8) ? bi.pbi_comm : "this program", bi.pbi_start.tv_sec > 1000000000 ? "plausible" : "wrong");
+        n = proc_pidinfo(getpid(), PROC_PIDTASKINFO, 0, &ti, sizeof ti);
+        printf("PROC_PIDTASKINFO: size %d, threads %s, resident size plausible %d\n", n, ti.pti_threadnum >= 1 && ti.pti_threadnum < 100 ? "plausible" : "wrong",
+               ti.pti_resident_size > 100000 && ti.pti_resident_size < 2000000000ull);
+        n = proc_pidpath(getpid(), path, sizeof path);
+        printf("proc_pidpath: %s\n", n > 0 && strstr(path, "syscalls") ? "this program" : path);
+        snprintf(tmp, sizeof tmp, "/tmp/syscalls_proc.%d", (int)getpid());
+        fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        write(fd, "12345", 5);
+        n = proc_pidfdinfo(getpid(), fd, PROC_PIDFDVNODEPATHINFO, &vp, sizeof vp);
+        printf("PROC_PIDFDVNODEPATHINFO: size %d, path %s, size %lld, offset %lld, mode %o\n", n,
+               strstr(vp.pvip.vip_path, "syscalls_proc") ? "right" : vp.pvip.vip_path, (long long)vp.pvip.vip_vi.vi_stat.vst_size,
+               (long long)vp.pfi.fi_offset, vp.pvip.vip_vi.vi_stat.vst_mode & 07777);
+        close(fd);
+        unlink(tmp);
+    }
 }
 
 int main(int argc, char **argv)

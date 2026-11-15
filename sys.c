@@ -497,6 +497,167 @@ static uint32_t procargs2_own(uint32_t a, uint32_t max)
     return need;
 }
 
+/* ---------- proc_info (libproc: proc_listpids, proc_pidinfo, proc_pidfdinfo, proc_pidpath; lsof, ps, top) ----------
+ * The kernel writes host structures; the layouts are the same for i386 and PowerPC (32 bit, 64-bit fields at 4-byte
+ * alignment), the fields are swapped one by one (offsetof of the host's definitions). Kinds without conversion
+ * (sockets, POSIX shared memory) answer ENOTSUP instead of unconverted data. */
+#include <sys/proc_info.h>
+#include <libproc.h>
+typedef char proc_info_layout_check[sizeof(struct vinfo_stat) == 136 && sizeof(struct proc_fileinfo) == 20 &&
+                                    sizeof(struct vnode_info) == 152 && sizeof(struct proc_taskinfo) == 96 ? 1 : -1];
+
+static void sw_n(uint32_t a, size_t n) { if (n == 2) sw16(a); else if (n == 4) sw32(a); else if (n == 8) sw64(a); }
+#define SWF(a, T, f) sw_n((a) + (uint32_t)offsetof(T, f), sizeof(((T *)0)->f))
+
+static void vinfo_stat_swap(uint32_t a)
+{
+    SWF(a, struct vinfo_stat, vst_dev); SWF(a, struct vinfo_stat, vst_mode); SWF(a, struct vinfo_stat, vst_nlink);
+    SWF(a, struct vinfo_stat, vst_ino); SWF(a, struct vinfo_stat, vst_uid); SWF(a, struct vinfo_stat, vst_gid);
+    SWF(a, struct vinfo_stat, vst_atime); SWF(a, struct vinfo_stat, vst_atimensec);
+    SWF(a, struct vinfo_stat, vst_mtime); SWF(a, struct vinfo_stat, vst_mtimensec);
+    SWF(a, struct vinfo_stat, vst_ctime); SWF(a, struct vinfo_stat, vst_ctimensec);
+    SWF(a, struct vinfo_stat, vst_birthtime); SWF(a, struct vinfo_stat, vst_birthtimensec);
+    SWF(a, struct vinfo_stat, vst_size); SWF(a, struct vinfo_stat, vst_blocks); SWF(a, struct vinfo_stat, vst_blksize);
+    SWF(a, struct vinfo_stat, vst_flags); SWF(a, struct vinfo_stat, vst_gen); SWF(a, struct vinfo_stat, vst_rdev);
+}
+
+static void vnode_info_swap(uint32_t a)
+{
+    vinfo_stat_swap(a + (uint32_t)offsetof(struct vnode_info, vi_stat));
+    SWF(a, struct vnode_info, vi_type); SWF(a, struct vnode_info, vi_fsid.val[0]); SWF(a, struct vnode_info, vi_fsid.val[1]);
+}
+
+static void fileinfo_swap(uint32_t a)
+{
+    SWF(a, struct proc_fileinfo, fi_openflags); SWF(a, struct proc_fileinfo, fi_status);
+    SWF(a, struct proc_fileinfo, fi_offset); SWF(a, struct proc_fileinfo, fi_type);
+}
+
+static void bsdinfo_swap(uint32_t a)
+{
+    uint32_t o;
+    for (o = 0; o < offsetof(struct proc_bsdinfo, pbi_comm); o += 4) sw32(a + o);     /* flags .. svgid */
+    SWF(a, struct proc_bsdinfo, pbi_nfiles); SWF(a, struct proc_bsdinfo, pbi_pgid); SWF(a, struct proc_bsdinfo, pbi_pjobc);
+    SWF(a, struct proc_bsdinfo, e_tdev); SWF(a, struct proc_bsdinfo, e_tpgid);
+    SWF(a, struct proc_bsdinfo, pbi_start.tv_sec); SWF(a, struct proc_bsdinfo, pbi_start.tv_usec);
+    SWF(a, struct proc_bsdinfo, pbi_nice);
+}
+
+static void taskinfo_swap(uint32_t a)
+{
+    uint32_t o;
+    for (o = 0; o < offsetof(struct proc_taskinfo, pti_policy); o += 8) sw64(a + o);
+    for (; o < sizeof(struct proc_taskinfo); o += 4) sw32(a + o);
+}
+
+static void threadinfo_swap(uint32_t a)     /* the name stays as it is (bytes) */
+{
+    uint32_t o;
+    sw64(a); sw64(a + 8);
+    for (o = 16; o < offsetof(struct proc_threadinfo, pth_name); o += 4) sw32(a + o);
+}
+
+static void regioninfo_swap(uint32_t a)
+{
+    uint32_t o;
+    for (o = 0; o < sizeof(struct proc_regioninfo); o += 4) {
+        if (o == offsetof(struct proc_regioninfo, pri_offset) || o == offsetof(struct proc_regioninfo, pri_address) ||
+            o == offsetof(struct proc_regioninfo, pri_size)) { sw64(a + o); o += 4; }
+        else sw32(a + o);
+    }
+}
+
+#define VIP_VI offsetof(struct vnode_info_path, vip_vi)
+
+/* the proc_info system call (callnum: 1 list of pids, 2 information on a process, 3 on one of its descriptors,
+   4 kernel message buffer); returns the length written, 0 on error (errno) as the host's libproc does */
+static int proc_info_call(int callnum, int pid, int flavor, uint64_t arg, uint32_t buf, int size)
+{
+    int r = 0;
+    uint32_t k;
+    switch (callnum) {
+    case 1:
+        r = proc_listpids((uint32_t)pid, (uint32_t)flavor, (void *)(uintptr_t)buf, size);
+        if (r > 0 && buf) for (k = 0; k + 4 <= (uint32_t)r; k += 4) sw32(buf + k);
+        return r;
+    case 2:
+        switch (flavor) {
+        case PROC_PIDLISTFDS: case PROC_PIDTASKALLINFO: case PROC_PIDTBSDINFO: case PROC_PIDTASKINFO:
+        case PROC_PIDTHREADINFO: case PROC_PIDLISTTHREADS: case PROC_PIDREGIONINFO: case PROC_PIDREGIONPATHINFO:
+        case PROC_PIDVNODEPATHINFO: case PROC_PIDPATHINFO:
+            break;
+        default: errno = ENOTSUP; return 0;
+        }
+        /* the own process: the kernel knows it as rosetta (the path: 10.5 answers 0 for success there) */
+        if (flavor == PROC_PIDPATHINFO && pid == getpid() && g_args_path && buf && strlen(g_args_path) < (size_t)size) {
+            strcpy((char *)(uintptr_t)buf, g_args_path);
+            return 0;
+        }
+        r = proc_pidinfo(pid, flavor, arg, (void *)(uintptr_t)buf, size);
+        if (r <= 0 || !buf) return r;
+        if (pid == getpid() && g_args_path) {
+            const char *s = strrchr(g_args_path, '/') ? strrchr(g_args_path, '/') + 1 : g_args_path;
+            uint32_t b = flavor == PROC_PIDTBSDINFO ? buf : flavor == PROC_PIDTASKALLINFO ? buf + (uint32_t)offsetof(struct proc_taskallinfo, pbsd) : 0;
+            if (b) {
+                strncpy((char *)(uintptr_t)(b + offsetof(struct proc_bsdinfo, pbi_comm)), s, MAXCOMLEN);
+                *(char *)(uintptr_t)(b + offsetof(struct proc_bsdinfo, pbi_comm) + MAXCOMLEN) = 0;
+                strncpy((char *)(uintptr_t)(b + offsetof(struct proc_bsdinfo, pbi_name)), s, 2 * MAXCOMLEN);
+                *(char *)(uintptr_t)(b + offsetof(struct proc_bsdinfo, pbi_name) + 2 * MAXCOMLEN) = 0;
+            }
+        }
+        switch (flavor) {
+        case PROC_PIDLISTFDS: for (k = 0; k + 4 <= (uint32_t)r; k += 4) sw32(buf + k); break;
+        case PROC_PIDLISTTHREADS: for (k = 0; k + 8 <= (uint32_t)r; k += 8) sw64(buf + k); break;
+        case PROC_PIDTBSDINFO: bsdinfo_swap(buf); break;
+        case PROC_PIDTASKINFO: taskinfo_swap(buf); break;
+        case PROC_PIDTASKALLINFO:
+            bsdinfo_swap(buf + (uint32_t)offsetof(struct proc_taskallinfo, pbsd));
+            taskinfo_swap(buf + (uint32_t)offsetof(struct proc_taskallinfo, ptinfo));
+            break;
+        case PROC_PIDTHREADINFO: threadinfo_swap(buf); break;
+        case PROC_PIDREGIONINFO: regioninfo_swap(buf); break;
+        case PROC_PIDREGIONPATHINFO:
+            regioninfo_swap(buf + (uint32_t)offsetof(struct proc_regionwithpathinfo, prp_prinfo));
+            vnode_info_swap(buf + (uint32_t)offsetof(struct proc_regionwithpathinfo, prp_vip) + VIP_VI);
+            break;
+        case PROC_PIDVNODEPATHINFO:
+            vnode_info_swap(buf + (uint32_t)offsetof(struct proc_vnodepathinfo, pvi_cdir) + VIP_VI);
+            vnode_info_swap(buf + (uint32_t)offsetof(struct proc_vnodepathinfo, pvi_rdir) + VIP_VI);
+            break;
+        }
+        return r;
+    case 3:
+        switch (flavor) {
+        case PROC_PIDFDVNODEINFO: case PROC_PIDFDVNODEPATHINFO: case PROC_PIDFDPIPEINFO: case PROC_PIDFDKQUEUEINFO: break;
+        default: errno = ENOTSUP; return 0;
+        }
+        r = proc_pidfdinfo(pid, (int)arg, flavor, (void *)(uintptr_t)buf, size);
+        if (r <= 0 || !buf) return r;
+        fileinfo_swap(buf);                 /* struct proc_fileinfo first in all of them */
+        switch (flavor) {
+        case PROC_PIDFDVNODEINFO: vnode_info_swap(buf + (uint32_t)offsetof(struct vnode_fdinfo, pvi)); break;
+        case PROC_PIDFDVNODEPATHINFO: vnode_info_swap(buf + (uint32_t)offsetof(struct vnode_fdinfowithpath, pvip) + VIP_VI); break;
+        case PROC_PIDFDPIPEINFO: {
+            uint32_t p = buf + (uint32_t)offsetof(struct pipe_fdinfo, pipeinfo);
+            vinfo_stat_swap(p + (uint32_t)offsetof(struct pipe_info, pipe_stat));
+            SWF(p, struct pipe_info, pipe_handle); SWF(p, struct pipe_info, pipe_peerhandle); SWF(p, struct pipe_info, pipe_status);
+            break;
+        }
+        case PROC_PIDFDKQUEUEINFO: {
+            uint32_t q = buf + (uint32_t)offsetof(struct kqueue_fdinfo, kqueueinfo);
+            vinfo_stat_swap(q + (uint32_t)offsetof(struct kqueue_info, kq_stat));
+            SWF(q, struct kqueue_info, kq_state);
+            break;
+        }
+        }
+        return r;
+    case 4:
+        return proc_kmsgbuf((void *)(uintptr_t)buf, (uint32_t)size);
+    }
+    errno = EINVAL;
+    return 0;
+}
+
 /* struct vfsconf (40 bytes on both sides): operations pointer, vfc_name[15], typenum, refcount, flags, two pointers */
 typedef char vfsconf_layout_check[sizeof(struct vfsconf) == 40 && offsetof(struct vfsconf, vfc_typenum) == 20 ? 1 : -1];
 #define NFS_NFSSTATS_OID 1                  /* vfs.<nfs typenum>.1: struct nfsstats, ints only */
@@ -2318,6 +2479,14 @@ static void sys_bsd_call(Cpu *c, int sysenter)
     case 380:                               /* __mac_execve(path, argv, envp, label): the label is not passed on */
         set_result(c, 0, proc_exec((const char *)PTR_ARG(0), arg(1), arg(2), g_sig_mask));
         return;
+    case 336: {                             /* proc_info(callnum, pid, flavor, uint64 arg, buffer, size) */
+        int r;
+        errno = 0;
+        r = proc_info_call((int)arg(0), (int)arg(1), (int)arg(2), arg64(3), arg(5), (int)arg(6));
+        if (r <= 0 && errno) set_result(c, 0, errno);
+        else set_result(c, (uint32_t)r, 0);
+        return;
+    }
     case 381 ... 395: case 424 ... 426:     /* MAC framework (sandbox, quarantine, labels): not offered to the guest */
         set_result(c, 0, ENOSYS);
         return;
