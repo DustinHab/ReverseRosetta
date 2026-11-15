@@ -497,10 +497,31 @@ static uint32_t procargs2_own(uint32_t a, uint32_t max)
     return need;
 }
 
+/* struct vfsconf (40 bytes on both sides): operations pointer, vfc_name[15], typenum, refcount, flags, two pointers */
+typedef char vfsconf_layout_check[sizeof(struct vfsconf) == 40 && offsetof(struct vfsconf, vfc_typenum) == 20 ? 1 : -1];
+#define NFS_NFSSTATS_OID 1                  /* vfs.<nfs typenum>.1: struct nfsstats, ints only */
+
+/* filesystem type number of NFS (getvfsbyname of the host, once); -1: none */
+static int nfs_typenum(void)
+{
+    static int t = -2;
+    struct vfsconf v;
+    if (t == -2) t = getvfsbyname("nfs", &v) == 0 ? v.vfc_typenum : -1;
+    return t;
+}
+
 /* results of sysctl that are structures (CTLTYPE_STRUCT or node handlers): converted by name; 1 = done */
 static int sysctl_struct_swap(const int *name, uint32_t n, uint32_t a, uint32_t l)
 {
     uint32_t k;
+    if (n == 4 && name[0] == CTL_VFS && name[1] == VFS_GENERIC && name[2] == VFS_CONF) {   /* getvfsbyname, lsvfs */
+        for (k = 0; k + 40 <= l; k += 40) { sw32(a + k); sw32_range(a + k, 20, 40); }
+        return 1;
+    }
+    if (n == 3 && name[0] == CTL_VFS && name[2] == NFS_NFSSTATS_OID && name[1] >= 0 && name[1] == nfs_typenum()) {
+        sw32_range(a, 0, l);                /* nfsstat */
+        return 1;
+    }
     if (n >= 3 && name[0] == CTL_KERN && name[1] == KERN_PROC) {
         for (k = 0; k + KINFO_PROC_SIZE <= l; k += KINFO_PROC_SIZE) {
             kinfo_proc_swap(a + k);
@@ -874,6 +895,25 @@ int sys_signal(Cpu *c, int sig, int code, const char *reason)
     return 0;
 }
 
+/* Memory fault of guest code (main.c memfault): with a handler for SIGSEGV/SIGBUS that is not blocked, the signal
+   is marked pending with the fault address and code (1); the dispatcher delivers it. exact = 0: eip and registers
+   are approximate (fault inside a translated block, jit_fault_state). The handler may then end the program, jump
+   away (siglongjmp) or continue elsewhere (changed eip in the context); if it returns to the same place, the
+   program ends with the signal (sig_back) instead of running on with a wrong state. Otherwise 0: as without
+   handler */
+#define FAULT_LOOSE 0x4c4f4f53u              /* "LOOS" in the reserved area of the float state: approximate fault */
+static int g_fault_loose;                    /* signal whose pending delivery comes from an approximate fault */
+
+int sys_fault(Cpu *c, int sig, int code, uint32_t addr, int exact)
+{
+    (void)c;
+    if ((sig != SIGSEGV && sig != SIGBUS) || g_handler[sig] <= 1 || (g_sig_mask & SIG_BIT(sig))) return 0;
+    sig_schedule(sig, code);
+    g_sig_info[sig].addr = addr;
+    g_fault_loose = exact ? 0 : sig;
+    return 1;
+}
+
 /* deliver a pending, unblocked signal (called at the dispatcher, guest state complete in Cpu) */
 void sig_deliver(Cpu *c)
 {
@@ -923,6 +963,10 @@ void sig_deliver(Cpu *c)
         memcpy((void *)(uintptr_t)(f + 168 + 16 * (uint32_t)k), c->xmm[k].b, 16);
     }
     st32(f + 296, 0x524f5354u); st32(f + 300, (uint32_t)c->st_top); st32(f + 304, c->x87_depth);
+    if (g_fault_loose == sig) {              /* approximate memory fault: returning to this eip ends the program */
+        st32(f + 308, FAULT_LOOSE); st32(f + 312, c->eip); st32(f + 316, (uint32_t)sig);
+        g_fault_loose = 0;
+    }
     /* siginfo: si_signo, si_errno, si_code, si_pid, si_uid, si_status, si_addr, si_value */
     memset((void *)(uintptr_t)sinfo, 0, 64);
     st32(sinfo, (uint32_t)sig); st32(sinfo + 8, (uint32_t)g_sig_info[sig].code);
@@ -949,6 +993,22 @@ static void sig_back(Cpu *c, uint32_t uctx)
     c->r[EDI] = ld32(mctx + 28); c->r[ESI] = ld32(mctx + 32); c->r[EBP] = ld32(mctx + 36); c->r[ESP] = ld32(mctx + 40);
     flags_set(c, ld32(mctx + 48) & ~F_TF);
     c->eip = ld32(mctx + 52);
+    if (ld32(f + 308) == FAULT_LOOSE && c->eip == ld32(f + 312)) {
+        /* the handler of an approximate memory fault returns to the faulting place: natively the instruction would
+           fault again; the state of the translated block is not known exactly, so end as the kernel would end a
+           program whose handler gives up (terminated by the signal) */
+        int sig = (int)ld32(f + 316);
+        char what[160];
+        main_crash_begin();
+        state_show(c, "memory fault in translated code, the handler returned to the same place");
+        snprintf(what, sizeof what, "memory fault at eip %08x, handler returned (signal %d)", c->eip, sig);
+        main_crash_end(what);
+        c->finished = 1;
+        c->end_code = 128 + sig;
+        g_end_signal = sig;
+        g_sig_eip_set = 1;
+        return;
+    }
     c->fpu_ctl = ld16(f + 8); c->fpu_status = ld16(f + 10); c->mxcsr = ld32(f + 32);
     for (k = 0; k < 8; k++) memcpy(c->xmm[k].b, (const void *)(uintptr_t)(f + 168 + 16 * (uint32_t)k), 16);
     if (ld32(f + 296) == 0x524f5354u) {     /* written by us: restore the x87 stack */

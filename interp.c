@@ -10,6 +10,9 @@
 #include "commpage.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <pthread.h>
 #include <mach/mach_time.h>
 #include <mach/mach.h>
 
@@ -194,7 +197,9 @@ static inline void rm_write(Cpu *c, const Insn *b, int sz, uint32_t a, uint32_t 
     else mem_write(a, sz, v);
 }
 
-static inline void push(Cpu *c, uint32_t v) { c->r[ESP] -= 4; st32(c->r[ESP], v); }
+/* store first: if the stack page faults, esp is still unchanged (as on x86; the guest's handler sees it, a retry
+   pushes again) */
+static inline void push(Cpu *c, uint32_t v) { st32(c->r[ESP] - 4, v); c->r[ESP] -= 4; }
 static inline uint32_t pop(Cpu *c) { uint32_t v = ld32(c->r[ESP]); c->r[ESP] += 4; return v; }
 
 /* ---------- ALU ---------- */
@@ -676,15 +681,19 @@ static inline __attribute__((always_inline)) int step_core(Cpu *c)
     case 0xcc:
         c->eip = following;                 /* trap: eip after the instruction */
         return sys_signal(c, 5 /* SIGTRAP */, 1 /* TRAP_BRKPT */, "int3") ? RUN_SIGNAL : RUN_ERROR;
-    case 0xcd:
+    case 0xcd: {
+        int was = g_guest_exec;
         c->eip = following;                 /* system calls see eip after the instruction */
+        g_guest_exec = 0;                   /* a fault in the translator's system call code is not the guest's */
         switch (b.imm & 0xff) {
         case 0x80: sys_bsd(c, 0); break;
         case 0x81: sys_mach(c); break;
         case 0x82: sys_machine(c); break;
-        default: state_show(c, "int with unknown number"); return RUN_UNKNOWN;
+        default: g_guest_exec = was; state_show(c, "int with unknown number"); return RUN_UNKNOWN;
         }
+        g_guest_exec = was;
         return c->finished ? RUN_END : RUN_OK;
+    }
     case 0xe0: case 0xe1: case 0xe2: {      /* loopne, loope, loop */
         int zf;
         c->r[ECX]--;
@@ -758,10 +767,14 @@ static inline __attribute__((always_inline)) int step_core(Cpu *c)
         c->r[EAX] = (uint32_t)t; c->r[EDX] = (uint32_t)(t >> 32);
         break;
     }
-    case OP_0F | 0x34:                      /* sysenter: the return address is in edx, the stack in ecx */
+    case OP_0F | 0x34: {                    /* sysenter: the return address is in edx, the stack in ecx */
+        int was = g_guest_exec;
         c->eip = following;
+        g_guest_exec = 0;
         sys_sysenter(c);
+        g_guest_exec = was;
         return c->finished ? RUN_END : RUN_OK;
+    }
     case OP_0F | 0x40: case OP_0F | 0x41: case OP_0F | 0x42: case OP_0F | 0x43:
     case OP_0F | 0x44: case OP_0F | 0x45: case OP_0F | 0x46: case OP_0F | 0x47:
     case OP_0F | 0x48: case OP_0F | 0x49: case OP_0F | 0x4a: case OP_0F | 0x4b:
@@ -894,14 +907,24 @@ static inline __attribute__((always_inline)) int step_core(Cpu *c)
     return RUN_OK;
 }
 
-int step(Cpu *c) { return step_core(c); }
+volatile int g_guest_exec;
+
+int step(Cpu *c)
+{
+    int was = g_guest_exec, r;
+    g_guest_exec = 1;
+    r = step_core(c);
+    g_guest_exec = was;
+    return r;
+}
 
 /* Up to max instructions straight ahead (translator: cold code). Stops after a jump (*jumped = 1), before the
    commpage, as soon as *halt is set (cache is being flushed) or on an error/end; *n = executed instructions */
 int steps(Cpu *c, int max, int *n, int *jumped, volatile int *halt)
 {
-    int k = 0, r = RUN_OK;
+    int k = 0, r = RUN_OK, was = g_guest_exec;
     *jumped = 0;
+    g_guest_exec = 1;
     while (k < max) {
         uint32_t e0 = c->eip;
         r = step_core(c);
@@ -910,8 +933,22 @@ int steps(Cpu *c, int max, int *n, int *jumped, volatile int *halt)
         if (c->eip - e0 - 1 >= 15) { *jumped = 1; break; }
         if (*halt || c->eip - COMMPAGE_BASE < COMMPAGE_SIZE) break;
     }
+    g_guest_exec = was;
     *n = k;
     return r;
+}
+
+/* the guest's handler for a memory fault takes over: main.c jumped back here out of the host signal handler, which
+   leaves SIGSEGV/SIGBUS blocked in the host */
+void interp_fault_landing(Cpu *c)
+{
+    sigset_t m;
+    (void)c;
+    g_guest_exec = 0;
+    sigemptyset(&m);
+    sigaddset(&m, SIGSEGV);
+    sigaddset(&m, SIGBUS);
+    sigprocmask(SIG_UNBLOCK, &m, 0);
 }
 
 /* for fpu.c, sse.c and jit.c */
@@ -945,12 +982,15 @@ static int run_halt(Cpu *c, const uint32_t *halt, int nh)
                     fprintf(stderr, "\n");
                 }
             }
-        if ((r = step_core(c)) != RUN_OK && r != RUN_SIGNAL) return r;
+        g_guest_exec = 1;
+        r = step_core(c);
+        g_guest_exec = 0;
+        if (r != RUN_OK && r != RUN_SIGNAL) return r;
         if (g_sig_pending & ~g_sig_mask) { sig_deliver(c); if (c->finished) return RUN_END; }
     }
 }
 
-int run(Cpu *c)
+static int run_loop(Cpu *c)
 {
     int r;
     static uint32_t halt[8];
@@ -961,12 +1001,35 @@ int run(Cpu *c)
         while (h && *h && nh < 8) { halt[nh++] = (uint32_t)strtoul(h, (char **)&h, 16); if (*h == ',') h++; else break; }
     }
     if (nh > 0) return run_halt(c, halt, nh);
-    while ((r = step_core(c)) == RUN_OK || r == RUN_SIGNAL) {
+    for (;;) {
+        g_guest_exec = 1;
+        r = step_core(c);
+        g_guest_exec = 0;
+        if (r != RUN_OK && r != RUN_SIGNAL) break;
         if (g_thread_waiting | c->yield) thread_yield(c);     /* other guest threads (thread.c) */
         if (g_sig_pending & ~g_sig_mask) {   /* signal to the guest */
             sig_deliver(c);
             if (c->finished) return RUN_END;
         }
     }
+    return r;
+}
+
+/* interpreter only (ROSETTA_INTERP=1, no space for the translator): a memory fault of the guest comes back here
+   (main.c memfault) and goes to the guest's handler before the next instruction */
+int run(Cpu *c)
+{
+    jmp_buf jb;
+    void *prev = c->fault_jmp;
+    int r;
+    if (_setjmp(jb)) {
+        interp_fault_landing(c);
+        sig_deliver(c);
+        if (c->finished) { c->fault_jmp = prev; return RUN_END; }
+    }
+    c->fault_jmp = (void *)jb;
+    c->host_thread = (void *)pthread_self();
+    r = run_loop(c);
+    c->fault_jmp = prev;
     return r;
 }

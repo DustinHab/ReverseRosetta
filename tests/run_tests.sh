@@ -74,6 +74,11 @@ t_flt()   { sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
 r_flt()   { cat ../tests/faults.expected; }
 t_flti()  { ROSETTA_INTERP=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
 t_fltj()  { ROSETTA_THRESHOLD=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
+# a handler that makes the page writable and returns: repeated exactly by the interpreter; translated the state is
+# approximate, the program ends with SIGBUS (138) after the handler instead of running on with a wrong state
+t_fltr()  { ROSETTA_INTERP=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults retry; ROSETTA_THRESHOLD=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults retry 2>/dev/null; echo "code $?"; }
+r_fltr()  { echo "handler: signal 10 at the page yes, making it writable"; echo "repeated write: value 7";
+            echo "handler: signal 10 at the page yes, making it writable"; echo "code 138"; }
 t_calc()  { ./rosetta ./calculate; }
 r_calc()  { ./calculate.ppc; }
 t_id()    { ./rosetta ./identity; }
@@ -104,6 +109,7 @@ same "processes, kqueue, locks, semaphores, files, blocked signals, pty" t_sys r
 same "exceptions to the program's handlers (SIGFPE, SIGILL, SIGTRAP)" t_flt r_flt
 same "exceptions, interpreter only" t_flti r_flt
 same "exceptions, translated at once" t_fltj r_flt
+same "memory fault handler that returns (exact in the interpreter, translated ends)" t_fltr r_fltr
 same "processor identity (Intel Core Duo, SSE3)" t_id r_id
 same "code replaced by remapping and writing (with translation cache)" t_remap r_remap
 same "translation cache: another file at the address of inlined code" t_remapc r_remapc

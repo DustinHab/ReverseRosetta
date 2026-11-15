@@ -60,7 +60,8 @@ translates everything the first one only interpreted; from the third start on al
   Ruby, Tcl, sqlite, openssl, plists) translated and natively and compares the output byte for byte; see
   [Tests](#tests) for the current result.
 - C programs with libSystem, libm, pthreads, signals (handlers, masks, `sigwait`, exceptions such as division by zero
-  delivered to the program's handler), sockets, `select`/`poll`/`kqueue`, file locks, POSIX semaphores, terminals.
+  and memory faults delivered to the program's handler), sockets, `select`/`poll`/`kqueue`, file locks, POSIX
+  semaphores, terminals.
 - Processes: `fork`, `vfork`, `execve`, `posix_spawn`, `system`, `popen`. A program that runs on PowerPC is started
   natively; an Intel-only program runs through rosetta again, with its own `argv[0]`, signal mask and ignored signals.
 - CoreFoundation, Objective-C and Foundation, taken from Apple's Intel frameworks (see below), including
@@ -94,7 +95,7 @@ therefore take their Intel code paths, as on Apple's Rosetta, which showed Power
   ATSServer, securityd, launchd, syslogd.
 - Threads run one at a time under a global lock; a watchdog thread interrupts long loops for signal delivery.
 - System structures that differ in byte order are converted where the guest reads them: `sysctl` results
-  (`kinfo_proc`, routing messages for `getifaddrs`, load average, swap usage), `kevent`, `flock`, `termios`,
+  (`kinfo_proc`, routing messages for `getifaddrs`, load average, swap usage, `vfsconf`, `nfsstats`), `kevent`, `flock`, `termios`,
   `/var/run/utmpx`. Intel frameworks that treat the missing EFI device tree node as fatal get the device tree root
   instead (AppKit otherwise hangs when a program starts its first `NSThread`).
 
@@ -219,7 +220,7 @@ error code.
 ## Tests
 
 ```
-tests/run_tests.sh      # 41 comparisons against native builds, real Intel output or the interpreter
+tests/run_tests.sh      # 42 comparisons against native builds, real Intel output or the interpreter
 tests/measure_all.sh    # the benchmark loads above
 tests/cli_matrix.sh     # every universal command line program of the system, translated against native
 ```
@@ -232,16 +233,21 @@ login session exists.
 `cli_matrix.sh` runs each command natively, translated, and natively again (output that changes between the native
 runs, such as a clock, is set aside) in an empty working directory, without arguments and with input from
 `/dev/null`; programs that could send mail, print, change settings or start services are never run. Current result
-on the iBook: 590 of 644 commands give byte-identical output and exit status, 15 change between native runs. Most of
-the rest differ on purpose (they report the Intel processor: `arch`, `machine`, `uname`, compiler driver names),
+on the iBook: 593 of 644 commands give byte-identical output and exit status, 15 change between native runs. Most of
+the rest differ on purpose (they report the Intel processor: `arch`, `machine`, `uname`, compiler driver names; the
+i386 part of `full2tt6e` is a placeholder that only prints "unsupported architecture"),
 need Intel libraries that the update does not contain (AppleTalk, Tcl, OpenDirectory, Samba), or crash natively as
 well.
 
 ## Limitations
 
 - i386 only; x86_64 code is not supported.
-- Memory faults (SIGSEGV, SIGBUS) are not passed to the guest's signal handlers; the program ends with the signal, as
-  without a handler. Division errors, `ud2` and `int3` do reach the handlers.
+- Memory faults (SIGSEGV, SIGBUS) reach the program's handler, but inside translated code the state is approximate
+  (registers exact, eip the start of the translated block). A handler that ends the program, jumps away with
+  `siglongjmp` or continues elsewhere works; one that returns to retry the access (garbage collectors with write
+  barriers) works only for interpreted code, translated code then ends with the signal.
+- Guest and translator share one address space: memory the guest gives back with `munmap` can be reused by the
+  translator, so a later access there does not always fault as it would natively.
 - Threads do not run in parallel (global lock). The test machine has one CPU core.
 - Multiprocessor Macs (dual G4, dual and quad G5) are untested. The handshake between the watchdog thread and
   running translated code assumes a single CPU and uses no memory barriers; rare crashes or hangs are possible there.

@@ -791,6 +791,33 @@ application): dyld places them wherever there is room, and that differs between 
   of the saved run), translating them again costs ~25 ms, rewriting 16 MB right after the window appears more.
 - Every program has a translation cache of its own; after the test matrix the folder held 533 of them (200 MB).
   Beyond `ROSETTA_CACHE_MAX_MB` (default 256) together, the caches used longest ago are deleted when one is written.
+
+**Memory faults to the program's handler** (2026-11-15). Until now a SIGSEGV/SIGBUS of guest code ended the program
+even when it had a handler (crash reporters, runtimes that recover from faults).
+- The host fault handler (main.c `memfault`) asks `jit_fault_state` whose fault it is: in the code cache a translated
+  block (the guest registers are in r14..r21 of the host context, eip = start of the block from the dependency
+  records, which are in code order), with `g_in_code` a native function called from a block (eip = the block that
+  called it, found through lr or the frame chain of the host stack), with `g_guest_exec` the interpreter between
+  instructions (exact). `g_guest_exec` is off during system calls: a bad pointer there is the translator's business.
+  If the guest has an unblocked handler (`sys_fault`), the signal becomes pending with si_addr and si_code of the
+  host, and `_longjmp` leads back to the dispatcher of this thread (`dispatcher` sets the jmp_buf once per call,
+  not per round; `run` likewise for the interpreter alone), which unblocks SIGSEGV/SIGBUS in the host and delivers.
+- Inside a translated block the exact instruction is not known, nor are lazily kept flags, deferred stack slots and
+  floating-point values in host registers: a precise state would need metadata per instruction (deoptimization).
+  Such a delivery is marked in the frame (reserved area of the float state); if the handler returns to the same
+  eip, `sig_back` ends the program with the signal, as natively a handler that gives up does (the instruction would
+  fault again), instead of running on with a wrong state. Ending, siglongjmp and continuing elsewhere (changed eip
+  in the context) work. `tests/faults.c`: write to a read-only page, read of a page without access and of address 8,
+  a hot loop that runs translated over the end of its mapping (1024 elements, then the fault in the block), a
+  handler that continues in another function; `faults retry` (make the page writable and return) repeats the write
+  in the interpreter and ends with SIGBUS (138) when translated.
+- Unmapped memory makes no reliable test: guest and translator share the address space, the host can reuse a page
+  the guest gave back right away. The first version of the test read after `munmap` and hung there; the hot loop
+  without `volatile` hung too (gcc drops the loads of a function that never returns).
+- The interpreter's push stores before it moves esp: a fault on the stack page leaves esp unchanged, as on x86.
+- sysctl: `struct vfsconf` (40 bytes, getvfsbyname, lsvfs: mount count and the "local" flag were swapped) and
+  `struct nfsstats` (ints; nfsstat found no NFS type number before, because it reads it from vfsconf). `full2tt6e`
+  is not a bug: its i386 part is a placeholder of Apple's that prints "unsupported architecture" and exits.
 - Result, window after start (first, second, from the third start with an empty cache): Calculator 9.3 / 8.8 /
   2.8-3.3 s (the native PowerPC Calculator 2 to 3 s), Transmission 17.0 / 17.4 / 9.5-11.1 s. The second start
   translates everything that the first one only interpreted (threshold 1 with a cache: 37600 blocks for Calculator),

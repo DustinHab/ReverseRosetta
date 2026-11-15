@@ -86,6 +86,9 @@ typedef struct Cpu {
     void *msg;                /* buffer for mach_msg (per thread: the lock is free during the call) */
     uint32_t msg_size;
     int wq_done;                  /* work queue thread: item done (workq_ops THREAD_RETURN) */
+    /* memory faults to the guest's handler (main.c memfault): the way back to the dispatcher of this guest thread */
+    void *fault_jmp;              /* jmp_buf of the running dispatcher or interpreter loop (0: none) */
+    void *host_thread;            /* pthread that runs this guest thread */
 } Cpu;
 
 /* ---------- guest memory ---------- */

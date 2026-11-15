@@ -51,6 +51,8 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <sched.h>
+#include <setjmp.h>
+#include <pthread.h>
 
 #define R(i) (14 + (i))
 #define RCPU 22
@@ -8362,7 +8364,85 @@ int jit_run(Cpu *c)
     return dispatcher(c);
 }
 
+/* Memory fault of guest code (main.c memfault, host signal handler) at host pc: the guest state for the guest's
+   handler. In a translated block the guest registers are in r14..r21 (R()), the exact instruction is not known: eip
+   = start of the block, flags, deferred stack slots and floating-point values as last written back. 0: approximate
+   (not resumable at the same place), 1: exact (the interpreter between instructions), -1: not a fault of guest code
+   (the translator itself, a system call) */
+static int in_code_cache(uint32_t pc)
+{
+    return g_cache && pc >= (uint32_t)(uintptr_t)g_cache_start && pc < (uint32_t)(uintptr_t)g_free;
+}
+
+/* guest eip of the block whose code contains pc (records in code order); 0: none */
+static uint32_t block_of(uint32_t pc)
+{
+    uint32_t off = pc - (uint32_t)(uintptr_t)g_cache, lo = 0, hi = g_ndep;
+    while (lo < hi) {                       /* last record that starts at or before pc */
+        uint32_t m = (lo + hi) / 2;
+        if ((g_dep[m].code & ~3u) <= off) lo = m + 1; else hi = m;
+    }
+    return lo ? g_dep[lo - 1].eip : 0;
+}
+
+/* host word without a signal on bad memory (fault handler) */
+static int host_word(uint32_t a, uint32_t *w)
+{
+    vm_size_t n = 0;
+    return !(a & 3) && vm_read_overwrite(mach_task_self(), a, 4, (vm_address_t)(uintptr_t)w, &n) == KERN_SUCCESS && n == 4;
+}
+
+int jit_fault_state(Cpu *c, void *ctx)
+{
+    ucontext_t *u = (ucontext_t *)ctx;
+#if __DARWIN_UNIX03
+    uint32_t pc = u->uc_mcontext->__ss.__srr0, lr = u->uc_mcontext->__ss.__lr, *gpr = (uint32_t *)&u->uc_mcontext->__ss.__r0;
+#else
+    uint32_t pc = u->uc_mcontext->ss.srr0, lr = u->uc_mcontext->ss.lr, *gpr = (uint32_t *)&u->uc_mcontext->ss.r0;
+#endif
+    if (in_code_cache(pc)) {
+        uint32_t e = block_of(pc);
+        int i;
+        for (i = 0; i < 8; i++) c->r[i] = gpr[R(i)];
+        c->shadow = gpr[RSHADOW];
+        if (e) c->eip = e;
+        return 0;
+    }
+    if (g_in_code) {
+        /* native function or helper called from a block (a native strlen with a bad pointer): registers as last stored,
+           eip = the block that called it (return address in lr or in the frame chain of the host stack) */
+        uint32_t fp = gpr[1], w, back;
+        int depth;
+        if (in_code_cache(lr)) { if (block_of(lr)) c->eip = block_of(lr); return 0; }
+        for (depth = 0; depth < 16 && host_word(fp, &back) && back > fp; depth++, fp = back)
+            if (host_word(back + 8, &w) && in_code_cache(w)) { if (block_of(w)) c->eip = block_of(w); break; }
+        return 0;
+    }
+    return g_guest_exec ? 1 : -1;
+}
+
+static int dispatch_loop(Cpu *c);
+
+/* the dispatcher of a guest thread; a memory fault for the guest's handler comes back here (main.c memfault) and
+   is delivered at the next round */
 static int dispatcher(Cpu *c)
+{
+    jmp_buf jb;
+    void *prev = c->fault_jmp;
+    int r;
+    if (_setjmp(jb)) {
+        g_in_code = 0;
+        while (g_patch_wants) sched_yield();     /* the watchdog was patching block starts: let it finish */
+        interp_fault_landing(c);
+    }
+    c->fault_jmp = (void *)jb;
+    c->host_thread = (void *)pthread_self();
+    r = dispatch_loop(c);
+    c->fault_jmp = prev;
+    return r;
+}
+
+static int dispatch_loop(Cpu *c)
 {
     int r;
     for (;;) {

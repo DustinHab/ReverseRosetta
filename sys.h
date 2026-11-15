@@ -46,4 +46,8 @@ void sys_mem_show(uint32_t addr);
 int sys_signal(Cpu *c, int sig, int code, const char *reason);
 extern int g_end_signal;
 
+/* memory fault of guest code (SIGSEGV/SIGBUS, si_code, fault address; exact = state is exact): 1 = pending for the
+   guest's handler, 0 = no handler (or blocked) */
+int sys_fault(Cpu *c, int sig, int code, uint32_t addr, int exact);
+
 #endif

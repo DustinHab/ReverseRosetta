@@ -2,7 +2,7 @@
  * fork, vfork, execve (native, translated, script), system, popen, posix_spawn with file actions, waitid,
  * kqueue/kevent, fcntl locks against a child, POSIX semaphores, fifo, truncate, futimes, chflags, setattrlist,
  * blocked signals with and without handler (sigpending, sigwait), terminal settings on a pty, FIONBIO, sysctl
- * structures (kinfo_proc, own arguments, loadavg, swap usage, clock rate), getifaddrs, utmpx.
+ * structures (kinfo_proc, own arguments, loadavg, swap usage, clock rate, vfsconf, nfsstats), getifaddrs, utmpx.
  * Prints no pids, times or paths. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +26,7 @@
 #include <sys/resource.h>
 #include <sys/ptrace.h>
 #include <sys/sysctl.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <net/if.h>
 #include <net/if_dl.h>
@@ -575,6 +576,21 @@ static void t_sysctl(void)
     mib[0] = CTL_KERN; mib[1] = KERN_CLOCKRATE; len = sizeof ci;
     sysctl(mib, 2, &ci, &len, 0, 0);
     printf("clockrate: hz %d, tick %d\n", ci.hz, ci.tick);
+    {   /* struct vfsconf (getvfsbyname, lsvfs) and struct nfsstats (nfsstat: type number from getvfsbyname) */
+        struct vfsconf v;
+        int nm[3] = { CTL_VFS, 0, 1 }, st[200];
+        if (getvfsbyname("hfs", &v) < 0) printf("getvfsbyname hfs: %s\n", strerror(errno));
+        else printf("getvfsbyname hfs: name %s, typenum %d, mounted %d, local %d\n", v.vfc_name, v.vfc_typenum,
+                    v.vfc_refcount > 0 && v.vfc_refcount < 1000, (v.vfc_flags & MNT_LOCAL) != 0);
+        if (getvfsbyname("nfs", &v) < 0) printf("getvfsbyname nfs: %s\n", strerror(errno));
+        else {
+            nm[1] = v.vfc_typenum;
+            len = sizeof st;
+            memset(st, 0, sizeof st);
+            if (sysctl(nm, 3, st, &len, 0, 0) < 0) printf("nfsstats: %s\n", strerror(errno));
+            else printf("nfsstats: size %d, counters plausible %d\n", (int)len, st[0] >= 0 && st[0] < 100000000 && st[16] >= 0 && st[16] < 100000000);
+        }
+    }
     if (getifaddrs(&ifa) == 0) {
         for (i = ifa, k = 0; i && k < 24; i = i->ifa_next, k++) {
             int fam = i->ifa_addr ? i->ifa_addr->sa_family : -1;

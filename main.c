@@ -22,6 +22,7 @@
 #include <sys/time.h>
 #include <mach/mach.h>
 #include <signal.h>
+#include <setjmp.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
 #include <dlfcn.h>
@@ -150,6 +151,15 @@ static void memfault(int sig, siginfo_t *info, void *k)
 {
     char t[64];
     if (jit_prefetch_error(k)) return;      /* prefetched past the end of an array: the value is never needed */
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        /* a fault of guest code (translated or interpreted, not the translator's own) with a handler of the guest:
+           back to this thread's dispatcher, which delivers the signal (sys_fault, jit_fault_state) */
+        Cpu *c = g_thread_cur ? g_thread_cur : &cpu;
+        int exact;
+        if (c->fault_jmp && c->host_thread == (void *)pthread_self() && (exact = jit_fault_state(c, k)) >= 0 &&
+            sys_fault(c, sig, info->si_code, (uint32_t)(uintptr_t)info->si_addr, exact))
+            _longjmp(*(jmp_buf *)c->fault_jmp, 1);
+    }
     main_crash_begin();
     {   /* first without stdio: signal, address, srr0, lr */
         ucontext_t *u = (ucontext_t *)k;

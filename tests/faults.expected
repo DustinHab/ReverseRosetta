@@ -4,3 +4,9 @@ ud2: signal 4, code 1, at ud2 yes
 int3: signal 5, code 1, continued after it
 skipped division: result 42
 after siglongjmp: SIGFPE blocked 0
+write to a read-only page: signal 10, code 1, address right 1
+read of a page without access: signal 10, code 1, address right 1
+read of address 8: signal 10, address right 1
+loop over the end of the mapping: signal 10, 1024 elements read, address right 1
+continued in another function after signal 10
+after the memory faults: SIGSEGV blocked 0, SIGBUS blocked 0
