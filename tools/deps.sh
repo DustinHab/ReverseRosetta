@@ -19,8 +19,9 @@ visit() {
     echo "$p" >> /tmp/dep_seen.txt
     f=$(resolve "$p")
     if [ -z "$f" ]; then echo "$p" >> /tmp/dep_missing.txt; return; fi
+    # (install names never contain spaces, client paths can: "Activity Monitor.app"; the edges are tab-separated)
     otool -arch i386 -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -vxF "$p" | grep -v "^@" > /tmp/dep_d.$$
-    while read d; do echo "$p $d" >> /tmp/dep_edges.txt; done < /tmp/dep_d.$$
+    while read d; do printf '%s\t%s\n' "$p" "$d" >> /tmp/dep_edges.txt; done < /tmp/dep_d.$$
     for d in $(cat /tmp/dep_d.$$); do visit "$d"; done
 }
 for p in "$@"; do visit "$p"; done
@@ -29,7 +30,7 @@ echo "$(wc -l < /tmp/dep_seen.txt | tr -d ' ') images, $(wc -l < /tmp/dep_missin
 while read m; do
     n=$(basename "$m" | sed 's/\.dylib$//; s/\..*//')
     echo "== $m"
-    grep " $m\$" /tmp/dep_edges.txt | awk '{print $1}' | while read v; do
+    grep "	$m\$" /tmp/dep_edges.txt | cut -f1 | while IFS= read -r v; do
         f=$(resolve "$v")
         c=$(nm -arch i386 -m "$f" 2>/dev/null | grep undefined | grep -c "(from $n)")
         echo "   from $(basename "$v"): $c symbols"

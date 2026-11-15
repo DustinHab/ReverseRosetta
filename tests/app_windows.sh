@@ -6,4 +6,4 @@ p=$(ps -axo pid,command | grep "rosetta $R/intel/apps/$1.app" | grep -v grep | a
 ps -o pid,stat,time,rss -p $p
 $R/tools/window_list $p
 echo "--- log"
-tail -${2:-10} /tmp/app_$1.log
+tail -${2:-10} "/tmp/app_$(echo "$1" | tr ' ' '_').log"

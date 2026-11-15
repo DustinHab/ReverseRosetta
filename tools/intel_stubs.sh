@@ -17,13 +17,14 @@ while read m; do
     esac
     n=$(basename "$m" | sed 's/\.dylib$//; s/\..*//')
     cv=0; cur=0
-    for k in $(grep " $m\$" /tmp/dep_edges.txt | awk '{print $1}' | sort -u); do
+    grep "	$m\$" /tmp/dep_edges.txt | cut -f1 | sort -u > /tmp/pl_clients.txt     # (tab-separated, paths with spaces)
+    while IFS= read -r k; do
         [ -f "$W$k" ] && f="$W$k" || f="$k"
         otool -arch i386 -L "$f" | grep -F "	$m (" | sed 's/.*compatibility version \([0-9.]*\), current version \([0-9.]*\).*/\1 \2/' > /tmp/pl_v.txt
         read a b < /tmp/pl_v.txt
         cv=$(printf "%s\n%s\n" "$cv" "$a" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
         cur=$(printf "%s\n%s\n" "$cur" "$b" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
-    done
+    done < /tmp/pl_clients.txt
     [ "$cv" = 0 ] && cv=1.0.0
     [ "$cur" = 0 ] && cur=$cv
     case "$m" in
@@ -33,6 +34,13 @@ while read m; do
         *) E=-1 ;;
     esac
     sh "$D/imports_from.sh" "$m" > /tmp/pl_sym.txt
+    if [ -f "$W$m" ] && grep -q -e "rosetta-stub" -e "rosetta-Platzhalter" "$W$m"; then
+        # rebuilding a stub library: it keeps what it exported for earlier clients (so it can be rebuilt from the
+        # point of view of one program, install_app.sh); the binding kind of the current clients wins
+        nm -arch i386 -g "$W$m" 2>/dev/null |
+            awk '$2 == "T" || $2 == "A" { print "lazy", $3 } $2 == "D" || $2 == "S" { print "nonlazy", $3 }' >> /tmp/pl_sym.txt
+        awk '!seen[$2]++' /tmp/pl_sym.txt > /tmp/pl_sym2.txt && mv /tmp/pl_sym2.txt /tmp/pl_sym.txt
+    fi
     {
         echo "/* stub library for $m (intel_stubs.sh) */"
         echo '#include <stdio.h>'
@@ -55,7 +63,7 @@ while read m; do
     gcc-4.2 -arch i386 -O1 -dynamiclib -isysroot $S -install_name "$m" -compatibility_version "$cv" -current_version "$cur" \
         -o "$W$m" "/tmp/pl_$n.c" -framework CoreFoundation || exit 1
     case "$m" in                            # framework: Versions/Current and the top-level link
-        */Versions/A/*) fw=${m%%/Versions/A/*}; ( cd "$W$fw" && ln -sfh A Versions/Current && ln -sfh "Versions/Current/$n" "$n" ) ;;
+        */Versions/A/*) fw=${m%/Versions/A/*}; ( cd "$W$fw" && ln -sfh A Versions/Current && ln -sfh "Versions/Current/$n" "$n" ) ;;
     esac
     echo "$m: $(grep -c . /tmp/pl_sym.txt) symbols, version $cv/$cur, error code $E"
 done < /tmp/dep_missing.txt
