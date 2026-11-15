@@ -686,8 +686,8 @@ Result: Calculator.app (Intel) draws windows and text completely; `tests/fonts.c
 advances, outlines, paths for three fonts) gives the same output under rosetta as native (test suite, needs the login
 session). Debugging: `ROSETTA_ATS_LOG=1` shows every message in server byte order with OOL and destination buffers
 (`tests/ats_trace.sh`, `ats_sequence.sh`, `ats_dest.sh`, `ats_dest_types.sh`); guest crashes now show the stack and
-the ebp chain with arguments. Open: GetFSRefForFileToken (0x09, FSRef raw: "ATSFontGetFileReference failed"),
-requests with embedded structures (0x02, 0x0a, 0x12, 0x14, 0x18, 0x1b) and bitmap results.
+the ebp chain with arguments. Open: requests with embedded structures (0x02, 0x0a, 0x12, 0x14, 0x18, 0x1b) and
+bitmap results. GetFSRefForFileToken (0x09) was solved later, see "Compatibility and everyday use".
 
 **Transmission 2.42** (screenshot `docs/transmission-on-ibook-g4.png`). Last version for Leopard, official download
 from github.com/transmission/transmission-releases (4089162 bytes, MD5 2b2ab8cc42b96242a1bc7470c5a20123), main
@@ -859,3 +859,64 @@ even when it had a handler (crash reporters, runtimes that recover from faults).
 - What remains for Calculator: 1.35 s user time (translated guest code about 56 %: dyld binding, the Objective-C
   runtime, CoreFoundation, spread thinly; interpreted 2 %, the SSE instructions that go to sse_x87_step), 0.31 s
   system time (page faults, Mach messages), waiting for the window server and the font server.
+
+**Compatibility and everyday use** (2026-11-15 evening).
+- Programs start from the Finder: `tools/finder_app.sh` makes a launcher bundle in `~/Applications/Intel` (the
+  program's Info.plist with `CFBundleExecutable` = a shell script that execs rosetta, Resources linked, registered
+  with `lsregister`). The process is rosetta, but LaunchServices knows it by the bundle, so Apple Events (quit,
+  open) reach the translated program. `tools/install_app.sh` does everything in one step for a .dmg, .zip, .app or
+  an application of the Combo Update: copy, missing libraries, stubs only for the program's own imports (the stub
+  keeps the symbols it already had: `nm -g` of the old stub merged), launcher. stubs_rebuild.sh took 19 minutes.
+- A survey of 14 Intel applications of the update through their launchers found: load commands larger than 4 KB
+  (Safari, iCal: "header too large"; now read into a buffer of up to 1 MB), subframeworks that exist only inside an
+  umbrella of the update (DictionaryServices, Help: `tools/sdk_stub.sh` builds a stub with every symbol of the 10.5
+  SDK's i386 stub library), framework bundles without their top-level links (ImageKit: dlopen found the PowerPC file;
+  `tools/intel_framework_links.sh`), paths with spaces in the dependency tools (Activity Monitor's GraphKit got an
+  empty stub; the dependency edges are tab-separated now), Mach traps 39, 44 and 45, and `proc_info` (syscall 336,
+  lsof, ps, Activity Monitor: through libproc, structures converted field by field; for its own pid
+  PROC_PIDPATHINFO answers the program path, the 10.5 kernel returns 0 there).
+- The font server's file reference (GetFSRefForFileToken, Address Book, Safari, Keychain Access, `ATSFontGetFile-
+  Reference` -43): the Intel ATS reads the reply with FSPathMakeRef when the rendezvous reported the other byte order
+  (`gRuntimeEndianNotRequired` = 0, the flag that also makes it swap the shared font database), and with
+  `_FSUnflattenFSRef` otherwise. The PowerPC server always sends the flattened FSRef. rosetta now turns it into the
+  file's path with the host's File Manager (CarbonCore loaded with dlopen at the first such reply).
+  `tools/probes/ats_fsref.c`: the same paths translated and native.
+- After that, 12 of 14 applications open their windows (Calculator, Transmission, Terminal, Console, System
+  Profiler, Dictionary, iCal, Address Book, Safari, Mail, Keychain Access; Preview opens no window without a
+  document and shows a PDF opened through its launcher). Safari shows pages over HTTP with CSS, JavaScript and
+  images, the URL given with `open -a`; HTTPS to current servers fails as it does natively on 10.5 (old TLS). Not running: Chess (OpenGL: the i386 OpenGL has only its software renderer, the
+  context does not come up, gluBuild2DMipmaps divides by the unpack alignment 0; `tools/probes/gl_probe.c`: natively
+  the Radeon 9200 and the software renderer, translated CGLQueryRendererInfo fails and CGLChoosePixelFormat gives
+  10015 "invalid code module": the i386 CGL reads the header of the display's GL driver bundle, which exists only for
+  PowerPC, and never gets to the i386 software renderer in the Intel root) and Activity Monitor (its helper
+  pmTool must be setuid root, the copy is not). Keychain Access crashes when it quits: LaunchServices
+  `_FSNodeCopyExtension` keeps the extension's position in the node (16, as for "Keychain Access.app"), later reads
+  a name of at most 16 characters for the same node, gets an empty buffer and writes the terminator to address 0.
+  Where the shorter name comes from is open. Programs that use the keychain (iCal,
+  Mail) ask once per item: the keychain sees the process rosetta, not the program.
+- Images were slow: decoding a 2560x1600 JPEG with ImageIO took 16.3 s translated, 0.44 s native
+  (`tools/probes/jpeg_decode.c`). 71 million SSE2 instructions went to the C implementation one by one (the IDCT:
+  paddsw, pmulhw, punpcklwd, psubsw, pextrw, shifts; the color conversion: mulps, addps, unpcklps, cvtdq2ps).
+  They are now AltiVec code (`gen_sse`): Cpu.xmm holds the raw Intel bytes. Instructions that only move whole lanes
+  (unpack, shuffle through one vperm with a pattern built at translation time, byte shifts with vsldoi) and byte-wise
+  ones work on that form directly; arithmetic on 16- and 32-bit lanes and on floats reverses all 16 bytes first (one
+  vperm, the same pattern for every lane width): each lane is then in host byte order and only the lane order is
+  reversed, which element-wise operations do not notice; packs take the source first for the same reason. pmulhw
+  is vmulesh/vmulosh and a vperm of the high halves, pmaddwd vmsumshm, psadbw vsum4ubs and vsum2sws, mulps vmaddfp
+  with -0 (one rounding), minps/maxps vcmpgtfp and vsel (d < s ? d : s, exact for NaN and -0), cvtps2dq vrfin and
+  vctsxs with the out-of-range lanes set to 0x80000000, 64-bit shifts through two words in GPRs (no 64-bit
+  elements). AltiVec runs in Java mode (VSCR.NJ = 0, set per guest thread; Mac OS X starts threads with NJ = 1,
+  which flushes denormals to zero). Divide and square root of packed floats, the MMX forms, paddq/psubq/pmuludq and
+  shifts by a register count still go to C. The vperm patterns built at translation time live in a pool that is
+  saved with the translation cache like the floating-point constants: the code loads them by address, and a run
+  from the cache first read zeros there (shufps, punpck*qdq; `run_tests.sh` now runs vec_ops twice through a cache
+  file).
+- `tests/vec_ops.c` runs every such instruction over all pairs of 24 vectors with border values: translated and
+  interpreted give the same checksums, and 104 of 107 equal those of the same program built natively on an Intel
+  PC (gcc in WSL). The three others are addps/subps/mulps: the default NaN of an invalid operation is positive on
+  PowerPC and negative on Intel (0x7fc00000 against 0xffc00000; the scalar instructions and x87 already behave the
+  same way), and gcc on x86-64 swaps the operands of commutative ones, which changes which NaN payload wins. The
+  test found a bug in the interpreter: minps/maxps went through double and quieted a signaling NaN; they now select
+  the operand's bits. Also translated now: incb/decb (fe /0 /1, 1 million at the JPEG's Huffman decoding),
+  `tests/incdec8.c` against the interpreter.
+- JPEG 2560x1600: 16.3 s -> 1.47 s (native 0.44 s), 71 million interpreted instructions -> 0.2 million.

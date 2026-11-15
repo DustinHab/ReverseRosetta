@@ -35,6 +35,10 @@ time per round is the slope between a short and a long run, so startup costs dro
 same instruction count with the native run time, so the last column is the ratio of the run times. Fastest of 3
 runs; the values vary by a few percent between measurement runs. `tests/measure_all.sh` repeats the measurement.
 
+Library code: decoding a 2560x1600 JPEG with ImageIO and drawing it into a bitmap (`tools/probes/jpeg_decode.c`)
+takes 1.47 s translated and 0.44 s native. ImageIO's decoder is SSE2 code; before packed SSE2 integer and float
+instructions were translated to AltiVec, it took 16.3 s.
+
 Startup time, translated against native, fastest of 7 runs with the translation cache filled:
 
 | Program | Translated | Native |
@@ -71,10 +75,13 @@ the native PowerPC build. At startup the translated Calculator uses 1.7 s of pro
   natively; an Intel-only program runs through rosetta again, with its own `argv[0]`, signal mask and ignored signals.
 - CoreFoundation, Objective-C and Foundation, taken from Apple's Intel frameworks (see below), including
   `NSThread` and `NSOperationQueue`.
-- Cocoa programs with windows, events and text: Calculator.app (Intel build from the 10.5.8 update, computing with the
-  system's own engine) and Transmission 2.42. Text rendering goes through the system's PowerPC font server; font
-  metrics, glyph outlines and paths are identical to a native build (`tests/fonts.c`).
-- x87, SSE and SSE2 (scalar and packed double), including Apple's Intel vDSP/vForce code.
+- Cocoa programs with windows, events and text. Of the Intel applications of the 10.5.8 update, Calculator (computing
+  with the system's own engine), Terminal, Console, System Profiler, Dictionary, iCal, Address Book, Safari, Mail and
+  Keychain Access open their windows; Preview shows PDF documents. Transmission 2.42 downloads. Safari shows pages
+  over HTTP with CSS, JavaScript and images (HTTPS to current servers fails on 10.5 natively too). Text rendering goes through the system's
+  PowerPC font server; font metrics, glyph outlines and paths are identical to a native build (`tests/fonts.c`).
+- x87, SSE and SSE2: scalar, packed double, packed integer and packed float (AltiVec), including Apple's Intel
+  vDSP/vForce code and ImageIO's image decoders.
 
 Intel programs see an Intel Mac: CPUID, the commpage, `hw.cputype`, `hw.optional.*` and `host_info` describe an
 Intel Core Duo with SSE3, `arch` prints `i386`, `uname -m` prints `i386`. Programs that check the processor
@@ -86,8 +93,8 @@ therefore take their Intel code paths, as on Apple's Rosetta, which showed Power
 
 - An interpreter runs code the first few times; blocks that run often are translated to PowerPC (block chaining,
   inner jumps, lazily computed x86 flags, x87 and SSE values kept in PowerPC floating-point registers within a block,
-  AltiVec for byte swapping and packed bitwise operations, native stubs for frequent libSystem string and math
-  functions).
+  AltiVec for byte swapping and for packed SSE2 integer and float instructions, native stubs for frequent libSystem
+  string and math functions).
 - Translated code is stored in a translation cache under `~/Library/Caches/rosetta` and mapped back in on the next
   start of the same program. Besides at the end, it is written after 6 and 45 seconds of run time and at the first
   idle moment, so programs that are closed by a signal or at logout keep their translations too. Each block records
@@ -172,27 +179,35 @@ build/rosetta /usr/bin/sort -n numbers.txt
 build/rosetta build/hello a b
 ```
 
-Programs with windows need the login session: start them from Terminal on the Mac. From an SSH login,
-`tests/in_session.sh SCRIPT` runs a shell script inside the login session (`launchctl submit` on the session's
-launchd, no root needed).
+### Programs with windows
 
-Application bundles are assembled in `intel/apps/`:
+One step sets up an Intel program and puts a launcher into `~/Applications/Intel`, which starts it with a double
+click in the Finder, from the Dock or with `open`, like any other program:
+
+```
+tools/install_app.sh Transmission-2.42.dmg     # a disk image, a .zip, an .app bundle ...
+tools/install_app.sh Preview                   # ... or an application of the Combo Update by name
+open ~/Applications/Intel/Transmission.app
+```
+
+`install_app.sh` copies the program to `intel/apps/`, reports i386 libraries that neither the Intel root nor the
+system has, builds stub libraries for them (and adds the program's symbols to existing ones) and creates the
+launcher (`tools/finder_app.sh NAME` makes the launcher alone). The launcher is a small bundle with the program's
+name and icon whose executable starts rosetta; the program runs from `intel/apps/`. Apple Events reach the
+translated program: it opens documents (`open -a ~/Applications/Intel/Preview.app file.pdf`, a URL for Safari) and
+quits through AppleScript (the Dock and logout send the same event). A few programs need more:
+`tools/intel_umbrellas.sh Quartz` for frameworks that exist only as an umbrella, `tests/transmission_setup.sh` (no
+router port mapping, no update check).
+
+From an SSH login, `tests/in_session.sh SCRIPT` runs a shell script inside the login session (`launchctl submit` on
+the session's launchd, no root needed); `tests/app_start.sh NAME` starts a program there with its output in
+`/tmp/app_NAME.log`. Step by step, as `install_app.sh` does it:
 
 ```
 tools/intel_app.sh Calculator          # Intel build from the Combo Update plus resources from /Applications
 tools/app_deps.sh Calculator           # i386 libraries that are still missing
-tools/stubs_rebuild.sh                 # stub libraries for libraries the update does not contain
+tools/stubs_rebuild.sh                 # all stub libraries for all programs at once (slow)
 build/rosetta intel/apps/Calculator.app/Contents/MacOS/Calculator
-```
-
-Third-party programs that are Intel-only:
-
-```
-tools/thirdparty_unpack.sh Transmission-2.42.dmg Transmission
-tools/intel_umbrellas.sh Quartz
-tools/stubs_rebuild.sh
-tests/transmission_setup.sh            # Transmission: no router port mapping, no update check
-build/rosetta intel/apps/Transmission.app/Contents/MacOS/Transmission
 ```
 
 Stub libraries stand in for i386 libraries that are neither in the update nor in the system (CoreVideo, QuickTime,
@@ -221,11 +236,12 @@ error code.
 | `ROSETTA_HALT=ADDR,...` | interpreter only; show registers and stack at these guest addresses |
 
 `ROSETTA_NO_*` switches turn off single optimizations; they are listed at the top of `jit.c`.
+`tools/which_image.sh ADDRESS...` names the Intel library and offset of addresses from a crash report.
 
 ## Tests
 
 ```
-tests/run_tests.sh      # 43 comparisons against native builds, real Intel output or the interpreter
+tests/run_tests.sh      # 45 comparisons against native builds, real Intel output or the interpreter
 tests/measure_all.sh    # the benchmark loads above
 tests/cli_matrix.sh     # every universal command line program of the system, translated against native
 ```
@@ -263,8 +279,14 @@ well.
 - Programs with windows start slowly the first two times (see the table under Performance). With the translation
   cache filled, Calculator still uses about 2.5 times the processor time of the native build at startup, most of it
   in translated guest code (dyld binding, the Objective-C runtime, CoreFoundation).
-- Font server: the reply to a file-reference request (FSRef) is not converted yet; a few rarely used message types
-  are passed through unconverted and reported once.
+- OpenGL does not work yet: the Intel OpenGL has only its software renderer, and no context comes up. 3D programs
+  (Chess) fail.
+- The keychain sees the process `rosetta`, not the program: a program that reads a password asks once per item, and
+  "Always Allow" lets every translated program read it. After rosetta is rebuilt, the keychain asks again.
+- Programs that need a setuid helper in their bundle (Activity Monitor's pmTool) do not work: the copy in
+  `intel/apps` is not setuid, and an i386 helper could not run with root rights through rosetta anyway.
+- Packed float instructions give the PowerPC default NaN (positive) where Intel processors give a negative one.
+- Font server: a few rarely used message types are passed through unconverted and reported once.
 
 ## License
 
