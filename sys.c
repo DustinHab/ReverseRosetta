@@ -1284,7 +1284,23 @@ static int proc_spawn(uint32_t pidp, const char *path, uint32_t desc, uint32_t g
  * ROSETTA_INTEL=- switches this off. */
 static char g_intel[PATH_MAX];
 static int g_intel_on = -1;
-static unsigned long g_st_redirected;
+static unsigned long g_st_redirected, g_st_gp_all, g_st_gp_hit, g_st_gp_stat, g_st_gp_lost, g_st_gp_i386;
+
+/* time per system call (ROSETTA_STATS): index is the BSD number, Mach traps from 512 */
+static uint64_t g_sys_time[1024];
+static unsigned g_sys_n[1024];
+static int g_sys_measure = -1;
+
+static uint64_t sys_t0(void)
+{
+    if (g_sys_measure < 0) g_sys_measure = getenv("ROSETTA_STATS") != 0;
+    return g_sys_measure ? mach_absolute_time() : 0;
+}
+
+static void sys_t1(int nr, uint64_t t0)
+{
+    if (g_sys_measure > 0 && nr >= 0 && nr < 1024) { g_sys_time[nr] += mach_absolute_time() - t0; g_sys_n[nr]++; }
+}
 uint32_t g_dyld_from, g_dyld_to;            /* main.c: where dyld is (calls from there are the loader's) */
 static uint32_t g_call_eip;                 /* eip of the current system call */
 
@@ -1353,19 +1369,22 @@ static const char *gpath_as(uint32_t a, int use)
     z = fresh[which ^= 1];                   /* two buffers: calls with two paths */
     if ((size_t)snprintf(z, sizeof fresh[0], "%s%s", g_intel, p) >= sizeof fresh[0]) return p;
     for (h = 2166136261u, q = (const unsigned char *)p; *q; q++) h = (h ^ *q) * 16777619u;
+    g_st_gp_all++;
     for (i = h & (GPATH_N - 1); g_gpath[i].path; i = (i + 1) & (GPATH_N - 1))
         if (g_gpath[i].h == h && !strcmp(g_gpath[i].path, p)) break;
-    if (g_gpath[i].path) { in_root = g_gpath[i].in_root; sys_i386 = g_gpath[i].sys_i386; }
+    if (g_gpath[i].path) { in_root = g_gpath[i].in_root; sys_i386 = g_gpath[i].sys_i386; g_st_gp_hit++; }
     else {
         in_root = stat(z, &st) == 0 && !S_ISDIR(st.st_mode);
+        g_st_gp_stat++;
         sys_i386 = -1;
         if (g_ngpath < GPATH_N / 2 && (g_gpath[i].path = strdup(p)) != 0) {
             g_gpath[i].h = h; g_gpath[i].in_root = (char)in_root; g_gpath[i].sys_i386 = -1; g_ngpath++;
-        } else i = GPATH_N;                   /* not remembered */
+        } else { i = GPATH_N; g_st_gp_lost++; }   /* not remembered */
     }
     if (!in_root) return p;
     if (use == GP_DATA) {                    /* read by the program: the system file, if it would do */
         if (sys_i386 < 0) {
+            g_st_gp_i386++;
             sys_i386 = file_has_i386(p);
             if (i < GPATH_N) g_gpath[i].sys_i386 = (char)sys_i386;
         }
@@ -1445,7 +1464,21 @@ static uint32_t no_nocancel(uint32_t n)
     return n;
 }
 
+static void sys_bsd_call(Cpu *c, int sysenter);
+
+/* int $0x80 is timed here, sysenter in sys_sysenter (ROSETTA_STATS) */
 void sys_bsd(Cpu *c, int sysenter)
+{
+    uint64_t t0;
+    int nr;
+    if (sysenter || !g_sys_measure) { sys_bsd_call(c, sysenter); return; }
+    nr = (int)(c->r[EAX] & 511);
+    t0 = sys_t0();
+    sys_bsd_call(c, 0);
+    sys_t1(nr, t0);
+}
+
+static void sys_bsd_call(Cpu *c, int sysenter)
 {
     /* i386 libSystem puts the length of the arguments in the upper 16 bits */
     uint32_t n = no_nocancel(c->r[EAX] & 0xffff);
@@ -2474,14 +2507,12 @@ void sys_machine(Cpu *c)
 
 void sys_mach(Cpu *c)
 {
+    int n = (int)-(int32_t)c->r[EAX];
+    uint64_t t0 = sys_t0();
     g_arg_base = c->r[ESP];
-    mach_trap(c, (int)-(int32_t)c->r[EAX], g_arg_base);
+    mach_trap(c, n, g_arg_base);
+    sys_t1(512 + (n & 511), t0);
 }
-
-/* time per system call (ROSETTA_STATS): index is the BSD number, Mach traps from 512 */
-static uint64_t g_sys_time[1024];
-static unsigned g_sys_n[1024];
-static int g_sys_measure = -1;
 
 void sys_stats(void)
 {
@@ -2489,7 +2520,9 @@ void sys_stats(void)
     int k, best, z;
     uint64_t sum = 0;
     if (g_sys_measure <= 0) return;
-    if (g_intel_on > 0) fprintf(stderr, "rosetta: %lu paths redirected to Intel versions (%s)\n", g_st_redirected, g_intel);
+    if (g_intel_on > 0) fprintf(stderr, "rosetta: %lu paths redirected to Intel versions (%s); path lookups %lu, remembered %lu, "
+                                "stat in the root %lu, not remembered %lu, i386 checks %lu\n", g_st_redirected, g_intel,
+                                g_st_gp_all, g_st_gp_hit, g_st_gp_stat, g_st_gp_lost, g_st_gp_i386);
     fprintf(stderr, "rosetta: %lu file mappings shared, %lu made private later\n", g_st_shared, g_st_private);
     mach_timebase_info(&tb);
     for (k = 0; k < 1024; k++) sum += g_sys_time[k];

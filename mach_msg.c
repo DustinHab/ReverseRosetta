@@ -463,9 +463,65 @@ static uint32_t efi_query(uint8_t *m, uint32_t size)
     return h->msgh_size;
 }
 
+/* ROSETTA_STATS: per message id sent (receive only: id 0) count, time in mach_msg (kernel and the server's answer)
+   and time converting; shown at the first idle moment (mach_msg_stats) */
+#define MSG_STATS 256
+static struct { int id; unsigned n; uint64_t host, conv; } g_msg_st[MSG_STATS];
+static int g_msg_measure = -1;
+
+static void msg_stat(int id, uint64_t host, uint64_t conv)
+{
+    uint32_t h = ((uint32_t)id * 2654435761u) >> 24, k;
+    for (k = 0; k < MSG_STATS; k++, h = (h + 1) & (MSG_STATS - 1))
+        if (g_msg_st[h].id == id || !g_msg_st[h].n) {
+            g_msg_st[h].id = id; g_msg_st[h].n++; g_msg_st[h].host += host; g_msg_st[h].conv += conv;
+            return;
+        }
+}
+
+void mach_msg_stats(void)
+{
+    mach_timebase_info_data_t tb;
+    uint64_t host = 0, conv = 0;
+    unsigned n = 0;
+    int k, z, best;
+    if (g_msg_measure <= 0) return;
+    mach_timebase_info(&tb);
+    for (k = 0; k < MSG_STATS; k++) { host += g_msg_st[k].host; conv += g_msg_st[k].conv; n += g_msg_st[k].n; }
+    fprintf(stderr, "rosetta: %u Mach messages, %.1f ms in mach_msg, %.1f ms converting; by id (0: receive only):", n,
+            (double)host * tb.numer / tb.denom / 1e6, (double)conv * tb.numer / tb.denom / 1e6);
+    for (z = 0; z < 16; z++) {
+        for (best = -1, k = 0; k < MSG_STATS; k++)
+            if (g_msg_st[k].n && (best < 0 || g_msg_st[k].host > g_msg_st[best].host)) best = k;
+        if (best < 0) break;
+        fprintf(stderr, " %d:%ux/%.1f/%.1f", g_msg_st[best].id, g_msg_st[best].n,
+                (double)g_msg_st[best].host * tb.numer / tb.denom / 1e6, (double)g_msg_st[best].conv * tb.numer / tb.denom / 1e6);
+        g_msg_st[best].n = 0;
+    }
+    fprintf(stderr, " ms\n");
+}
+
 /* buffer per thread (Cpu.msg): during mach_msg the thread lock is free, another thread can send */
+static mach_msg_return_t guest_mach_msg_call(Cpu *c, uint32_t msg, mach_msg_option_t option, uint32_t send_size, uint32_t receive,
+                                            mach_port_t name, mach_msg_timeout_t deadline, mach_port_t message, uint64_t *host);
+
 static mach_msg_return_t guest_mach_msg(Cpu *c, uint32_t msg, mach_msg_option_t option, uint32_t send_size, uint32_t receive,
                                        mach_port_t name, mach_msg_timeout_t deadline, mach_port_t message)
+{
+    uint64_t t0, host = 0;
+    mach_msg_return_t r;
+    int id;
+    if (g_msg_measure < 0) g_msg_measure = getenv("ROSETTA_STATS") != 0;
+    if (!g_msg_measure) return guest_mach_msg_call(c, msg, option, send_size, receive, name, deadline, message, 0);
+    id = (option & MACH_SEND_MSG) && send_size >= 24 ? (int)ld32(msg + 20) : 0;
+    t0 = mach_absolute_time();
+    r = guest_mach_msg_call(c, msg, option, send_size, receive, name, deadline, message, &host);
+    msg_stat(id, host, mach_absolute_time() - t0 - host);
+    return r;
+}
+
+static mach_msg_return_t guest_mach_msg_call(Cpu *c, uint32_t msg, mach_msg_option_t option, uint32_t send_size, uint32_t receive,
+                                            mach_port_t name, mach_msg_timeout_t deadline, mach_port_t message, uint64_t *host)
 {
     size_t need = (send_size > receive ? send_size : receive) + 256;
     mach_msg_return_t r;
@@ -512,6 +568,7 @@ static mach_msg_return_t guest_mach_msg(Cpu *c, uint32_t msg, mach_msg_option_t 
             g_checkpoint_idle = 1;
             thread_watchdog_start();
         }
+        uint64_t h0 = host ? mach_absolute_time() : 0;
         fc = glock_release();                    /* receiving can wait: let other threads run */
         for (;;) {
             r = mach_msg((mach_msg_header_t *)g_buffer, o, send_size, receive, name, deadline, message);
@@ -520,6 +577,7 @@ static mach_msg_return_t guest_mach_msg(Cpu *c, uint32_t msg, mach_msg_option_t 
             if (g_sig_pending & ~g_sig_mask) break;
             if (r == MACH_RCV_INTERRUPTED) { o &= ~MACH_SEND_MSG; send_size = 0; }
         }
+        if (host) *host = mach_absolute_time() - h0;   /* (with waiting for the lock below not included) */
         glock_acquire(fc);
         g_base = saved_base;
         ofa_cleanup(&ats_copy, r);

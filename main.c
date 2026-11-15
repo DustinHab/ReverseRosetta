@@ -151,6 +151,7 @@ static void memfault(int sig, siginfo_t *info, void *k)
 {
     char t[64];
     if (jit_prefetch_error(k)) return;      /* prefetched past the end of an array: the value is never needed */
+    if ((sig == SIGSEGV || sig == SIGBUS) && jit_probe_fault()) return;   /* (jumps back into safe_read) */
     if (sig == SIGSEGV || sig == SIGBUS) {
         /* a fault of guest code (translated or interpreted, not the translator's own) with a handler of the guest:
            back to this thread's dispatcher, which delivers the signal (sys_fault, jit_fault_state) */

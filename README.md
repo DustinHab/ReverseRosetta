@@ -45,13 +45,18 @@ Startup time, translated against native, fastest of 7 runs with the translation 
 | Foundation test | 69 ms | 47 ms |
 | `/bin/ls -la /usr/lib` (i386 part of the universal binary) | 71 ms | 42 ms |
 
-Programs with windows, time until the window appears, starting with an empty translation cache. The second start
-translates everything the first one only interpreted; from the third start on almost nothing is translated:
+Programs with windows, time until the program is idle after the start (the translator's own measurement,
+`ROSETTA_STATS`, nothing else running), starting with an empty translation cache. The second start translates
+everything the first one only interpreted; from the third start on almost nothing is translated:
 
-| Program | 1st start | 2nd start | from the 3rd start | Native PowerPC build |
-|---|---|---|---|---|
-| Calculator.app | 9.3 s | 8.8 s | 2.8 to 3.3 s | 2 to 3 s |
-| Transmission 2.42 | 17.0 s | 17.4 s | 9.5 to 11.1 s | (Intel only) |
+| Program | 1st start | 2nd start | from the 3rd start |
+|---|---|---|---|
+| Calculator.app | 4.0 s | 4.2 s | 2.1 s |
+| Transmission 2.42 | 6.1 s | 6.9 s | 3.9 to 4.1 s |
+
+Measured from outside in the same way for both (the window polled every 0.2 s, which costs processor time
+itself), Calculator's window appears after 3.6 to 3.9 s with a filled translation cache and after 2.3 to 2.6 s for
+the native PowerPC build. At startup the translated Calculator uses 1.7 s of processor time, the native one 0.66 s.
 
 ## What runs
 
@@ -207,7 +212,7 @@ error code.
 | `ROSETTA_CACHE_FILE=FILE` | use this file as the translation cache (tests) |
 | `ROSETTA_CACHE_MAX_MB=N` | translation caches of all programs together at most N MB (default 256; the ones used longest ago are deleted) |
 | `ROSETTA_HOST_CPU=1` | show the guest the real PowerPC processor instead of the Intel one |
-| `ROSETTA_STATS=1` | translator counters and times at exit |
+| `ROSETTA_STATS=1` | translator counters and times at exit; at the first idle moment processor time, page faults, system calls, Mach messages by id and interpreted opcodes of the startup |
 | `ROSETTA_LOG=1` | log of system calls and Mach traps (`=2`: with time and thread) |
 | `ROSETTA_ATS_LOG=1` | every message to the font server, in the server's byte order |
 | `ROSETTA_HPROFILE=FILE` | sampling profile of the translator and the guest (`ROSETTA_HPROFILE_CPU=1`: processor time) |
@@ -220,7 +225,7 @@ error code.
 ## Tests
 
 ```
-tests/run_tests.sh      # 42 comparisons against native builds, real Intel output or the interpreter
+tests/run_tests.sh      # 43 comparisons against native builds, real Intel output or the interpreter
 tests/measure_all.sh    # the benchmark loads above
 tests/cli_matrix.sh     # every universal command line program of the system, translated against native
 ```
@@ -255,9 +260,9 @@ well.
 - Frameworks that the 10.5.8 update does not contain as i386 (QuickTime, QTKit, CoreVideo, Tcl, OpenDirectory ...)
   are stubs; features that need them do not work. Calculator's engine is the exception: it runs as the native
   PowerPC function.
-- Programs with windows start slowly the first two times (see the table under Performance): Calculator after about
-  9 seconds, Transmission after about 17. With the translation cache filled, about half of the processor time at
-  startup goes to system calls and Mach messages, a third to the translated guest code.
+- Programs with windows start slowly the first two times (see the table under Performance). With the translation
+  cache filled, Calculator still uses about 2.5 times the processor time of the native build at startup, most of it
+  in translated guest code (dyld binding, the Objective-C runtime, CoreFoundation).
 - Font server: the reply to a file-reference request (FSRef) is not converted yet; a few rarely used message types
   are passed through unconverted and reported once.
 

@@ -16,6 +16,7 @@ void jit_stats(void);
 /* if a memory fault hit a prefetching instruction (hoisted array accesses): skip it, return 1.
    ctx = ucontext_t * of the signal handler. */
 int jit_prefetch_error(void *ctx);
+int jit_probe_fault(void);                       /* a read probe of the translator faulted: jumps back (does not return) */
 int jit_fault_state(Cpu *c, void *ctx);          /* memory fault: guest state (1 exact, 0 approximate, -1 not the guest's) */
 
 /* crash dump (cache, registers, return ring buffer) to stderr */

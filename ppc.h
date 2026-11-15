@@ -51,6 +51,7 @@
 #define EXTSH(a, s)     X_(s, a, 0, 922, 0)
 #define RLWINM(a, s, sh, mb, me) ((uint32_t)21 << 26 | (uint32_t)(s) << 21 | (uint32_t)(a) << 16 | (uint32_t)(sh) << 11 | (uint32_t)(mb) << 6 | (uint32_t)(me) << 1)
 #define RLWIMI(a, s, sh, mb, me) ((uint32_t)20 << 26 | (uint32_t)(s) << 21 | (uint32_t)(a) << 16 | (uint32_t)(sh) << 11 | (uint32_t)(mb) << 6 | (uint32_t)(me) << 1)
+#define RLWNM(a, s, b, mb, me) ((uint32_t)23 << 26 | (uint32_t)(s) << 21 | (uint32_t)(a) << 16 | (uint32_t)(b) << 11 | (uint32_t)(mb) << 6 | (uint32_t)(me) << 1)
 #define RC_(w)          ((w) | 1)                /* X-form that sets CR0 (and., subf., extsb. ...) */
 #define SLWI(a, s, n)   RLWINM(a, s, n, 0, 31 - (n))
 #define SRWI(a, s, n)   RLWINM(a, s, 32 - (n), n, 31)

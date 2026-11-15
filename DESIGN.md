@@ -789,6 +789,13 @@ application): dyld places them wherever there is room, and that differs between 
   of its own. `ROSETTA_CACHE_FILE` sets the file (for tests). Discarded blocks lead to a rewrite only beyond 32 +
   1/64 of the cache, like new code: Calculator discards 161 blocks in every warm start (two allocations land on pages
   of the saved run), translating them again costs ~25 ms, rewriting 16 MB right after the window appears more.
+- Result, window after start (first, second, from the third start with an empty cache): Calculator 9.3 / 8.8 /
+  2.8-3.3 s (the native PowerPC Calculator 2 to 3 s), Transmission 17.0 / 17.4 / 9.5-11.1 s. The second start
+  translates everything that the first one only interpreted (threshold 1 with a cache: 37600 blocks for Calculator),
+  from the third on almost nothing is translated (450 blocks) and only a few blocks are discarded (57 for an
+  allocation that lands on pages of the saved run). Loading Calculator's cache (60817 blocks, 14.6 MB code): 47 ms,
+  1494 page faults. (These times were taken with a window poller that slowed the program down itself, and the
+  processor time profile then counted blocked threads as well; see "Startup of programs with windows" below.)
 - Every program has a translation cache of its own; after the test matrix the folder held 533 of them (200 MB).
   Beyond `ROSETTA_CACHE_MAX_MB` (default 256) together, the caches used longest ago are deleted when one is written.
 
@@ -818,11 +825,37 @@ even when it had a handler (crash reporters, runtimes that recover from faults).
 - sysctl: `struct vfsconf` (40 bytes, getvfsbyname, lsvfs: mount count and the "local" flag were swapped) and
   `struct nfsstats` (ints; nfsstat found no NFS type number before, because it reads it from vfsconf). `full2tt6e`
   is not a bug: its i386 part is a placeholder of Apple's that prints "unsupported architecture" and exits.
-- Result, window after start (first, second, from the third start with an empty cache): Calculator 9.3 / 8.8 /
-  2.8-3.3 s (the native PowerPC Calculator 2 to 3 s), Transmission 17.0 / 17.4 / 9.5-11.1 s. The second start
-  translates everything that the first one only interpreted (threshold 1 with a cache: 37600 blocks for Calculator),
-  from the third on almost nothing is translated (450 blocks) and only a few blocks are discarded (57 for an
-  allocation that lands on pages of the saved run). Loading Calculator's cache (60817 blocks, 14.6 MB code): 47 ms,
-  1494 page faults. Processor time profile of a warm Transmission start: translated guest code 36 %, interpreted 5 %,
-  system calls and host libraries 54 % (mach_msg 20 %, stat/open/close/mmap/getattrlist together about 15 %),
-  loading the cache 1.7 %, discarding 0.8 %, translating 0.5 %.
+
+**Startup of programs with windows** (2026-11-15 afternoon).
+- Measuring first. The window poller of the earlier measurements (`ps`, `grep`, `awk` and `window_list` every 0.1 s)
+  took processor time from the starting program on the single core: Calculator was idle after 3.1 s while polled,
+  after 2.5 s without. And a processor time profile (SIGPROF) samples whatever thread the signal reaches, also one
+  blocked in mach_msg: 47 % mach_msg_trap in one profile, which was waiting, not computing. Reliable instead:
+  `ROSETTA_STATS` now prints at the first idle moment (the end of the startup; programs with windows rarely end
+  normally) processor time (getrusage, the main thread with thread_info), task events (page faults, copy on write,
+  Mach messages), lock waiting, every system call by number (int $0x80/$0x81 too, not only sysenter), Mach messages
+  by id with the time in mach_msg and the time converting, the interpreted opcodes so far. `tests/app_profile.sh`
+  passes program arguments (`-AppleLanguages (en)`: a German profile run translated new code and rewrote the cache).
+- Calculator with a warm cache: idle after 2.5 s with 1.63 s user and 0.30 s system processor time; the native
+  PowerPC Calculator needs 0.66 s altogether. 1007 Mach messages: 12.9 ms converting, the rest is the servers'
+  answer (the font server's OFAStrike 30 to 250 ms, waiting on a receive 150 ms). 11,900 page faults (the system
+  time). And 705,686 interpreted `shld` (0f a4), CoreFoundation's binary property lists read big-endian numbers with
+  gcc's 64-bit shifts: every one a call of the interpreter from the block.
+- `shld`/`shrd` translated (`gen_double_shift`): a fixed count is two rotations (rlwinm, rlwimi), cl is slw/srw/or (a
+  shift by 32 gives 0 on PowerPC: count 0 needs no branch). Flags as shl/shr (CF the last bit shifted out of the
+  destination, SF ZF PF of the result, OF of shl for one bit); OF of a one-bit shrd differs, and the cl forms leave
+  the flags at count 0: then the interpreter if they are live. Also translated now: byte shifts and rotations of
+  registers (`c0`/`d0`, 70,000 at Calculator's startup: shrb $4 for hex digits), `rolw $8` (ntohs), rol/ror by cl,
+  `xchg eax, r32`, movzbw/movsbw. `tests/shifts.c` against the native build, translated, at once and interpreted.
+  Calculator: user time 1.63 -> 1.35 s.
+- The translator's read probes (`safe_read`: predicted call targets, constants) went through vm_read_overwrite, a
+  Mach call: 3.7 us against 0.1 us for a copy guarded by setjmp (`tools/probes/vm_read_cost.c`), 62,000 of them in
+  a first start of Calculator. Now a copy; if it faults, the fault handler jumps back (`jit_probe_fault`, only for
+  the probing thread). First start 3.7 -> 3.3 s, second 4.5 -> 4.1 s (`ROSETTA_NO_PROBE=1` the old way).
+- The map is sized directly when the translation cache is loaded (2^17 entries for 60,000 blocks; growing fourfold
+  gave 2^18, 1.5 MB more pages to touch).
+- Result, idle moment without polling (first, second, third, fourth start from an empty cache), before -> after:
+  Calculator 4.8 4.8 2.4 2.3 -> 4.0 4.2 2.1 2.1 s, Transmission 7.9 7.7 4.5 4.2 -> 6.1 6.9 4.0 3.9 s.
+- What remains for Calculator: 1.35 s user time (translated guest code about 56 %: dyld binding, the Objective-C
+  runtime, CoreFoundation, spread thinly; interpreted 2 %, the SSE instructions that go to sse_x87_step), 0.31 s
+  system time (page faults, Mach messages), waiting for the window server and the font server.

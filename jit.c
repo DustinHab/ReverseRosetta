@@ -21,7 +21,9 @@
  * the generated code. What the translator cannot do, the interpreter executes (exit "interpret").
  *
  * Blocks from writable pages (dyld rewrites its jump stubs in __IMPORT) check their bytes on entry;
- * mmap/munmap/mprotect of the guest flush the whole cache at the next stop.
+ * mmap/munmap/mprotect of the guest discard the blocks that rely on the range at the next stop (invalidate_ranges).
+ * A memory fault in guest code goes to the guest's handler (jit_fault_state); the translator's own reads of guest
+ * memory at translation time are probes that a fault jumps back from (safe_read).
  *
  * ROSETTA_PROFILE=1: samples of the program counter, report at the end (hottest blocks, /tmp/rosetta_profile.s).
  */
@@ -32,6 +34,7 @@
 #include "thunk.h"
 #include "sys.h"
 #include "thread.h"
+#include "mach_msg.h"
 #include "ppc.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +56,7 @@
 #include <sched.h>
 #include <setjmp.h>
 #include <pthread.h>
+#include <sys/resource.h>
 
 #define R(i) (14 + (i))
 #define RCPU 22
@@ -562,6 +566,7 @@ static int g_dep_lost;                  /* a record could not be stored: remappi
 #define INVAL_N 64
 static struct { uint32_t a, len; } g_inval[INVAL_N];     /* remapped ranges waiting for the dispatcher (g_flush 2) */
 static int g_ninval, g_no_partial;
+static int g_no_probe;                  /* ROSETTA_NO_PROBE: read probes through vm_read_overwrite (safe_read) */
 static unsigned long g_st_inval_ranges, g_st_inval_blocks, g_st_inval_loaded;
 
 static void flush(void)
@@ -776,6 +781,7 @@ static int jit_create(void)
     if (getenv("ROSETTA_SETCC_CR")) g_no_setcc_cr = !atoi(getenv("ROSETTA_SETCC_CR"));
     g_no_pageexact = getenv("ROSETTA_NO_PAGEEXACT") != 0;
     g_no_partial = getenv("ROSETTA_NO_PARTIAL") != 0;
+    g_no_probe = getenv("ROSETTA_NO_PROBE") != 0;
     g_cmpsb_on = !getenv("ROSETTA_NO_CMPSB");
     if (getenv("ROSETTA_PAUSE")) g_no_pause = !atoi(getenv("ROSETTA_PAUSE"));
     g_no_exact_sz = getenv("ROSETTA_NO_EXACT_SZ") != 0;
@@ -883,6 +889,7 @@ static void map_remove(uint32_t eip)
 
 /* vm_region is a Mach call (expensive): remember the last regions until the guest rearranges its memory */
 #define RANGES 64                     /* program, dyld, libraries, stack, heap: 8 were not enough */
+static unsigned long g_st_region, g_st_safe_read;    /* own Mach calls of the translator, failed read probes (ROSETTA_STATS) */
 static struct { uint32_t start, end; int prot; } g_range[RANGES];
 static int g_nrange;
 
@@ -900,6 +907,7 @@ static int page_prot(uint32_t a)
     if (a - g_range[latest].start < g_range[latest].end - g_range[latest].start) return g_range[latest].prot;
     for (i = 0; i < RANGES; i++)
         if (a - g_range[i].start < g_range[i].end - g_range[i].start) { latest = i; return g_range[i].prot; }
+    g_st_region++;
     if (vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO, (vm_region_info_t)&info, &n, &obj))
         return -1;
     if (addr > a) return -1;
@@ -1023,7 +1031,8 @@ static int classify(const Insn *b, uint8_t *reads, uint8_t *writes, int *kind)
         return sz == 4;
     case 0xc1: case 0xd1:
         if (op == 0xc1 && (b->imm & 31) == 0) return sz == 4 || (sz == 2 && !b->mem);
-        if (b->reg <= 1 && sz == 4) {       /* rol/ror: only CF and OF; if one of them is live, the interpreter computes */
+        if (b->reg <= 1 && (sz == 4 || (sz == 2 && !b->mem))) {
+            /* rol/ror (also rolw $8 of a register: ntohs): only CF and OF; if one is live, the interpreter computes */
             *writes = FCF | FOF;
             return 1;
         }
@@ -1032,7 +1041,26 @@ static int classify(const Insn *b, uint8_t *reads, uint8_t *writes, int *kind)
         *writes = TRAP;
         return 1;
     case 0xd3:                              /* count 0 leaves the flags unchanged: neither read nor write */
-        return sz == 4 && (b->reg == 4 || b->reg == 5 || b->reg == 7);
+        return sz == 4 && (b->reg <= 1 || b->reg == 4 || b->reg == 5 || b->reg == 7);
+    case 0xc0: case 0xd0:                   /* a byte register by 1..7 (gen_shift8) */
+        if (b->mem) return 0;
+        {
+            int n = op == 0xd0 ? 1 : (int)(b->imm & 31);
+            if (n == 0) return 1;
+            if (n > 7) return 0;
+            if (b->reg <= 1) { *writes = FCF | FOF; return 1; }
+            if (!(b->reg == 4 || b->reg == 5 || b->reg == 7)) return 0;
+            *writes = TRAP;
+            return 1;
+        }
+    case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97:   /* xchg eax, r32 */
+        return sz == 4;
+    case OP_0F | 0xa4: case OP_0F | 0xac:   /* shld/shrd $n (gen_double_shift) */
+        if (sz != 4) return 0;
+        if (b->imm & 31) *writes = TRAP;    /* count 0: nothing happens */
+        return 1;
+    case OP_0F | 0xa5: case OP_0F | 0xad:   /* the same with cl: as d3, neither read nor write */
+        return sz == 4;
     case 0xc2: case 0xc3:
         *kind = RET; return 1;
     case 0xc9:
@@ -1076,7 +1104,7 @@ static int classify(const Insn *b, uint8_t *reads, uint8_t *writes, int *kind)
     case OP_0F | 0x9c: case OP_0F | 0x9d: case OP_0F | 0x9e: case OP_0F | 0x9f:
         *reads = cond_mask(op & 15); return 1;
     case OP_0F | 0xb6: case OP_0F | 0xb7: case OP_0F | 0xbe: case OP_0F | 0xbf:
-        return sz == 4;
+        return sz == 4 || sz == 2;          /* also movzbw/movsbw into a 16-bit register */
     case OP_0F | 0xc8: case OP_0F | 0xc9: case OP_0F | 0xca: case OP_0F | 0xcb:
     case OP_0F | 0xcc: case OP_0F | 0xcd: case OP_0F | 0xce: case OP_0F | 0xcf:
         return 1;
@@ -1780,6 +1808,53 @@ static void gen_rotate(const Insn *b, int right, int count)
     if (!only_reg) { save_p(vd, ra, rb, 4); after_save(b, 4, ra, rb, vd); }
 }
 
+/* rol/ror r/m32 by cl (CF and OF dead; count 0 leaves the value) */
+static void gen_rotate_cl(const Insn *b, int right)
+{
+    int ra = 0, rb = 0, vd, only_reg = 0;
+    e(RLWINM(5, R(ECX), 0, 27, 31));
+    if (right) e(SUBFIC(5, 5, 32));         /* rotating by 32 is rotating by 0 (rlwnm takes 5 bits) */
+    if (!b->mem) { e(RLWNM(R(b->rm), R(b->rm), 5, 0, 31)); return; }
+    {
+        int c = slot_reg(b, 4);
+        only_reg = c >= 0 && g_sl_wb_now;
+        if (!only_reg) ea_pair(b, 1, &ra, &rb);
+        if (c >= 0) vd = c; else { load_p(3, ra, rb, 4); vd = 3; }
+    }
+    e(RLWNM(vd, vd, 5, 0, 31));
+    if (!only_reg) { save_p(vd, ra, rb, 4); after_save(b, 4, ra, rb, vd); }
+}
+
+/* rolw/rorw $n of a 16-bit register (rolw $8: the byte swap of ntohs): the half twice side by side, rotate */
+static void gen_rotate16(const Insn *b, int right, int n)
+{
+    int r = R(b->rm);
+    n &= 15;
+    if (!n) return;
+    e(RLWINM(0, r, 0, 16, 31));
+    e(RLWIMI(0, 0, 16, 0, 15));
+    e(RLWINM(0, 0, right ? 16 - n : n, 16, 31));
+    e(RLWIMI(r, 0, 0, 16, 31));
+}
+
+/* shl/shr/sar/rol/ror of a byte register by 1..7 (hex digits: shrb $4); rotations only with CF and OF dead */
+static void gen_shift8(const Insn *b, int kind, int n, int needs)
+{
+    int x = reg_val(b->rm, 1, 4);           /* zero-extended byte */
+    if (kind <= 1) {
+        e(RLWIMI(x, x, 8, 16, 23));          /* the byte twice side by side */
+        e(RLWINM(0, x, kind == 0 ? 24 + n : 32 - n, 24, 31));
+        reg_set(b->rm, 1, 0);
+        return;
+    }
+    if (needs) { e(MR(RA, x)); e(LI(RB, n)); }
+    if (kind == 4) e(RLWINM(0, x, n, 24, 31));
+    else if (kind == 5) e(RLWINM(0, x, 32 - n, 24, 31));
+    else { e(EXTSB(0, x)); e(SRAWI(0, 0, n)); e(RLWINM(0, 0, 0, 24, 31)); }
+    reg_set(b->rm, 1, 0);
+    if (needs) { e(MR(RE, 0)); flags_new(kind == 4 ? CC_SHL : kind == 5 ? CC_SHR : CC_SAR, 1); }
+}
+
 static void gen_shift(const Insn *b, int kind, int count, int needs)
 {
     int ra = 0, rb = 0, vd, vr, only_reg = 0;
@@ -1820,6 +1895,37 @@ static void gen_shift(const Insn *b, int kind, int count, int needs)
             e(NOP); e(NOP);
             fs.kind = -1;                    /* state is in memory (both paths) */
         }
+    }
+    if (b->mem && !only_reg) { save_p(vr, ra, rb, 4); after_save(b, 4, ra, rb, vr); }
+}
+
+/* shld/shrd r/m32, r32 by count 1..31 or (count < 0) by cl: gcc's 64-bit shifts (CoreFoundation reads big-endian
+   numbers of binary property lists this way: 700,000 interpreted shld at Calculator's startup). Fixed count: two
+   rotations; flags as shl/shr (CF the last bit shifted out of the destination, SF ZF PF of the result; OF of a
+   one-bit shrd differs, the caller interprets then). With cl only without live flags (count 0 leaves them) */
+static void gen_double_shift(const Insn *b, int left, int count, int needs)
+{
+    int ra = 0, rb = 0, vd, vr, only_reg = 0, src = reg_val(b->reg, 4, 0);
+    if (!b->mem) { vd = reg_val(b->rm, 4, 0); vr = R(b->rm); }
+    else {
+        int c = slot_reg(b, 4);
+        only_reg = c >= 0 && g_sl_wb_now;
+        if (!only_reg) ea_pair(b, 1, &ra, &rb);
+        if (c >= 0) vd = c; else { load_p(3, ra, rb, 4); vd = 3; }
+        vr = vd;
+    }
+    if (count > 0) {
+        if (needs) { e(MR(RA, vd)); e(LI(RB, count)); }
+        if (left) { e(RLWINM(0, vd, count, 0, 31 - count)); e(RLWIMI(0, src, count, 32 - count, 31)); }
+        else { e(RLWINM(0, vd, 32 - count, count, 31)); e(RLWIMI(0, src, 32 - count, 0, count - 1)); }
+        e(MR(vr, 0));
+        if (needs) { e(MR(RE, vr)); flags_new(left ? CC_SHL : CC_SHR, 4); }
+    } else {                                /* count 0 gives the destination unchanged: shift by 32 is 0 on PowerPC */
+        e(RLWINM(5, R(ECX), 0, 27, 31));
+        e(SUBFIC(6, 5, 32));
+        if (left) { e(SLW(0, vd, 5)); e(SRW(6, src, 6)); }
+        else { e(SRW(0, vd, 5)); e(SLW(6, src, 6)); }
+        e(OR(vr, 0, 6));
     }
     if (b->mem && !only_reg) { save_p(vr, ra, rb, 4); after_save(b, 4, ra, rb, vr); }
 }
@@ -3035,7 +3141,8 @@ static int prefetch_choose(const Insn *b, const int *kinds, const int *traced, c
             if (!ok[q]) {
                 for (k = i - 1; k >= 0 && !(wm[k] >> x->rm & 1); k--) ;
                 q = -1;
-                if (k >= 0 && (b[k].op == (OP_0F | 0xb6) || b[k].op == (OP_0F | 0xb7)) && !b[k].mem && b[k].reg == x->rm) {
+                if (k >= 0 && (b[k].op == (OP_0F | 0xb6) || b[k].op == (OP_0F | 0xb7)) && !b[k].mem && b[k].reg == x->rm &&
+                    b[k].opsz == 4) {               /* (movzbw writes only the low half) */
                     int s = b[k].rm, m;
                     if (b[k].op == (OP_0F | 0xb6) && s >= 4) s = -1;     /* ah..bh: not */
                     if (s >= 0 && ok[s]) {
@@ -5009,6 +5116,7 @@ static void gen(const Insn *b, int needs, int needs_cf)
         if (n == 0) return;
         if (b->reg <= 1) {                  /* rol/ror */
             if (g_afterwards_now & (FCF | FOF)) gen_interpret(b, 0, FCF | FOF);
+            else if (sz == 2) gen_rotate16(b, b->reg == 1, n);
             else gen_rotate(b, b->reg == 1, n);
             return;
         }
@@ -5016,7 +5124,35 @@ static void gen(const Insn *b, int needs, int needs_cf)
         return;
     }
     case 0xd3:
+        if (b->reg <= 1) {                  /* rol/ror by cl: count 0 leaves CF and OF, so the interpreter if they are live */
+            if (g_afterwards_now & (FCF | FOF)) gen_interpret(b, 0, FCF | FOF);
+            else gen_rotate_cl(b, b->reg == 1);
+            return;
+        }
         gen_shift(b, b->reg, -1, needs);
+        return;
+    case 0xc0: case 0xd0: {
+        int n = op == 0xd0 ? 1 : (int)(b->imm & 31);
+        if (n == 0) return;
+        if (b->reg <= 1 && (g_afterwards_now & (FCF | FOF))) { gen_interpret(b, 0, FCF | FOF); return; }
+        gen_shift8(b, b->reg, n, needs);
+        return;
+    }
+    case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97:
+        e(MR(3, R(EAX))); e(MR(R(EAX), R(op & 7))); e(MR(R(op & 7), 3));
+        return;
+    case OP_0F | 0xa4: case OP_0F | 0xac: {
+        int n = (int)(b->imm & 31);
+        if (n == 0) return;
+        /* OF of a one-bit shrd is not that of shr: the interpreter if it is needed */
+        if (op == (OP_0F | 0xac) && n == 1 && (g_afterwards_now & FOF)) { gen_interpret(b, 0, TRAP); return; }
+        gen_double_shift(b, op == (OP_0F | 0xa4), n, needs);
+        return;
+    }
+    case OP_0F | 0xa5: case OP_0F | 0xad:
+        /* live flags: the interpreter (count 0 leaves them, otherwise new ones); s != TRAP stores the current ones first */
+        if (g_afterwards_now & TRAP) { gen_interpret(b, 0, TRAP & ~FAF); return; }
+        gen_double_shift(b, op == (OP_0F | 0xa5), -1, 0);
         return;
     case 0xc9: {                            /* leave: esp = ebp, pop ebp */
         int k = g_sw_aebp_ok ? sw_find(g_sw_aebp) : -1;
@@ -5057,12 +5193,13 @@ static void gen(const Insn *b, int needs, int needs_cf)
         if (b->mem) save_m(4, b, 1); else reg_set(b->rm, 1, 4);
         return;
     case OP_0F | 0xb6: case OP_0F | 0xb7: case OP_0F | 0xbe: case OP_0F | 0xbf: {
-        int g = (op & 1) ? 2 : 1, sign = (op & 0xff) >= 0xbe;
-        if (b->mem) load_m(R(b->reg), b, g);
-        else if (g == 2) e(RLWINM(R(b->reg), R(b->rm), 0, 16, 31));
-        else if (b->rm < 4) e(RLWINM(R(b->reg), R(b->rm), 0, 24, 31));
-        else e(RLWINM(R(b->reg), R(b->rm - 4), 24, 24, 31));
-        if (sign) e(g == 1 ? EXTSB(R(b->reg), R(b->reg)) : EXTSH(R(b->reg), R(b->reg)));
+        int g = (op & 1) ? 2 : 1, sign = (op & 0xff) >= 0xbe, t = sz == 2 ? 4 : R(b->reg);   /* 16 bit: low half only */
+        if (b->mem) load_m(t, b, g);
+        else if (g == 2) e(RLWINM(t, R(b->rm), 0, 16, 31));
+        else if (b->rm < 4) e(RLWINM(t, R(b->rm), 0, 24, 31));
+        else e(RLWINM(t, R(b->rm - 4), 24, 24, 31));
+        if (sign) e(g == 1 ? EXTSB(t, t) : EXTSH(t, t));
+        if (sz == 2) reg_set(b->reg, 2, t);
         return;
     }
     case OP_0F | 0xbc: case OP_0F | 0xbd:   /* bsf, bsr: destination stays unchanged at 0; ZF from the source */
@@ -5215,6 +5352,9 @@ static uint8_t write_mask_calc(const Insn *b)
     case 0x8a: case 0x8b: return MK(BREG(b->reg, op == 0x8a ? 1 : b->opsz));
     case 0xc6: case 0xc7: return m ? 0 : MK(BREG(b->rm, op == 0xc6 ? 1 : b->opsz));
     case 0xc1: case 0xd1: case 0xd3: return m ? 0 : MK(b->rm);
+    case OP_0F | 0xa4: case OP_0F | 0xa5: case OP_0F | 0xac: case OP_0F | 0xad: return m ? 0 : MK(b->rm);
+    case 0xc0: case 0xd0: return m ? 0 : MK(BREG(b->rm, 1));
+    case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97: return MK(EAX) | MK(op & 7);
     case 0xc9: return MK(ESP) | MK(EBP);
     case 0xf6: case 0xf7:                   /* test; not/neg on r/m; mul/imul/div/idiv write eax (and edx) */
         if (b->reg == 0 || b->reg == 1) return 0;
@@ -5991,13 +6131,44 @@ static unsigned long g_st_embed, g_st_before, g_st_before_miss;
    instructions collected so far (then their value in g_cpu holds), memory readable; *target = value now. A guard
    checks at run time. */
 /* 32-bit word at adr, if readable */
-/* Whether n bytes from a are really readable. vm_region reports subregions (shared libraries of the host at
-   0x90000000) as readable even though they contain holes without pages; vm_read_overwrite returns an error there
-   instead of signal 11. Only at translation time (predictions from register values can point anywhere). */
+/* Whether n bytes from a are really readable, and copy them. Only at translation time (predictions from register
+   values can point anywhere; vm_region reports the shared libraries of the host at 0x90000000 as readable even
+   though they contain holes without pages). A probe: copy directly; if that faults, the fault handler (main.c
+   memfault, jit_probe_fault) jumps back here. vm_read_overwrite did the same safely, but as a Mach call of ~12 us:
+   62,000 of them in a first start of Calculator, the second start (everything is translated) more */
+static jmp_buf g_probe_jb;
+static volatile int g_probing;
+static void *volatile g_probe_thread;
+
+int jit_probe_fault(void)
+{
+    if (!g_probing || g_probe_thread != (void *)pthread_self()) return 0;
+    g_probing = 0;
+    _longjmp(g_probe_jb, 1);
+    return 1;
+}
+
 static int safe_read(uint32_t a, void *target, uint32_t n)
 {
-    vm_size_t was_read = 0;
-    return vm_read_overwrite(mach_task_self(), a, n, (vm_address_t)(uintptr_t)target, &was_read) == KERN_SUCCESS && was_read == n;
+    if (!n || a + n - 1 < a) return 0;
+    if (g_no_probe) {
+        vm_size_t was_read = 0;
+        return vm_read_overwrite(mach_task_self(), a, n, (vm_address_t)(uintptr_t)target, &was_read) == KERN_SUCCESS && was_read == n;
+    }
+    if (_setjmp(g_probe_jb)) {             /* faulted: the host still blocks the signal (no sigreturn) */
+        sigset_t m;
+        sigemptyset(&m);
+        sigaddset(&m, SIGSEGV);
+        sigaddset(&m, SIGBUS);
+        sigprocmask(SIG_UNBLOCK, &m, 0);
+        g_st_safe_read++;
+        return 0;
+    }
+    g_probe_thread = (void *)pthread_self();
+    g_probing = 1;
+    memcpy(target, (const void *)(uintptr_t)a, n);
+    g_probing = 0;
+    return 1;
 }
 
 /* 16 bytes of code from a really present (predicted targets) */
@@ -7517,6 +7688,26 @@ static int step_counted(Cpu *c)
     return step(c);
 }
 
+/* the most frequent interpreted opcodes so far (ROSETTA_STATS, at the first idle moment; leaves the counts) */
+static void interp_op_show(void)
+{
+    unsigned long seen[16];
+    int k, i, best, m;
+    fprintf(stderr, "rosetta: interpreted so far (opcode count):");
+    for (k = 0; k < 16; k++) {
+        for (best = -1, i = 0; i < 0x400; i++) {
+            for (m = 0; m < k && seen[m] != (unsigned long)i; m++) ;
+            if (m == k && g_interp_op[i] && (best < 0 || g_interp_op[i] > g_interp_op[best])) best = i;
+        }
+        if (best < 0) break;
+        seen[k] = (unsigned long)best;
+        if (best >= 0x3c0) fprintf(stderr, " %02x/%d:%lu", 0xd8 + ((best - 0x3c0) >> 3), (best - 0x3c0) & 7, g_interp_op[best]);
+        else fprintf(stderr, " %s%02x:%lu", best >= 0x300 ? "0f3a." : best >= 0x200 ? "0f38." : best >= 0x100 ? "0f." : "",
+                     best & 0xff, g_interp_op[best]);
+    }
+    fprintf(stderr, "\n");
+}
+
 /* ---------- Tiered translation ----------
  * Translation costs about 3 us per instruction, interpretation a fraction of that. Code that runs only a few times
  * (the bulk at startup) is therefore interpreted; a block is translated only when the dispatcher enters it for the
@@ -8064,7 +8255,20 @@ static void cache_load(void)
     close(fd);
     g_nvimage = (int)k.nimages;
     g_free = g_cache + k.code / 4;
-    while (2 * (k.nmap + 1) > g_map_mask + 1) map_grow();    /* the right size right away (otherwise rehash three times) */
+    {   /* the map empty in the right size right away (map_grow would rehash several times and grow fourfold: 2^18
+           entries instead of 2^17 for Calculator's 60,000 blocks, 1.5 MB more pages to touch) */
+        uint32_t bits = g_map_bits;
+        while (2 * (k.nmap + 1) > (1u << bits)) bits++;
+        if (bits > g_map_bits && !g_nused) {
+            void *m = calloc(1u << bits, sizeof *g_map), *u = calloc(1u << bits, sizeof *g_inuse);
+            if (m && u) {
+                free(g_map); free(g_inuse);
+                g_map = m; g_inuse = u;
+                g_map_bits = bits; g_map_mask = (1u << bits) - 1;
+            } else { free(m); free(u); }
+        }
+    }
+    while (2 * (k.nmap + 1) > g_map_mask + 1) map_grow();
     for (i = 0; i < k.nmap; i++) map_add(t[2 * i], g_cache + t[2 * i + 1] / 4);
     {
         uint32_t *s = t + 2 * k.nmap;
@@ -8259,6 +8463,40 @@ static void checkpoint_idle(void)
     if (!g_checkpoint_idle || g_checkpoint_idle_done) return;
     g_checkpoint_idle = 0;
     g_checkpoint_idle_done = 1;
+    if (getenv("ROSETTA_STATS")) {           /* what the startup cost (programs with windows rarely end normally) */
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        struct rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+        fprintf(stderr, "rosetta: first idle moment after %.2f s: processor %.2f s user, %.2f s system; %ld page faults "
+                "(%ld from disk), %ld + %ld context switches\n", (double)(mach_absolute_time() - g_run_t0) * tb.numer / tb.denom / 1e9,
+                ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6, ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6, ru.ru_minflt,
+                ru.ru_majflt, ru.ru_nvcsw, ru.ru_nivcsw);
+        {
+            task_events_info_data_t ev;
+            mach_msg_type_number_t en = TASK_EVENTS_INFO_COUNT;
+            memset(&ev, 0, sizeof ev);
+            task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&ev, &en);
+            fprintf(stderr, "rosetta: page faults %d (copy on write %d, from disk %d), Mach messages sent %d, received %d, "
+                    "system calls %d + %d, context switches %d\n", ev.faults, ev.cow_faults, ev.pageins, ev.messages_sent,
+                    ev.messages_received, ev.syscalls_unix, ev.syscalls_mach, ev.csw);
+        }
+        if (g_main_cpu && g_main_cpu->host_thread) {   /* the main thread alone (the others mostly wait) */
+            thread_basic_info_data_t ti;
+            mach_msg_type_number_t tn = THREAD_BASIC_INFO_COUNT;
+            mach_port_t th = pthread_mach_thread_np((pthread_t)g_main_cpu->host_thread);
+            if (thread_info(th, THREAD_BASIC_INFO, (thread_info_t)&ti, &tn) == KERN_SUCCESS)
+                fprintf(stderr, "rosetta: main thread: processor %.2f s user, %.2f s system\n",
+                        ti.user_time.seconds + ti.user_time.microseconds / 1e6, ti.system_time.seconds + ti.system_time.microseconds / 1e6);
+        }
+        thread_stats();
+        sys_stats();
+        mach_msg_stats();
+        thunk_stats();
+        interp_op_show();
+        fprintf(stderr, "rosetta: own Mach calls: %lu vm_region (page protections); %lu read probes failed (predictions)\n",
+                g_st_region, g_st_safe_read);
+    }
     if (getenv("ROSETTA_NO_CHECKPOINT") || !g_cache) return;
     if (g_patched) unpatch();
     cache_write();

@@ -87,9 +87,12 @@ t_remap() { ./rosetta ./remap; ./rosetta ./remap; ROSETTA_THRESHOLD=1 ./rosetta 
 r_remap() { cat ../tests/remap.expected ../tests/remap.expected ../tests/remap.expected; }
 t_remapc() { rm -f /tmp/rr_remap_cache; for n in 1 2 1 2; do ROSETTA_CACHE_FILE=/tmp/rr_remap_cache ./rosetta ./remap $n; done; rm -f /tmp/rr_remap_cache; }
 r_remapc() { for n in 1 2 1 2; do echo "file $n: 10$n (sum 10${n}000)"; done; }
+t_shf()   { ./rosetta ./shifts; ROSETTA_THRESHOLD=1 ./rosetta ./shifts; ROSETTA_INTERP=1 ./rosetta ./shifts; }
+r_shf()   { ./shifts.ppc; ./shifts.ppc; ./shifts.ppc; }
 t_cmpsb() { ROSETTA_THRESHOLD=1 ./rosetta ./cmpsb; }
 r_cmpsb() { ROSETTA_INTERP=1 ./rosetta ./cmpsb; }
 same raw_arith t_raw r_raw
+same "64-bit shifts, shld/shrd with flags" t_shf r_shf
 same "cmpsb (translated against interpreter)" t_cmpsb r_cmpsb
 same "packed doubles with special values (against interpreter)" t_pdo r_pdo
 same "threads (mutex, condition, spinlock, pipe, join)" t_thr r_thr
