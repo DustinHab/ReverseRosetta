@@ -9,7 +9,7 @@ W=${ROSETTA_INTEL:-$R/intel/root}
 resolve() {     # install path -> file with an i386 part, or empty (STUBS_REBUILD=1: stub libraries count as missing)
     for k in "$W$1" "$1"; do
         [ -f "$k" ] && lipo -info "$k" 2>/dev/null | grep -q i386 || continue
-        [ -n "$STUBS_REBUILD" ] && grep -q "rosetta-stub" "$k" && continue
+        [ -n "$STUBS_REBUILD" ] && grep -q -e "rosetta-stub" -e "rosetta-Platzhalter" "$k" && continue   # (older marker)
         echo "$k"; return
     done
 }

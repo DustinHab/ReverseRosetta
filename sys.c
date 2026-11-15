@@ -36,6 +36,7 @@
 #include <sys/wait.h>
 #include <sys/event.h>
 #include <termios.h>
+#include <pthread.h>
 #include <utmpx.h>
 #include <signal.h>
 #include <mach/mach.h>
@@ -593,7 +594,7 @@ static void sys_sysctl(Cpu *c)
                 return;
             }
         }
-        r = sysctl(name, n, (void *)(uintptr_t)prev, prev ? &l : 0, (void *)(uintptr_t)fresh, newlen);
+        r = sysctl(name, n, (void *)(uintptr_t)prev, oldlen ? &l : 0, (void *)(uintptr_t)fresh, newlen);
         if (r < 0) { set_result(c, 0, errno); return; }
         for (i = 0; prev && i + 4 <= l; i += 4) st32(prev + i, *(uint32_t *)(uintptr_t)(prev + i));
         if (oldlen) st32(oldlen, (uint32_t)l);
@@ -649,8 +650,14 @@ static void sys_sysctl(Cpu *c)
         set_result(c, 0, 0);
         return;
     }
-    r = sysctl(name, n, (void *)(uintptr_t)prev, prev ? &l : 0, (void *)(uintptr_t)fresh, newlen);
-    if (r < 0) { set_result(c, 0, errno); return; }
+    /* the length pointer goes along also without a buffer: that is how the guest asks for the size it needs */
+    r = sysctl(name, n, (void *)(uintptr_t)prev, oldlen ? &l : 0, (void *)(uintptr_t)fresh, newlen);
+    if (r < 0) {
+        int e = errno;
+        if (e == ENOMEM && oldlen) st32(oldlen, (uint32_t)l);
+        set_result(c, 0, e);
+        return;
+    }
     if (prev && l && sysctl_struct_swap(name, n, prev, (uint32_t)l)) type = -1;
     else type = prev && l ? sysctl_type(name, n) : 0;
     if (prev && type >= 0) {
@@ -763,7 +770,7 @@ static void sig_host(int sig, siginfo_t *si, void *k)
 static int sig_own(int sig)
 {
     return sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGKILL || sig == SIGSTOP ||
-           (sig == SIGALRM && getenv("ROSETTA_HPROFILE"));
+           ((sig == SIGALRM || sig == SIGPROF) && getenv("ROSETTA_HPROFILE"));
 }
 
 /* SIG_DFL signals that the guest blocks are caught by the host as well: they are only marked pending, and the
@@ -1345,6 +1352,16 @@ static const char *sys_name(uint32_t n)
     }
 }
 
+/* ROSETTA_LOG=2: each log line starts with the seconds since the start and the host thread */
+void sys_log_stamp(void)
+{
+    static uint64_t t0;
+    static mach_timebase_info_data_t tb;
+    uint64_t t = mach_absolute_time();
+    if (!t0) { t0 = t; mach_timebase_info(&tb); }
+    fprintf(stderr, "%9.3f %04x ", (double)(t - t0) * tb.numer / tb.denom / 1e9, (unsigned)(pthread_mach_thread_np(pthread_self()) & 0xffff));
+}
+
 /* *_nocancel versions (396..423) mapped to the normal calls */
 static uint32_t no_nocancel(uint32_t n)
 {
@@ -1364,8 +1381,10 @@ void sys_bsd(Cpu *c, int sysenter)
     uint32_t n = no_nocancel(c->r[EAX] & 0xffff);
     if (!sysenter) g_arg_base = c->r[ESP];
     g_call_eip = c->eip;
-    if (g_log)
+    if (g_log) {
+        if (g_log > 1) sys_log_stamp();
         fprintf(stderr, "[bsd %u %s] %08x %08x %08x %08x\n", n, sys_name(n), arg(0), arg(1), arg(2), arg(3));
+    }
     switch (n) {
     case SYS_exit:
         c->finished = 1;
@@ -2331,8 +2350,18 @@ void sys_bsd(Cpu *c, int sysenter)
             ch[k].fflags = ld32(a + 8); ch[k].data = (intptr_t)(int32_t)ld32(a + 12); ch[k].udata = (void *)(uintptr_t)ld32(a + 16);
         }
         if (arg(5)) { ts.tv_sec = (time_t)(int32_t)ld32(arg(5)); ts.tv_nsec = (long)(int32_t)ld32(arg(5) + 4); }
+        if (g_log) {
+            for (k = 0; k < nch; k++)
+                fprintf(stderr, "[kevent] change ident %u filter %d flags %04x fflags %x data %ld udata %08x\n", (unsigned)ch[k].ident,
+                        ch[k].filter, ch[k].flags, ch[k].fflags, (long)ch[k].data, (unsigned)(uintptr_t)ch[k].udata);
+            if (arg(5)) fprintf(stderr, "[kevent] wait up to %ld.%09ld s for %d events\n", (long)ts.tv_sec, ts.tv_nsec, nev);
+        }
         r = f_kevent((int)arg(0), ch, nch, ev, nev, arg(5) ? &ts : 0);
         e = errno;
+        if (g_log)
+            for (k = 0; k < r; k++)
+                fprintf(stderr, "[kevent] event ident %u filter %d flags %04x fflags %x data %ld udata %08x\n", (unsigned)ev[k].ident,
+                        ev[k].filter, ev[k].flags, ev[k].fflags, (long)ev[k].data, (unsigned)(uintptr_t)ev[k].udata);
         for (k = 0; k < r; k++) {
             uint32_t a = gb + 20 * (uint32_t)k;
             st32(a, (uint32_t)ev[k].ident); st16(a + 4, (uint16_t)ev[k].filter); st16(a + 6, ev[k].flags);

@@ -14,6 +14,9 @@ void sys_stats(void);                /* ROSETTA_STATS: time per system call */
    parent (blocked signals become the guest mask, ignored ones stay ignored) */
 void sys_init(void);
 
+/* ROSETTA_LOG=2: time and thread in front of every log line */
+void sys_log_stamp(void);
+
 /* the guest's arguments and program path (KERN_PROCARGS2 and p_comm of the own process) */
 void sys_set_args(int argc, char **argv, const char *path);
 

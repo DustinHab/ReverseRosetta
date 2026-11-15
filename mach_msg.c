@@ -439,6 +439,29 @@ static void host_info_reply(uint8_t *m, uint32_t n)
     *(uint32_t *)(m + 56) = 4;              /* CPU_SUBTYPE_486, as Intel Macs report it ("machine": i486) */
 }
 
+/* io_registry_entry_from_path("IODeviceTree:/efi"): Intel frameworks treat a missing EFI node as a fatal platform
+   error. AppKit, when the program starts its first NSThread ([NSApplication _taskNowMultiThreaded:]), then waits
+   forever on a condition nobody signals; LaunchServices waits for the node to appear. A PowerPC Mac has Open Firmware
+   instead of EFI: the query goes to the device tree root, which exists. Request (MIG, iokit 2809): NDR @24,
+   pathOffset @32, pathCnt @36 (guest byte order, with the NUL), path from @40; size 40 + pathCnt rounded to 4. */
+#define IO_REGISTRY_ENTRY_FROM_PATH 2809
+static const char g_efi_path[] = "IODeviceTree:/efi", g_dt_root[] = "IODeviceTree:/";
+
+static uint32_t efi_query(uint8_t *m, uint32_t size)
+{
+    mach_msg_header_t *h = (mach_msg_header_t *)m;
+    uint32_t cnt;
+    if (size < 40 + sizeof g_efi_path || h->msgh_id != IO_REGISTRY_ENTRY_FROM_PATH) return size;
+    cnt = swap32(*(uint32_t *)(m + 36));
+    if (cnt != sizeof g_efi_path || memcmp(m + 40, g_efi_path, sizeof g_efi_path)) return size;
+    memset(m + 40, 0, (sizeof g_efi_path + 3) & ~3u);
+    memcpy(m + 40, g_dt_root, sizeof g_dt_root);
+    *(uint32_t *)(m + 36) = swap32((uint32_t)sizeof g_dt_root);
+    h->msgh_size = 40 + (((uint32_t)sizeof g_dt_root + 3) & ~3u);
+    if (g_log) fprintf(stderr, "[iokit] IODeviceTree:/efi answered with the device tree root\n");
+    return h->msgh_size;
+}
+
 /* buffer per thread (Cpu.msg): during mach_msg the thread lock is free, another thread can send */
 static mach_msg_return_t guest_mach_msg(Cpu *c, uint32_t msg, mach_msg_option_t option, uint32_t send_size, uint32_t receive,
                                        mach_port_t name, mach_msg_timeout_t deadline, mach_port_t message)
@@ -470,6 +493,7 @@ static mach_msg_return_t guest_mach_msg(Cpu *c, uint32_t msg, mach_msg_option_t 
                     !strncmp((const char *)(g_buffer + 32), ATS_SERVICE, 128);
         basic_info = send_size >= 40 && ((mach_msg_header_t *)g_buffer)->msgh_id == HOST_INFO_ID &&
                      swap32(*(uint32_t *)(g_buffer + 32)) == HOST_BASIC_INFO;    /* flavor, still in guest order */
+        send_size = efi_query(g_buffer, send_size);
     }
     {
         /* Wait interruptibly: otherwise the libSystem wrapper of the host silently restarts an interrupted send/receive,
@@ -525,7 +549,10 @@ static mach_msg_return_t guest_mach_msg(Cpu *c, uint32_t msg, mach_msg_option_t 
 void mach_trap(Cpu *c, int n, uint32_t base)
 {
     g_base = base;
-    if (g_log) fprintf(stderr, "[mach %d] %08x %08x %08x %08x\n", n, arg(0), arg(1), arg(2), arg(3));
+    if (g_log) {
+        if (g_log > 1) sys_log_stamp();
+        fprintf(stderr, "[mach %d] %08x %08x %08x %08x\n", n, arg(0), arg(1), arg(2), arg(3));
+    }
     switch (n) {
     case 26: c->r[EAX] = mach_reply_port(); return;
     case 27: c->r[EAX] = mach_thread_self(); return;
@@ -555,6 +582,7 @@ void mach_trap(Cpu *c, int n, uint32_t base)
         }
         c->r[EAX] = (uint32_t)guest_mach_msg(c, m, (mach_msg_option_t)opt, arg(2), arg(3), arg(4), arg(5), arg(6));
         if (g_log) {
+            if (g_log > 1) sys_log_stamp();
             fprintf(stderr, "[mach_msg] id %d to %x -> %x", id, (opt & MACH_SEND_MSG) ? ld32(m + 8) : 0, c->r[EAX]);
             if ((opt & MACH_RCV_MSG) && c->r[EAX] == 0)
                 fprintf(stderr, ", reply id %d size %u RetCode %d NDR %02x%02x%02x%02x", (int32_t)ld32(m + 20), ld32(m + 4),

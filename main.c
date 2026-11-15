@@ -132,7 +132,9 @@ static void memfault(int sig, siginfo_t *info, void *k)
         struct itimerval stop;
         memset(&stop, 0, sizeof stop);
         setitimer(ITIMER_REAL, &stop, 0);
+        setitimer(ITIMER_PROF, &stop, 0);
         signal(SIGALRM, SIG_IGN);
+        signal(SIGPROF, SIG_IGN);
     }
     {                                       /* host location (debugging the generated code) */
         ucontext_t *u = (ucontext_t *)k;
@@ -277,10 +279,12 @@ static void profile_start(void)
     sa.sa_sigaction = profile_sample;
     sa.sa_flags = SA_SIGINFO | SA_RESTART;
     sigaction(SIGALRM, &sa, 0);
+    sigaction(SIGPROF, &sa, 0);
     it.it_interval.tv_sec = it.it_value.tv_sec = 0;
     /* not below 50 us: at 29 us the kernel created over 5000 threads for the clock callbacks */
     it.it_interval.tv_usec = it.it_value.tv_usec = us && atoi(us) >= 50 ? atoi(us) : us ? 50 : 100;
-    setitimer(ITIMER_REAL, &it, 0);
+    /* ROSETTA_HPROFILE_CPU=1: processor time only (threads that wait are not sampled) */
+    setitimer(getenv("ROSETTA_HPROFILE_CPU") ? ITIMER_PROF : ITIMER_REAL, &it, 0);
 }
 
 static void profile_write(const char *path)
@@ -290,6 +294,7 @@ static void profile_write(const char *path)
     int i, t;
     memset(&it, 0, sizeof it);
     setitimer(ITIMER_REAL, &it, 0);
+    setitimer(ITIMER_PROF, &it, 0);
     f = fopen(path, "a");
     if (!f) return;
     for (i = 0; i < g_prof_n; i++) {
@@ -356,7 +361,7 @@ int main(int argc, char **argv)
     if (i >= argc) { fprintf(stderr, "usage: rosetta [-s] [-0 name] program [arguments ...]\n"); return 2; }
     path = argv[i];
     if (name) argv[i] = (char *)name;        /* argv[0] of the guest; the file is still loaded from path */
-    g_log = getenv("ROSETTA_LOG") != 0;
+    g_log = getenv("ROSETTA_LOG") ? (atoi(getenv("ROSETTA_LOG")) > 1 ? 2 : 1) : 0;     /* 2: with time and thread */
     sys_init();
     {
         struct sigaction sa;

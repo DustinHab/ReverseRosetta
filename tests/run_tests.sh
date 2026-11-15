@@ -74,6 +74,8 @@ t_flt()   { sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
 r_flt()   { cat ../tests/faults.expected; }
 t_flti()  { ROSETTA_INTERP=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
 t_fltj()  { ROSETTA_THRESHOLD=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
+t_calc()  { ./rosetta ./calculate; }
+r_calc()  { ./calculate.ppc; }
 t_id()    { ./rosetta ./identity; }
 r_id()    { cat ../tests/identity.expected; }
 t_cmpsb() { ROSETTA_THRESHOLD=1 ./rosetta ./cmpsb; }
@@ -90,6 +92,7 @@ if [ -d $R/intel/root ]; then      # stage 4: Intel frameworks from the Combo Up
     same "Foundation (Intel)" t_fnd r_fnd
     same "threads with Foundation (NSThread, NSOperationQueue)" t_thrns r_thrns
     same "vecLib: vDSP and vForce with doubles (against interpreted)" t_vd r_vd
+    same "Calculator's engine (Calculate.framework, native replacement)" t_calc r_calc
 fi
 same word16 t_w16 r_w16
 same "signals (handler, mask, alarm, pause, SIGPIPE)" t_sig r_sig

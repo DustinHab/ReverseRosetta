@@ -454,12 +454,11 @@ static void block_starts_halt(uint32_t *o, uint32_t eip, uint32_t fresh)
 static volatile int g_state_wish;
 static int word_read(uint32_t addr, uint32_t *w);
 
-static void state_short(Cpu *c)
+static void state_one(Cpu *c, const char *label)
 {
     uint32_t bp = c->r[EBP], w, n, s = c->r[ESP];
     int t;
-    g_state_wish = 0;
-    fprintf(stderr, "STATE eip %08x eax %08x ecx %08x edx %08x esp %08x ebp %08x | [esp]", c->eip, c->r[EAX], c->r[ECX],
+    fprintf(stderr, "%s eip %08x eax %08x ecx %08x edx %08x esp %08x ebp %08x | [esp]", label, c->eip, c->r[EAX], c->r[ECX],
             c->r[EDX], s, bp);
     for (t = 0; t < 4 && word_read(s + 4 * (uint32_t)t, &w); t++) fprintf(stderr, " %08x", w);
     fprintf(stderr, "\n  chain:");
@@ -469,6 +468,21 @@ static void state_short(Cpu *c)
         bp = n;
     }
     fprintf(stderr, "\n");
+}
+
+/* the running thread, then every other guest thread as it was when it last left translated code (blocked in a
+   system call or waiting for the lock) */
+static void state_short(Cpu *c)
+{
+    int k;
+    g_state_wish = 0;
+    state_one(c, "STATE");
+    for (k = 0; k < g_nfcpu; k++)
+        if (g_fcpu[k] != c) {
+            char label[32];
+            snprintf(label, sizeof label, "  THREAD %d", k);
+            state_one(g_fcpu[k], label);
+        }
 }
 
 static void state_signal(int sig)
@@ -2605,7 +2619,8 @@ static uint32_t g_vl_new[256];                  /* such sites in the block being
 static int g_vl_nnew, g_vl_overflow;
 static int g_vl_reg;                            /* ring pointer (0: no hoisting in this block) */
 static int32_t g_vl_step[VL_STREAMS];
-static char g_vl_kind[VL_STREAMS];               /* 'm' memory (double), 'u' conversion integer -> double */
+static char g_vl_kind[VL_STREAMS];               /* 'm' memory (double or float), 'u' conversion integer -> double */
+static int8_t g_vl_size[VL_STREAMS];             /* 'm': 8 double, 4 float */
 static int8_t g_vl_src[VL_STREAMS];          /* 'u': counter register */
 static uint32_t g_vl_mask[VL_STREAMS];         /* 'u': 0 whole, 0xff/0xffff after movzbl/movzwl */
 static int g_vl_nloaded;
@@ -2696,10 +2711,16 @@ static void vl_lwbrx(int d, int a, int b)
     e(LWBRX(d, a, b));
 }
 
-/* double at memory operand t (offset already adjusted) byte-swapped to ring slot o (relative to the ring pointer) */
-static void vl_put(const Insn *t, int o)
+/* double (size 8) or float (4) at memory operand t (offset already adjusted) byte-swapped to ring slot o (relative
+   to the ring pointer) */
+static void vl_put(const Insn *t, int o, int size)
 {
     int a = ea_in(t);
+    if (size == 4) {
+        vl_lwbrx(3, 0, a);
+        e(STW(3, o, g_vl_reg));
+        return;
+    }
     e(LI(0, 4));
     vl_lwbrx(3, a, 0);
     vl_lwbrx(4, 0, a);
@@ -2712,9 +2733,9 @@ static void vl_load(int f, const Insn *b)
 {
     int s = g_vl_cur - 1;
     Insn t = *b;
-    e(LFD(f, 8 * s, g_vl_reg));
+    e(g_vl_size[s] == 4 ? LFS(f, 8 * s, g_vl_reg) : LFD(f, 8 * s, g_vl_reg));
     t.disp += (uint32_t)(VL_DEPTH * g_vl_step[s]);
-    vl_put(&t, 8 * s);
+    vl_put(&t, 8 * s, g_vl_size[s]);
     g_vl_nloaded++;
 }
 
@@ -2792,14 +2813,40 @@ static int no_memwrite(const Insn *b)
     return 0;
 }
 
-/* double load that goes through m_load or the load paths of gen_fp/gen_x87 (vl_load is there) */
+/* double or float load that goes through m_load or the load paths of gen_fp/gen_x87 (vl_load is there): its size
+   (8 or 4), 0 if not */
 static int vl_can(const Insn *b)
 {
     int op = b->op, o = op & 0xff;
     if (!b->mem || b->seg) return 0;
-    if (x87_can(b)) return op == 0xdc || (op == 0xdd && b->reg == 0);
-    if (op < OP_0F || sse_can(b) || !fp_can(b) || b->rep != 0xf2 || b->p66) return 0;
-    return o == 0x10 || o == 0x58 || o == 0x59 || o == 0x5c || o == 0x5e || o == 0x51 || o == 0x5a || o == 0x2c || o == 0x2d;
+    if (x87_can(b)) {
+        if (op == 0xdc || (op == 0xdd && b->reg == 0)) return 8;
+        if (op == 0xd8 || (op == 0xd9 && b->reg == 0)) return 4;
+        return 0;
+    }
+    if (op < OP_0F || sse_can(b) || !fp_can(b) || (b->rep != 0xf2 && b->rep != 0xf3) || b->p66) return 0;
+    if (o == 0x10 || o == 0x58 || o == 0x59 || o == 0x5c || o == 0x5e || o == 0x51 || o == 0x5a || o == 0x2c || o == 0x2d)
+        return b->rep == 0xf2 ? 8 : 4;
+    return 0;
+}
+
+/* the instruction's only memory write is a plain store of *size bytes to its memory operand (0: some other or an
+   unknown write) */
+static int store_size(const Insn *b, int *size)
+{
+    int op = b->op, o = op & 0xff;
+    if (!b->mem || b->seg || b->lock) return 0;
+    switch (op) {
+    case 0x88: case 0xc6: *size = 1; return 1;
+    case 0x89: case 0xc7: *size = b->opsz; return 1;
+    case 0xd9: if (b->reg == 2 || b->reg == 3) { *size = 4; return 1; } return 0;   /* fst/fstp m32 */
+    case 0xdd: if (b->reg == 2 || b->reg == 3) { *size = 8; return 1; } return 0;   /* fst/fstp m64 */
+    }
+    if (op >= OP_0F && o == 0x11 && !b->p66 && (b->rep == 0xf2 || b->rep == 0xf3)) {  /* movsd/movss m, xmm */
+        *size = b->rep == 0xf2 ? 8 : 4;
+        return 1;
+    }
+    return 0;
 }
 
 /* Choose streams: stream[i] = stream + 1, stream_i/pre_d per stream (instruction, address change from the head up to
@@ -2807,8 +2854,8 @@ static int vl_can(const Insn *b)
 static int prefetch_choose(const Insn *b, const int *kinds, const int *traced, const int *interp, const uint32_t *cval,
                            int n, uint32_t eip, int *stream, int *stream_i, int32_t *pre_d)
 {
-    int j = -1, i, r, ns = 0, ok[8], mem = 0;
-    int32_t step[8], pre[8], d;
+    int j = -1, i, r, k, ns = 0, ok[8], mem = 0, nst, st_i[8], st_sz[8];
+    int32_t step[8], pre[8], d, st_pre[8];
     uint8_t wm[MAX_INSNS];
     g_vl_reg = 0;
     memset(stream, 0, (size_t)n * sizeof *stream);
@@ -2821,21 +2868,56 @@ static int prefetch_choose(const Insn *b, const int *kinds, const int *traced, c
         }
     if (j < 0) return 0;
     for (r = 0; r < 8; r++) { ok[r] = 1; step[r] = 0; pre[r] = 0; }
+    nst = 0;
     for (i = 0; i <= j; i++) {
+        int sz;
         if (interp[i]) return 0;
-        if (!no_memwrite(&b[i])) mem = 1;   /* then no memory streams (overlap) */
+        if (!no_memwrite(&b[i])) {
+            /* plain stores are allowed if no stream can overlap them (checked below); any other write: no streams */
+            if (nst < 8 && store_size(&b[i], &sz)) { st_i[nst] = i; st_sz[nst] = sz; nst++; }
+            else mem = 1;
+        }
         wm[i] = write_mask(&b[i]);
         for (r = 0; r < 8; r++)
             if (wm[i] >> r & 1) { if (simple_change(&b[i], r, &d)) step[r] += d; else ok[r] = 0; }
     }
+    {                                       /* offset of each store from the head (address registers advanced up to it) */
+        int32_t pr[8];
+        for (r = 0; r < 8; r++) pr[r] = 0;
+        for (i = 0; i <= j; i++) {
+            for (k = 0; k < nst; k++)
+                if (st_i[k] == i) {
+                    const Insn *x = &b[i];
+                    st_pre[k] = (x->base >= 0 ? pr[x->base] : 0) + (x->index >= 0 ? pr[x->index] << x->scale : 0);
+                }
+            for (r = 0; r < 8; r++) if ((wm[i] >> r & 1) && simple_change(&b[i], r, &d)) pr[r] += d;
+        }
+    }
     for (i = 0; i <= j; i++) {
         const Insn *x = &b[i];
-        if (ns < VL_STREAMS && !mem && !cval[i] && vl_can(x) && (x->base < 0 || ok[x->base]) &&
+        int size = vl_can(x);
+        if (ns < VL_STREAMS && !mem && !cval[i] && size && (x->base < 0 || ok[x->base]) &&
             (x->index < 0 || ok[x->index])) {
             int32_t st = (x->base >= 0 ? step[x->base] : 0) + (x->index >= 0 ? step[x->index] << x->scale : 0);
             int32_t vd = (x->base >= 0 ? pre[x->base] : 0) + (x->index >= 0 ? pre[x->index] << x->scale : 0);
-            if (st >= -(1 << 20) && st <= (1 << 20)) {
+            int clash = 0;
+            /* A store hits a value of this stream between its prefetch (VL_DEPTH iterations earlier, at the stream's
+               instruction) and its use: only stores with the same address registers can be ruled out. Relative to
+               the stream's address in the same iteration a store lies at dd; k iterations before the use it
+               covers [dd - k*st, dd - k*st + size of the store) */
+            for (k = 0; k < nst && !clash; k++) {
+                const Insn *w = &b[st_i[k]];
+                int32_t dd = (int32_t)w->disp + st_pre[k] - ((int32_t)x->disp + vd), kk;
+                int kmin = st_i[k] < i ? 0 : 1, kmax = st_i[k] > i ? VL_DEPTH : VL_DEPTH - 1;
+                if (w->base != x->base || w->index != x->index || (w->index >= 0 && w->scale != x->scale)) { clash = 1; break; }
+                for (kk = kmin; kk <= kmax; kk++) {
+                    int32_t lo = dd - kk * st;
+                    if (lo < size && lo + st_sz[k] > 0) { clash = 1; break; }
+                }
+            }
+            if (!clash && st >= -(1 << 20) && st <= (1 << 20)) {
                 g_vl_kind[ns] = 'm';
+                g_vl_size[ns] = (int8_t)size;
                 g_vl_step[ns] = st;
                 stream_i[ns] = i;
                 pre_d[ns] = vd;
@@ -2884,7 +2966,7 @@ static void vl_prefetch_code(const Insn *b, const int *stream_i, const int32_t *
             {
                 Insn t = b[stream_i[s]];
                 t.disp += (uint32_t)(pre_d[s] + k * g_vl_step[s]);
-                vl_put(&t, k * 8 * VL_STREAMS + 8 * s);
+                vl_put(&t, k * 8 * VL_STREAMS + 8 * s, g_vl_size[s]);
             }
         }
 }
@@ -7400,6 +7482,7 @@ typedef struct {
 } CacheHead;
 typedef struct { uint32_t start, end, size, mtime, ino, type; char path[232]; } CacheImage;
 static char g_cache_path[1024];
+static uint32_t g_written_live;         /* live blocks in the cache file written by this run (checkpoint) */
 static CacheImage g_vimage[CACHE_IMAGES];
 static int g_nvimage, g_cache_loaded;
 static unsigned long g_st_cache, g_st_expected;
@@ -7510,14 +7593,16 @@ static void cache_write(void)
     if (!g_cache_path[0] || g_st_flushes || !g_nused || g_free == g_free_loaded) return;
     /* only newly bound jump stubs (writable pages, every run binds anew: old entry removed, new one
        added) are no reason to write; live entries count */
-    if (g_cache_loaded) {
-        uint32_t live = 0;
+    {
+        uint32_t live = 0, before = g_cache_loaded ? (uint32_t)g_st_cache : 0;
         for (i = 0; i < g_nused; i++)
             if (g_map[g_inuse[i]].code && g_map[g_inuse[i]].eip && g_map[g_inuse[i]].eip != 0xffffffffu) live++;
+        if (g_written_live > before) before = g_written_live;   /* a checkpoint of this run */
         /* only when there is substantial new code: programs with threads interleave differently each time and bring a
            few new blocks in every run; translating those is faster than rewriting and loading the whole
            translation cache (MB) */
-        if (live < g_st_cache + 32 + g_st_cache / 64) return;
+        if (before && live < before + 32 + before / 64) return;
+        g_written_live = live;
     }
     if (g_cache != (uint32_t *)(uintptr_t)CACHE_ADDR) return;
     b = malloc(sizeof *b * CACHE_IMAGES);
@@ -7811,6 +7896,33 @@ static int cold_run(Cpu *c)
 
 static int dispatcher(Cpu *c);
 
+/* Translation cache checkpoint: a program that never ends normally (programs with windows closed by a signal or at
+   logout, crashes) would otherwise start without its translations every time. At 6 s and at 45 s of run time the
+   cache is written as at the end (only if enough is new). The dispatcher holds the thread lock; the watchdog patches
+   nothing while no thread is in translated code. ROSETTA_NO_CHECKPOINT=1 */
+static uint64_t g_run_t0, g_checkpoint_at[2];
+static int g_checkpoint_n = -1;
+static void jit_end_hot(void);
+
+static void checkpoint_maybe(void)
+{
+    uint64_t now = mach_absolute_time();
+    if (g_checkpoint_n < 0) {
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        g_checkpoint_at[0] = g_run_t0 + 6000000000ull * tb.denom / tb.numer;
+        g_checkpoint_at[1] = g_run_t0 + 45000000000ull * tb.denom / tb.numer;
+        g_checkpoint_n = getenv("ROSETTA_NO_CHECKPOINT") ? 2 : 0;
+    }
+    if (g_checkpoint_n >= 2 || now < g_checkpoint_at[g_checkpoint_n]) return;
+    g_checkpoint_n++;
+    if (g_patched) unpatch();
+    cache_write();
+    jit_end_hot();
+    if (g_cache_show) fprintf(stderr, "rosetta: checkpoint %d after %.1f s\n", g_checkpoint_n,
+                              (double)(mach_absolute_time() - g_run_t0) / (double)(g_checkpoint_at[0] - g_run_t0) * 6.0);
+}
+
 /* one interpreted instruction at the dispatcher: an exception for the guest handler (RUN_SIGNAL) is delivered at the
    start of the next round */
 static inline int dstep(Cpu *c)
@@ -7869,6 +7981,7 @@ void jit_thread_unregister(Cpu *c)
 
 int jit_run(Cpu *c)
 {
+    g_run_t0 = mach_absolute_time();
     if (getenv("ROSETTA_THRESHOLD")) g_threshold = atoi(getenv("ROSETTA_THRESHOLD"));
     {
         int f0 = jit_pagefault();
@@ -7886,6 +7999,7 @@ static int dispatcher(Cpu *c)
     for (;;) {
         uint32_t *code, eip;
         g_dispatcher_rounds++;
+        if (!(g_dispatcher_rounds & 0x3fff) && g_checkpoint_n < 2) checkpoint_maybe();
         if (g_patched) unpatch();       /* restore block starts (jit_interrupt) */
         if (g_state_wish) state_short(c);
         if (g_thread_waiting | c->yield) thread_yield(c);  /* other guest threads (thread.c) */

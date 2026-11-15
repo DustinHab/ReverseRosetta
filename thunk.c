@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 
 /* ---------- arguments and result ---------- */
 
@@ -97,6 +98,23 @@ static int t_strtoul(Cpu *c)
     return 0;
 }
 
+/* Calculator's expression engine, CalculatePerformExpression(expression, significant digits, flags, answer), lives in
+   the private Calculate.framework, which a PowerPC system has only for PowerPC (the Intel root has a stub library):
+   the arguments are strings and numbers, so the PowerPC function serves the guest directly */
+static int t_CalculatePerformExpression(Cpu *c)
+{
+    static int (*fn)(char *, int, int, char *);
+    static int tried;
+    if (!tried) {
+        void *h = dlopen("/System/Library/PrivateFrameworks/Calculate.framework/Versions/A/Calculate", RTLD_LAZY | RTLD_LOCAL);
+        tried = 1;
+        if (h) fn = (int (*)(char *, int, int, char *))dlsym(h, "CalculatePerformExpression");
+        if (!fn) fprintf(stderr, "rosetta: Calculate.framework (PowerPC) not available\n");
+    }
+    c->r[EAX] = fn ? (uint32_t)fn(PTR_ARG(0), (int)arg32(c, 1), (int)arg32(c, 2), PTR_ARG(3)) : 0;
+    return 0;
+}
+
 /* art: 'g' only via the C wrapper; '1' double(double), '2' double(double, double), 'f' float(float),
    'F' float(float, float): the translator then calls the PowerPC function itself (arguments in f1/f2, result f1) */
 #define S(n)  { #n, t_##n, 'g', 0 }
@@ -113,8 +131,12 @@ static const struct { const char *name; Stub fn; char kind; void *native; } g_li
     MF(ceilf), MF(truncf), MF(roundf), MF(fabsf), MG(powf), MG(atan2f), MG(fmodf), MG(hypotf), S(ldexp), S(ldexpf),
     S(strlen), S(strcmp), S(strncmp), S(memcmp), S(strcpy), S(strncpy), S(strcat), S(strchr), S(strrchr), S(memchr),
     S(strstr), S(strtok), S(strtok_r), S(strspn), S(strcspn), S(strpbrk), S(strncat), S(strcasecmp), S(strncasecmp),
-    S(atoi), S(strtol), S(strtoul),
+    S(atoi), S(strtol), S(strtoul), S(CalculatePerformExpression),
 };
+
+/* frameworks besides libSystem whose exported functions are replaced by name (their i386 version is a stub library
+   or does less than the PowerPC one) */
+static const char *const g_native_libs[] = { "/Calculate.framework/", 0 };
 #define LIST (sizeof g_list / sizeof g_list[0])
 
 /* ---------- tables ---------- */
@@ -330,7 +352,7 @@ static void image_read(uint32_t head, uint32_t region_end)
     uint32_t ncmds = ld32(head + 16), lc = head + 28, i;
     uint32_t text_vm = 0, text_sz = 0, le_vm = 0, le_off = 0, symoff = 0, nsyms = 0, stroff = 0, vmslide, base, n = 0;
     uint32_t indoff = 0, nind = 0, st_addr[8], st_sz[8], st_ind[8], st_step[8], iext = 0, next = 0;
-    int libsystem = 0, text = 0, nst = 0, dyld;
+    int libsystem = 0, native_lib = 0, text = 0, nst = 0, dyld;
     const uint8_t *uuid = 0;
     for (i = 0; i < ncmds && lc < head + 0x10000; i++) {
         uint32_t cmd = ld32(lc), sz = ld32(lc + 4);
@@ -353,7 +375,9 @@ static void image_read(uint32_t head, uint32_t region_end)
             indoff = ld32(lc + 56); nind = ld32(lc + 60);
         } else if (cmd == 0xd) {                /* LC_ID_DYLIB */
             const char *name = (const char *)(uintptr_t)(lc + ld32(lc + 8));
+            int k;
             if (strstr(name, "/libSystem.B.dylib")) libsystem = 1;
+            for (k = 0; g_native_libs[k]; k++) if (strstr(name, g_native_libs[k])) native_lib = 1;
         } else if (cmd == 0x1b && sz >= 24) {   /* LC_UUID */
             uuid = (const uint8_t *)(uintptr_t)(lc + 8);
         }
@@ -363,7 +387,7 @@ static void image_read(uint32_t head, uint32_t region_end)
     if (!text) { image_note(head, region_end, 0); return; }
     vmslide = head - text_vm;
     dyld = ld32(head + 12) == 7;                /* MH_DYLINKER */
-    image_note(head, head + text_sz, libsystem || dyld);
+    image_note(head, head + text_sz, libsystem || dyld || native_lib);
     if (!symoff || !le_vm || g_off) return;
     base = le_vm + vmslide - le_off;             /* file offset in __LINKEDIT -> address */
     if (dyld) {
@@ -402,6 +426,19 @@ static void image_read(uint32_t head, uint32_t region_end)
             g_sa[s].nsyms = nsyms;
             g_sa[s].stroff = stroff;
         }
+    }
+    if (native_lib && !libsystem) {             /* small symbol table: read every time */
+        for (i = next && iext + next <= nsyms ? iext : 0; i < (next && iext + next <= nsyms ? iext + next : nsyms); i++) {
+            uint32_t s = base + symoff + 12 * i;
+            uint8_t type = (uint8_t)ld8(s + 4);
+            const char *name;
+            Stub fn;
+            if ((type & 0xe0) || (type & 0x0e) != 0x0e || !(type & 1)) continue;
+            name = (const char *)(uintptr_t)(base + stroff + ld32(s));
+            if (name[0] == '_' && (fn = name_verify(name + 1)) != 0) { addr_add(ld32(s + 8) + vmslide, fn); n++; }
+        }
+        if (getenv("ROSETTA_STATS")) fprintf(stderr, "rosetta: native replacements in %08x: %u\n", head, n);
+        return;
     }
     if (!libsystem) return;
     if (uuid && store_read(uuid, head, &n)) {

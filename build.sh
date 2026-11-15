@@ -22,6 +22,9 @@ if [ "$1" = tests ] && [ -d "$Q/tests" ]; then
               gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" $V/libvDSP.dylib $V/libvMisc.dylib ;;   # Intel vecLib
       graphics*|fonts) gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" -framework ApplicationServices
           gcc-4.2 -arch ppc -mcpu=7450 -O2 -o "$B/$n.ppc" "$t" -framework ApplicationServices ;;   # tests/in_session.sh
+      calculate) C=System/Library/PrivateFrameworks/Calculate.framework/Versions/A/Calculate   # private engine
+          [ -f "$Q/intel/root/$C" ] && gcc-4.2 -arch i386 -O1 -o "$B/$n" "$t" "$Q/intel/root/$C"   # (stub library)
+          gcc-4.2 -arch ppc -O1 -o "$B/$n.ppc" "$t" "/$C" ;;
       cf) gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" -framework CoreFoundation
           gcc-4.2 -arch ppc -mcpu=7450 -O2 -o "$B/$n.ppc" "$t" -framework CoreFoundation ;;
       *) gcc-4.2 -arch i386 -O2 -msse2 -o "$B/$n" "$t"
@@ -41,5 +44,6 @@ if [ "$1" = tests ] && [ -d "$Q/tests" ]; then
   gcc-4.2 -O2 -o "$T/screen_grab" "$T/screen_grab.c" -framework ApplicationServices -framework CoreServices -framework IOKit
   gcc-4.2 -O2 -o "$T/window_list" "$T/window_list.c" -framework ApplicationServices -framework Carbon
   gcc-4.2 -O2 -o "$T/host_symbol" "$T/host_symbol.c" -framework ApplicationServices -framework Carbon -framework Cocoa
+  gcc-4.2 -O2 -o "$T/input_send" "$T/input_send.c" -framework ApplicationServices
   ls "$B"
 fi

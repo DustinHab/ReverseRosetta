@@ -12,6 +12,9 @@ S=/Developer/SDKs/MacOSX10.5.sdk
 sh "$D/deps.sh" "$@" > /dev/null
 [ -s /tmp/dep_missing.txt ] || { echo "nothing missing"; exit 0; }
 while read m; do
+    case "$m" in                            # reached through a symbolic link that deps.sh does not follow: never a stub
+        /System/Library/Perl/*) echo "$m: skipped (exists under its real path)"; continue ;;
+    esac
     n=$(basename "$m" | sed 's/\.dylib$//; s/\..*//')
     cv=0; cur=0
     for k in $(grep " $m\$" /tmp/dep_edges.txt | awk '{print $1}' | sort -u); do

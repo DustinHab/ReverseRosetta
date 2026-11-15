@@ -558,6 +558,14 @@ static void t_sysctl(void)
         while (p < args + len && !*p) p++;
         printf(", argv[0] %s\n", strstr(p, "syscalls") ? "this program" : p);
     }
+    {   /* size queries: no buffer, the kernel reports the length (getifaddrs, ps, sysctlbyname with strings) */
+        int all[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+        size_t need = 12345, need2 = 0;
+        int r1 = sysctl(all, 3, 0, &need, 0, 0);
+        int r2 = sysctlbyname("kern.ostype", 0, &need2, 0, 0);
+        printf("size query: KERN_PROC_ALL %d, whole entries %d, plausible %d; kern.ostype %d, length %d\n", r1,
+               need % sizeof(struct kinfo_proc) == 0, need > 10 * sizeof(struct kinfo_proc) && need != 12345, r2, (int)need2);
+    }
     mib[0] = CTL_VM; mib[1] = VM_LOADAVG; len = sizeof la;
     sysctl(mib, 2, &la, &len, 0, 0);
     printf("loadavg: fscale %ld, sane %d\n", la.fscale, la.ldavg[0] < 1000u * (unsigned)la.fscale && la.ldavg[2] < 1000u * (unsigned)la.fscale);

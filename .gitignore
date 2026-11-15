@@ -5,3 +5,4 @@ intel/
 tools/screen_grab
 tools/window_list
 tools/host_symbol
+tools/input_send

@@ -1,11 +1,12 @@
 #!/bin/sh
 # app_profile.sh PROGRAM_PATH [SECONDS] - (in the login session) run a program with the sampling profile, stop it after
-# SECONDS with SIGTERM (rosetta saves the profile before the signal kills it); evaluation per guest block as in guest_blocks.sh
+# SECONDS with SIGTERM (rosetta saves the profile before the signal kills it); evaluation per guest block as in guest_blocks.sh.
+# PROFILE_CPU=1: processor time only (otherwise wall clock, which also samples waiting threads)
 R=$(cd "$(dirname "$0")/.." && pwd)
 cd $R/build || exit 1
 W=$R/intel/root
-rm -f /tmp/gp.txt /tmp/gp.txt.guest
-ROSETTA_HPROFILE=/tmp/gp.txt ./rosetta "$1" > /dev/null 2>&1 &
+rm -f /tmp/gp.txt /tmp/gp.txt.guest /tmp/gp.txt.host
+env ${PROFILE_CPU:+ROSETTA_HPROFILE_CPU=1} ROSETTA_HPROFILE=/tmp/gp.txt ./rosetta "$1" > /dev/null 2>&1 &
 p=$!
 sleep ${2:-40}
 kill -TERM $p 2>/dev/null
