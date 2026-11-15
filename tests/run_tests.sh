@@ -96,10 +96,13 @@ t_cmpsb() { ROSETTA_THRESHOLD=1 ./rosetta ./cmpsb; }
 r_cmpsb() { ROSETTA_INTERP=1 ./rosetta ./cmpsb; }
 t_idb()   { ROSETTA_THRESHOLD=1 ./rosetta ./incdec8; }
 r_idb()   { ROSETTA_INTERP=1 ./rosetta ./incdec8; }
+t_m16()   { ROSETTA_THRESHOLD=1 ./rosetta ./mem16; }
+r_m16()   { ROSETTA_INTERP=1 ./rosetta ./mem16; }
 same raw_arith t_raw r_raw
 same "64-bit shifts, shld/shrd with flags" t_shf r_shf
 same "cmpsb (translated against interpreter)" t_cmpsb r_cmpsb
 same "incb/decb with flags (against interpreter)" t_idb r_idb
+same "incw, byte and word shifts in memory, movw (against interpreter)" t_m16 r_m16
 same "packed doubles with special values (against interpreter)" t_pdo r_pdo
 same "SSE2 integer and packed floats with AltiVec (against interpreter)" t_vec r_vec
 same "threads (mutex, condition, spinlock, pipe, join)" t_thr r_thr

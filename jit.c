@@ -1038,8 +1038,8 @@ static int classify(const Insn *b, uint8_t *reads, uint8_t *writes, int *kind)
         return 1;
     case 0x89: case 0x8b:
         return sz == 4 || sz == 2;
-    case 0xa1: case 0xa3:
-        return sz == 4;
+    case 0xa1: case 0xa3:                   /* also movw with a fixed address (gzip's bit buffer) */
+        return sz == 4 || sz == 2;
     case 0xc7:                              /* also movw $imm16 */
         return 1;
     case 0x8d:
@@ -1052,7 +1052,7 @@ static int classify(const Insn *b, uint8_t *reads, uint8_t *writes, int *kind)
     case 0xb0: case 0xb1: case 0xb2: case 0xb3: case 0xb4: case 0xb5: case 0xb6: case 0xb7:
         return 1;
     case 0xb8: case 0xb9: case 0xba: case 0xbb: case 0xbc: case 0xbd: case 0xbe: case 0xbf:
-        return sz == 4;
+        return sz == 4 || sz == 2;          /* also movw $imm16, %r16 */
     case 0xc1: case 0xd1:
         if (op == 0xc1 && (b->imm & 31) == 0) return sz == 4 || (sz == 2 && !b->mem);
         if (b->reg <= 1 && (sz == 4 || (sz == 2 && !b->mem))) {
@@ -1061,13 +1061,13 @@ static int classify(const Insn *b, uint8_t *reads, uint8_t *writes, int *kind)
             return 1;
         }
         if (!(b->reg == 4 || b->reg == 5 || b->reg == 7)) return 0;
-        if (sz != 4 && (sz != 2 || b->mem)) return 0;  /* 16 bit only in a register (shrw $n,%reg) */
+        if (sz != 4 && sz != 2) return 0;   /* 16 bit: shrw $n of a register or a word in memory */
         *writes = TRAP;
         return 1;
     case 0xd3:                              /* count 0 leaves the flags unchanged: neither read nor write */
         return sz == 4 && (b->reg <= 1 || b->reg == 4 || b->reg == 5 || b->reg == 7);
-    case 0xc0: case 0xd0:                   /* a byte register by 1..7 (gen_shift8) */
-        if (b->mem) return 0;
+    case 0xc0: case 0xd0:                   /* a byte (register or memory) by 1..7 (gen_shift8) */
+        if (b->mem && b->reg <= 1) return 0;   /* rotating a byte in memory: interpreter */
         {
             int n = op == 0xd0 ? 1 : (int)(b->imm & 31);
             if (n == 0) return 1;
@@ -1109,6 +1109,7 @@ static int classify(const Insn *b, uint8_t *reads, uint8_t *writes, int *kind)
         *writes = TRAP & ~FCF;
         return 1;
     case 0xff:
+        if (sz == 2 && b->reg <= 1) { *writes = TRAP & ~FCF; return 1; }  /* incw/decw (counters in structures) */
         if (sz != 4) return 0;
         switch (b->reg) {
         case 0: case 1: *writes = TRAP & ~FCF; return 1;
@@ -1821,6 +1822,17 @@ static void gen_inc_dec(const Insn *b, int reg, int dec, int needs, int needs_cf
         if (needs) { e(MR(RE, 5)); flags_new(dec ? CC_DEC : CC_INC, 1); }
         return;
     }
+    if (reg < 0 && b->opsz == 2) {          /* 16 bit in memory (incw: gzip's frequency counters): result in r5 */
+        ea_pair(b, 1, &ra, &rb);
+        e(LHBRX(5, ra, rb));
+        e(ADDI(5, 5, dec ? -1 : 1));
+        e(STHBRX(5, ra, rb));
+        after_save(b, 2, ra, rb, -1);
+        e(RLWINM(5, 5, 0, 16, 31));
+        g_res = 5;
+        if (needs) { e(MR(RE, 5)); flags_new(dec ? CC_DEC : CC_INC, 2); }
+        return;
+    }
     if (reg >= 0) { vd = R(reg); q = reg_val(reg, 4, 0); }
     else {
         int c = slot_reg(b, 4);
@@ -1882,7 +1894,12 @@ static void gen_rotate16(const Insn *b, int right, int n)
 /* shl/shr/sar/rol/ror of a byte register by 1..7 (hex digits: shrb $4); rotations only with CF and OF dead */
 static void gen_shift8(const Insn *b, int kind, int n, int needs)
 {
-    int x = reg_val(b->rm, 1, 4);           /* zero-extended byte */
+    int ra = 0, rb = 0, x;
+    if (b->mem) {                           /* a byte in memory (shrb of flag bytes: gzip) */
+        ea_pair(b, 1, &ra, &rb);
+        e(LBZX(4, ra, rb));
+        x = 4;
+    } else x = reg_val(b->rm, 1, 4);        /* zero-extended byte */
     if (kind <= 1) {
         e(RLWIMI(x, x, 8, 16, 23));          /* the byte twice side by side */
         e(RLWINM(0, x, kind == 0 ? 24 + n : 32 - n, 24, 31));
@@ -1893,7 +1910,8 @@ static void gen_shift8(const Insn *b, int kind, int n, int needs)
     if (kind == 4) e(RLWINM(0, x, n, 24, 31));
     else if (kind == 5) e(RLWINM(0, x, 32 - n, 24, 31));
     else { e(EXTSB(0, x)); e(SRAWI(0, 0, n)); e(RLWINM(0, 0, 0, 24, 31)); }
-    reg_set(b->rm, 1, 0);
+    if (b->mem) { e(STBX(0, ra, rb)); after_save(b, 1, ra, rb, -1); }
+    else reg_set(b->rm, 1, 0);
     if (needs) { e(MR(RE, 0)); flags_new(kind == 4 ? CC_SHL : kind == 5 ? CC_SHR : CC_SAR, 1); }
 }
 
@@ -1906,6 +1924,17 @@ static void gen_shift(const Insn *b, int kind, int count, int needs)
         if (needs) { e(MR(RA, 5)); e(LI(RB, count)); }
         if (kind == 4) e(SLWI(0, 5, count)); else if (kind == 5) e(SRWI(0, 5, count)); else e(SRAWI(0, 5, count));
         e(RLWIMI(rr, 0, 0, 16, 31));
+        if (needs) { e(RLWINM(RE, 0, 0, 16, 31)); flags_new(kind == 4 ? CC_SHL : kind == 5 ? CC_SHR : CC_SAR, 2); }
+        return;
+    }
+    if (b->opsz == 2 && b->mem && count >= 0) {   /* a word in memory (fixed count 1..31) */
+        ea_pair(b, 1, &ra, &rb);
+        e(LHBRX(5, ra, rb));
+        if (kind == 7) e(EXTSH(5, 5));
+        if (needs) { e(MR(RA, 5)); e(LI(RB, count)); }
+        if (kind == 4) e(SLWI(0, 5, count)); else if (kind == 5) e(SRWI(0, 5, count)); else e(SRAWI(0, 5, count));
+        e(STHBRX(0, ra, rb));
+        after_save(b, 2, ra, rb, -1);
         if (needs) { e(RLWINM(RE, 0, 0, 16, 31)); flags_new(kind == 4 ? CC_SHL : kind == 5 ? CC_SHR : CC_SAR, 2); }
         return;
     }
@@ -5328,9 +5357,9 @@ static void gen(const Insn *b, int needs, int needs_cf)
         return;
     }
     case 0xa0: case 0xa1: case 0xa2: case 0xa3: {
-        int g = (op & 1) ? 4 : 1;
+        int g = (op & 1) ? sz : 1;
         if (op <= 0xa1) {
-            if (g == 4) load_m(R(EAX), b, 4); else { load_m(4, b, 1); reg_set(EAX, 1, 4); }
+            if (g == 4) load_m(R(EAX), b, 4); else { load_m(4, b, g); reg_set(EAX, g, 4); }
         } else save_m(reg_src(EAX, g, 4), b, g);
         return;
     }
@@ -5354,6 +5383,7 @@ static void gen(const Insn *b, int needs, int needs_cf)
         reg_set(op & 7, 1, 4);
         return;
     case 0xb8: case 0xb9: case 0xba: case 0xbb: case 0xbc: case 0xbd: case 0xbe: case 0xbf:
+        if (sz == 2) { e(LI(4, b->imm & 0xffff)); reg_set(op & 7, 2, 4); return; }
         reg_imm(R(op & 7), b->imm);
         return;
     case 0xc6: case 0xc7: {
@@ -5545,8 +5575,8 @@ static int mem_access(const Insn *b, int *sz, int *reads, int *writes)
         return 1;
     }
     switch (op) {
-    case 0xa0: case 0xa1: *sz = op == 0xa0 ? 1 : 4; *reads = 1; return 1;
-    case 0xa2: case 0xa3: *sz = op == 0xa2 ? 1 : 4; *writes = 1; return 1;
+    case 0xa0: case 0xa1: *sz = op == 0xa0 ? 1 : b->opsz; *reads = 1; return 1;
+    case 0xa2: case 0xa3: *sz = op == 0xa2 ? 1 : b->opsz; *writes = 1; return 1;
     }
     if (!b->mem || op == 0x8d || (op >= (OP_0F | 0x18) && op <= (OP_0F | 0x1f))) return 0;
     if (op < 0x40 && (op & 7) < 6) {
@@ -5563,8 +5593,9 @@ static int mem_access(const Insn *b, int *sz, int *reads, int *writes)
     case 0x88: case 0x89: *sz = op == 0x88 ? 1 : b->opsz; *writes = 1; return 1;
     case 0x8a: case 0x8b: *sz = op == 0x8a ? 1 : b->opsz; *reads = 1; return 1;
     case 0xc6: case 0xc7: *sz = op == 0xc6 ? 1 : b->opsz; *writes = 1; return 1;
-    case 0xc1: case 0xd1: case 0xd3: *reads = 1; *writes = 1; return 1;
-    case 0xff: *reads = 1; *writes = b->reg <= 1; return 1;
+    case 0xc1: case 0xd1: case 0xd3: *sz = b->opsz; *reads = 1; *writes = 1; return 1;
+    case 0xc0: case 0xd0: case 0xd2: *sz = 1; *reads = 1; *writes = 1; return 1;
+    case 0xff: if (b->reg <= 1) *sz = b->opsz; *reads = 1; *writes = b->reg <= 1; return 1;
     case 0xfe: *sz = 1; *reads = 1; *writes = 1; return 1;
     case 0x87: *reads = 1; *writes = 1; return 1;
     case 0x69: case 0x6b: case OP_0F | 0xaf: *reads = 1; return 1;

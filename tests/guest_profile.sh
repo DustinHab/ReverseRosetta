@@ -6,9 +6,12 @@ R=$(cd "$(dirname "$0")/.." && pwd)
 cd $R/build || exit 1
 P=${1:-./hello}; N=${2:-10}
 W=$R/intel/root
-rm -f /tmp/gp.txt /tmp/gp.txt.guest
-i=0
-while [ $i -lt $N ]; do ROSETTA_HPROFILE=/tmp/gp.txt ./rosetta $P > /dev/null 2>&1; i=$((i + 1)); done
+# GP_KEEP=1: evaluate /tmp/gp.txt as recorded (ROSETTA_HPROFILE=/tmp/gp.txt with arguments the line above cannot pass)
+if [ -z "$GP_KEEP" ]; then
+    rm -f /tmp/gp.txt /tmp/gp.txt.guest
+    i=0
+    while [ $i -lt $N ]; do ROSETTA_HPROFILE=/tmp/gp.txt ./rosetta $P > /dev/null 2>&1; i=$((i + 1)); done
+fi
 nm -n rosetta | grep -i ' t ' > /tmp/gp_sym.txt
 # images with hits: read the symbols (i386) of each image
 cut -d' ' -f1,2 /tmp/gp.txt.guest | tr ' ' '\n' | grep '+' | sed 's/+[0-9a-f]*$//' | sort -u > /tmp/gp_images.txt
@@ -29,7 +32,7 @@ perl -e '
   open B, "/tmp/gp_bsym.txt"; while (<B>) { my ($b, $o, $s) = split; push @{$bo{$b}}, hex $o; push @{$bs{$b}}, $s; } close B;
   sub gfn { my $g = shift; return "?" unless $g =~ /^(.*)\+([0-9a-f]+)$/; my ($b, $o) = ($1, hex $2);
     my $short = $b; $short =~ s{.*/}{};
-    my $ao = $bo{$b}; return "$short+?" unless $ao && @$ao;
+    my $ao = $bo{$b}; return sprintf("%s+%x (no symbols: block)", $short, $o) unless $ao && @$ao;
     my ($lo, $hi) = (0, $#$ao); return "$short+?" if $o < $ao->[0];
     while ($lo < $hi) { my $m = int(($lo + $hi + 1) / 2); if ($ao->[$m] <= $o) { $lo = $m } else { $hi = $m - 1 } }
     return "$short:" . $bs{$b}[$lo]; }
