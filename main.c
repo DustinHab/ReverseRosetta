@@ -87,6 +87,20 @@ static char *hex_put(char *p, const char *text, uint32_t v)
     return p;
 }
 
+/* end like a native process that did not handle an exception: terminated by the signal (the parent's wait sees
+   WIFSIGNALED, the shell prints "Segmentation fault" etc.); falls back to exit status 128 + sig */
+static void end_by_signal(int sig)
+{
+    sigset_t m;
+    fflush(stdout);
+    signal(sig, SIG_DFL);
+    sigemptyset(&m);
+    sigaddset(&m, sig);
+    sigprocmask(SIG_UNBLOCK, &m, 0);
+    kill(getpid(), sig);
+    _exit(128 + sig);
+}
+
 static void memfault(int sig, siginfo_t *info, void *k)
 {
     char t[64];
@@ -150,7 +164,7 @@ static void memfault(int sig, siginfo_t *info, void *k)
         signal(SIGILL, SIG_DFL);
         state_show(c, t);
     }
-    _exit(128 + sig);
+    end_by_signal(sig);
 }
 
 /* sampling profile (ROSETTA_HPROFILE=file): SIGALRM (ITIMER_REAL, fine resolution) reads srr0, lr and the
@@ -349,6 +363,7 @@ int main(int argc, char **argv)
     }
     g_error_start = getenv("ROSETTA_STATS") ? jit_pagefault() : 0;
     g_prog_path = path;
+    sys_set_args(argc - i, argv + i, path);
     if (commpage_create()) return 1;
     if (macho_load(path, 0, &prog)) return 1;
     memset(&cpu, 0, sizeof cpu);
@@ -357,6 +372,8 @@ int main(int argc, char **argv)
     cpu.mxcsr = 0x1f80;
     if (prog.has_dyld) {
         if (macho_load(prog.dyld, DYLD_TARGET - 0x8fe00000u, &dyld)) return 1;
+        g_dyld_from = dyld.from;
+        g_dyld_to = dyld.bis;
         cpu.r[ESP] = stack_build(argc - i, argv + i, path, prog.mh, 1);
         cpu.eip = dyld.entrypoint;
     } else {
@@ -417,6 +434,7 @@ static int end_expiry(Cpu *c, int r)
             }
         }
     }
+    if (g_end_signal) end_by_signal(g_end_signal);
     if (r == RUN_END) return c->end_code;
     return c->finished ? c->end_code : 127;
 }

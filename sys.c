@@ -14,6 +14,7 @@
 #include "thread.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -35,6 +36,7 @@
 #include <sys/wait.h>
 #include <sys/event.h>
 #include <termios.h>
+#include <utmpx.h>
 #include <signal.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
@@ -132,13 +134,6 @@ static int f_sendfile(int d, int s, off_t o, off_t *l, struct sf_hdtr *h, int fl
 { int r; FREE_ON; r = sendfile(d, s, o, l, h, fl); FREE_OFF; return r; }
 static pid_t f_waitpid(pid_t p, int *st) { pid_t r; FREE_ON; r = waitpid(p, st, 0); FREE_OFF; return r; }
 
-void sys_signal(Cpu *c, int sig, const char *reason)
-{
-    state_show(c, reason);
-    fprintf(stderr, "rosetta: signal %d to the program, terminated\n", sig);
-    c->finished = 1;
-    c->end_code = 128 + sig;
-}
 
 /* ---------- structures ---------- */
 
@@ -390,6 +385,147 @@ static int sysctl_type(const int *name, unsigned n)
     return type;
 }
 
+/* in-place byte swap of guest memory (host order -> guest order) */
+static inline void sw16(uint32_t a) { st16(a, *(uint16_t *)(uintptr_t)a); }
+static inline void sw32(uint32_t a) { st32(a, *(uint32_t *)(uintptr_t)a); }
+static inline void sw64(uint32_t a) { st64(a, *(uint64_t *)(uintptr_t)a); }
+static void sw32_range(uint32_t a, uint32_t from, uint32_t to) { uint32_t o; for (o = from; o + 4 <= to; o += 4) sw32(a + o); }
+
+/* struct kinfo_proc (492 bytes, the same layout for i386 and PowerPC): extern_proc (196) and eproc (296); words,
+   except the bytes p_stat, p_priority..p_comm, pc_lock, e_wmesg, e_login and the shorts */
+#define KINFO_PROC_SIZE 492
+typedef char kinfo_proc_size_check[sizeof(struct kinfo_proc) == KINFO_PROC_SIZE ? 1 : -1];
+typedef char kinfo_proc_layout_check[offsetof(struct kinfo_proc, kp_eproc.e_login) == 196 + 268 ? 1 : -1];
+static void kinfo_proc_swap(uint32_t a)
+{
+    uint32_t e = a + 196, o;
+    sw32_range(a, 0, 20);                    /* p_un, p_vmspace, p_sigacts, p_flag */
+    sw32_range(a, 24, 104);                  /* p_pid .. p_rtime */
+    for (o = 104; o < 128; o += 8) sw64(a + o);   /* p_uticks, p_sticks, p_iticks */
+    sw32_range(a, 128, 160);                 /* p_traceflag .. p_sigcatch */
+    sw32(a + 180); sw32(a + 184); sw16(a + 188); sw16(a + 190); sw32(a + 192);
+    sw32(e); sw32(e + 4);                    /* e_paddr, e_sess; pc_lock (72 bytes) stays */
+    sw32_range(e, 80, 104);                  /* pc_ucred, p_ruid, p_svuid, p_rgid, p_svgid, p_refcnt */
+    sw32(e + 104); sw32(e + 108); sw16(e + 112);   /* cr_ref, cr_uid, cr_ngroups */
+    sw32_range(e, 116, 228);                 /* cr_groups, e_vm, e_ppid, e_pgid */
+    sw16(e + 228); sw32(e + 232); sw32(e + 236); sw32(e + 240);   /* e_jobc, e_tdev, e_tpgid, e_tsess */
+    sw32(e + 252); sw16(e + 256); sw16(e + 258); sw16(e + 260); sw32(e + 264);
+    sw32_range(e, 280, 296);                 /* e_spare */
+}
+
+/* routing messages (sysctl NET_RT_*: getifaddrs, if_nameindex, route tables): per message u16 length, version,
+   type, then a header that depends on the type, then the socket addresses selected by its address mask. Socket
+   addresses are in network order except sdl_index (AF_LINK) and sin6_scope_id (AF_INET6). */
+static void rt_addrs_swap(uint32_t p, uint32_t end, uint32_t addrs)
+{
+    int k;
+    for (k = 0; k < 8 && p < end; k++) {     /* RTAX_MAX */
+        uint32_t len;
+        if (!(addrs & (1u << k))) continue;
+        len = ld8(p);
+        if (ld8(p + 1) == AF_LINK && len >= 4 && p + 4 <= end) sw16(p + 2);
+        if (ld8(p + 1) == AF_INET6 && len >= 28 && p + 28 <= end) sw32(p + 24);
+        p += len ? (len + 3) & ~3u : 4;
+    }
+}
+
+static void rt_msgs_swap(uint32_t a, uint32_t n)
+{
+    uint32_t p = a, end = a + n;
+    while (p + 4 <= end) {
+        uint32_t len = *(uint16_t *)(uintptr_t)p, type = ld8(p + 3), head = 0, addrs = 0, o;
+        if (len < 4 || p + len > end) break;
+        switch (type) {
+        case 0xe:                            /* RTM_IFINFO: if_msghdr + if_data (8 bytes, then words) */
+            addrs = *(uint32_t *)(uintptr_t)(p + 4); head = 112;
+            sw32(p + 4); sw32(p + 8); sw16(p + 12); sw32_range(p, 24, 112);
+            break;
+        case 0x12:                           /* RTM_IFINFO2: if_msghdr2 + if_data64 */
+            addrs = *(uint32_t *)(uintptr_t)(p + 4); head = 160;
+            sw32(p + 4); sw32(p + 8); sw16(p + 12); sw32_range(p, 16, 32);
+            sw32(p + 40); sw32(p + 44);
+            for (o = 48; o < 144; o += 8) sw64(p + o);
+            sw32_range(p, 144, 160);
+            break;
+        case 0xc: case 0xd:                  /* RTM_NEWADDR, RTM_DELADDR: ifa_msghdr */
+            addrs = *(uint32_t *)(uintptr_t)(p + 4); head = 20;
+            sw32(p + 4); sw32(p + 8); sw16(p + 12); sw32(p + 16);
+            break;
+        case 0xf: case 0x10: case 0x13:      /* RTM_NEWMADDR, RTM_DELMADDR: ifma_msghdr; RTM_NEWMADDR2 + refcount */
+            addrs = *(uint32_t *)(uintptr_t)(p + 4); head = type == 0x13 ? 20 : 16;
+            sw32(p + 4); sw32(p + 8); sw16(p + 12); if (type == 0x13) sw32(p + 16);
+            break;
+        default:
+            if ((type >= 1 && type <= 0xb) || type == 0x14) {   /* rt_msghdr, rt_msghdr2: index, then words */
+                addrs = *(uint32_t *)(uintptr_t)(p + 12); head = 92;
+                sw16(p + 4); sw32_range(p, 8, 92);
+            }
+        }
+        sw16(p);
+        if (head && head <= len) rt_addrs_swap(p + head, p + len, addrs);
+        p += len;
+    }
+}
+
+/* the guest's own arguments (main.c, sys_set_args): the kernel knows this process as rosetta */
+static int g_args_n;
+static char **g_args_v;
+static const char *g_args_path;
+
+void sys_set_args(int argc, char **argv, const char *path) { g_args_n = argc; g_args_v = argv; g_args_path = path; }
+
+/* KERN_PROCARGS2 of the own process as the kernel would write it for the guest: argc, executable path, NULs up to a
+   word boundary, the arguments, the environment; returns the length (the content only if it fits into max) */
+static uint32_t procargs2_own(uint32_t a, uint32_t max)
+{
+    extern char **environ;
+    uint32_t need = 4, o, k;
+    char **e;
+    need += (uint32_t)strlen(g_args_path) + 1;
+    need = (need + 3) & ~3u;
+    for (k = 0; k < (uint32_t)g_args_n; k++) need += (uint32_t)strlen(g_args_v[k]) + 1;
+    for (e = environ; *e; e++) need += (uint32_t)strlen(*e) + 1;
+    if (!a || need > max) return need;
+    st32(a, (uint32_t)g_args_n);
+    o = 4;
+    strcpy((char *)(uintptr_t)(a + o), g_args_path);
+    o += (uint32_t)strlen(g_args_path) + 1;
+    while (o & 3) *(char *)(uintptr_t)(a + o++) = 0;
+    for (k = 0; k < (uint32_t)g_args_n; k++) { strcpy((char *)(uintptr_t)(a + o), g_args_v[k]); o += (uint32_t)strlen(g_args_v[k]) + 1; }
+    for (e = environ; *e; e++) { strcpy((char *)(uintptr_t)(a + o), *e); o += (uint32_t)strlen(*e) + 1; }
+    return need;
+}
+
+/* results of sysctl that are structures (CTLTYPE_STRUCT or node handlers): converted by name; 1 = done */
+static int sysctl_struct_swap(const int *name, uint32_t n, uint32_t a, uint32_t l)
+{
+    uint32_t k;
+    if (n >= 3 && name[0] == CTL_KERN && name[1] == KERN_PROC) {
+        for (k = 0; k + KINFO_PROC_SIZE <= l; k += KINFO_PROC_SIZE) {
+            kinfo_proc_swap(a + k);
+            if ((pid_t)ld32(a + k + 24) == getpid() && g_args_path) {   /* p_comm of the own process: the guest's name */
+                const char *s = strrchr(g_args_path, '/') ? strrchr(g_args_path, '/') + 1 : g_args_path;
+                strncpy((char *)(uintptr_t)(a + k + 163), s, 16);
+                *(char *)(uintptr_t)(a + k + 179) = 0;
+            }
+        }
+        return 1;
+    }
+    if (n == 3 && name[0] == CTL_KERN && name[1] == KERN_PROCARGS2) { if (l >= 4) sw32(a); return 1; }   /* argc */
+    if (n == 2 && name[0] == CTL_KERN && name[1] == KERN_CLOCKRATE) { sw32_range(a, 0, l); return 1; }  /* clockinfo */
+    if (n == 2 && name[0] == CTL_VM && name[1] == VM_LOADAVG) { sw32_range(a, 0, l); return 1; }         /* loadavg */
+    if (n == 2 && name[0] == CTL_VM && name[1] == VM_SWAPUSAGE && l >= 32) {                             /* xsw_usage */
+        sw64(a); sw64(a + 8); sw64(a + 16); sw32(a + 24); sw32(a + 28);
+        return 1;
+    }
+    if (n >= 5 && name[0] == CTL_NET && name[1] == PF_ROUTE && name[2] == 0) {
+        if (name[4] == NET_RT_STAT) { for (k = 0; k + 2 <= l; k += 2) sw16(a + k); }   /* rtstat: shorts */
+        else rt_msgs_swap(a, l);
+        return 1;
+    }
+    return 0;
+}
+
 static void sys_sysctl(Cpu *c)
 {
     uint32_t gname = arg(0), n = arg(1), prev = arg(2), oldlen = arg(3), fresh = arg(4), newlen = arg(5), i;
@@ -438,6 +574,19 @@ static void sys_sysctl(Cpu *c)
         set_result(c, 0, 0);
         return;
     }
+    if (n == 3 && name[0] == CTL_KERN && name[1] == KERN_PROCARGS2 && name[2] == getpid() && g_args_path) {
+        uint32_t need = procargs2_own(prev, (uint32_t)l);
+        if (prev && need > l) { set_result(c, 0, ENOMEM); return; }
+        if (oldlen) st32(oldlen, need);
+        set_result(c, 0, 0);
+        return;
+    }
+    if (n == 2 && name[0] == CTL_HW && name[1] == HW_BYTEORDER) {   /* the guest's own byte order */
+        if (prev && l >= 4) st32(prev, 1234);
+        if (oldlen) st32(oldlen, 4);
+        set_result(c, 0, 0);
+        return;
+    }
     if (n == 2 && name[0] == CTL_HW && name[1] == HW_MACHINE) {
         static const char m[] = "i386";
         if (prev && l >= sizeof m) memcpy((void *)(uintptr_t)prev, m, sizeof m);
@@ -447,8 +596,9 @@ static void sys_sysctl(Cpu *c)
     }
     r = sysctl(name, n, (void *)(uintptr_t)prev, prev ? &l : 0, (void *)(uintptr_t)fresh, newlen);
     if (r < 0) { set_result(c, 0, errno); return; }
-    type = prev && l ? sysctl_type(name, n) : 0;
-    if (prev) {
+    if (prev && l && sysctl_struct_swap(name, n, prev, (uint32_t)l)) type = -1;
+    else type = prev && l ? sysctl_type(name, n) : 0;
+    if (prev && type >= 0) {
         if (type == CTLTYPE_INT)
             for (i = 0; i + 4 <= l; i += 4) st32(prev + i, *(uint32_t *)(uintptr_t)(prev + i));
         else if (type == CTLTYPE_QUAD)
@@ -605,6 +755,27 @@ static void sig_default(Cpu *c, int sig)
     }
     c->finished = 1;                         /* still alive (own signal): report as terminated */
     c->end_code = 128 + sig;
+}
+
+/* synchronous exception of the guest found by the interpreter (division error, ud2, int3, hlt) at c->eip: with a
+   handler that is not blocked, the signal is marked pending and the dispatcher delivers it before the next
+   instruction (returns 1). Otherwise the program ends; main.c then terminates rosetta with the same signal, as the
+   kernel would terminate the native process (returns 0). */
+int g_end_signal;
+
+int sys_signal(Cpu *c, int sig, int code, const char *reason)
+{
+    if (g_handler[sig] > 1 && !(g_sig_mask & SIG_BIT(sig))) {
+        sig_schedule(sig, code);
+        g_sig_info[sig].addr = c->eip;
+        return 1;
+    }
+    state_show(c, reason);
+    fprintf(stderr, "rosetta: signal %d to the program, terminated\n", sig);
+    c->finished = 1;
+    c->end_code = 128 + sig;
+    g_end_signal = sig;
+    return 0;
 }
 
 /* deliver a pending, unblocked signal (called at the dispatcher, guest state complete in Cpu) */
@@ -914,23 +1085,53 @@ static int proc_spawn(uint32_t pidp, const char *path, uint32_t desc, uint32_t g
 
 /* ---------- Intel versions of the system libraries (stage 4) ----------
  * On the PowerPC system the frameworks exist only for PowerPC; the i386 versions from Apple's Combo Update are
- * under $ROSETTA_INTEL (default ~/tools/rosetta/intel/root) with the same paths. If the guest opens or checks a
- * file under /System/Library, /usr/lib or /Library that exists there, it gets that file; directories, resources
- * and everything else come from the system. ROSETTA_INTEL=- switches this off. */
+ * under $ROSETTA_INTEL (default <rosetta>/../intel/root) with the same paths. If the guest reads or checks a file
+ * under /System/Library, /usr/lib or /Library that exists there, it gets that file; directories, resources and
+ * everything else come from the system. Exceptions, so that programs that read libraries as data (file, nm, lipo,
+ * backup and copy programs) see the real files: a Mach-O file that the system has with an i386 part itself is only
+ * redirected for dyld (the prebound copy loads faster), and writing never goes to the root.
+ * ROSETTA_INTEL=- switches this off. */
 static char g_intel[PATH_MAX];
 static int g_intel_on = -1;
 static unsigned long g_st_redirected;
+uint32_t g_dyld_from, g_dyld_to;            /* main.c: where dyld is (calls from there are the loader's) */
+static uint32_t g_call_eip;                 /* eip of the current system call */
 
-static const char *gpath(uint32_t a);
-const char *sys_guest_path(const char *p) { return gpath((uint32_t)(uintptr_t)p); }
+static const char *gpath_as(uint32_t a, int loader);
+#define gpath(a) gpath_as((a), g_call_eip - g_dyld_from < g_dyld_to - g_dyld_from)
+const char *sys_guest_path(const char *p) { return gpath_as((uint32_t)(uintptr_t)p, 1); }
 
 /* remembered answers (dyld queries the same path several times with stat, open, ...): per path, whether it exists
-   in the Intel root */
+   in the Intel root, and whether the system file has an i386 part itself (-1: not checked yet) */
 #define GPATH_N 512
-static struct { uint32_t h; char *path; char ja; } g_gpath[GPATH_N];
+static struct { uint32_t h; char *path; char in_root, sys_i386; } g_gpath[GPATH_N];
 static int g_ngpath;
 
-static const char *gpath(uint32_t a)
+/* 1: Mach-O file with an i386 part (thin i386 or fat with CPU type 7) */
+static int file_has_i386(const char *path)
+{
+    unsigned char h[4096];
+    int fd = open(path, O_RDONLY), n;
+    uint32_t nfat, k;
+    if (fd < 0) return 0;
+    n = (int)read(fd, h, sizeof h);
+    close(fd);
+    if (n < 8) return 0;
+    if (h[0] == 0xce && h[1] == 0xfa && h[2] == 0xed && h[3] == 0xfe) return h[4] == 7;
+    if (!(h[0] == 0xca && h[1] == 0xfe && h[2] == 0xba && h[3] == 0xbe)) return 0;
+    nfat = (uint32_t)h[4] << 24 | (uint32_t)h[5] << 16 | (uint32_t)h[6] << 8 | h[7];
+    if (nfat == 0 || nfat > (uint32_t)(n - 8) / 20) return 0;
+    for (k = 0; k < nfat; k++) if (!memcmp(h + 8 + 20 * k, "\0\0\0\7", 4)) return 1;
+    return 0;
+}
+
+/* open for the guest: reading may be redirected, writing never */
+static const char *gpath_open(uint32_t a, int flags)
+{
+    return (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)) ? (const char *)(uintptr_t)a : gpath(a);
+}
+
+static const char *gpath_as(uint32_t a, int loader)
 {
     static char fresh[2][1200];
     static int which;
@@ -939,7 +1140,7 @@ static const char *gpath(uint32_t a)
     char *z;
     uint32_t h, i;
     const unsigned char *q;
-    int ja;
+    int in_root, sys_i386;
     if (g_intel_on < 0) {
         const char *e = getenv("ROSETTA_INTEL");
         char exe[1024], cand[1200];
@@ -959,15 +1160,56 @@ static const char *gpath(uint32_t a)
     for (h = 2166136261u, q = (const unsigned char *)p; *q; q++) h = (h ^ *q) * 16777619u;
     for (i = h & (GPATH_N - 1); g_gpath[i].path; i = (i + 1) & (GPATH_N - 1))
         if (g_gpath[i].h == h && !strcmp(g_gpath[i].path, p)) break;
-    if (g_gpath[i].path) ja = g_gpath[i].ja;
+    if (g_gpath[i].path) { in_root = g_gpath[i].in_root; sys_i386 = g_gpath[i].sys_i386; }
     else {
-        ja = stat(z, &st) == 0 && !S_ISDIR(st.st_mode);
-        if (g_ngpath < GPATH_N / 2 && (g_gpath[i].path = strdup(p)) != 0) { g_gpath[i].h = h; g_gpath[i].ja = (char)ja; g_ngpath++; }
+        in_root = stat(z, &st) == 0 && !S_ISDIR(st.st_mode);
+        sys_i386 = -1;
+        if (g_ngpath < GPATH_N / 2 && (g_gpath[i].path = strdup(p)) != 0) {
+            g_gpath[i].h = h; g_gpath[i].in_root = (char)in_root; g_gpath[i].sys_i386 = -1; g_ngpath++;
+        } else i = GPATH_N;                   /* not remembered */
     }
-    if (!ja) return p;
+    if (!in_root) return p;
+    if (!loader) {                           /* data read by the program: the system file, if it would do */
+        if (sys_i386 < 0) {
+            sys_i386 = file_has_i386(p);
+            if (i < GPATH_N) g_gpath[i].sys_i386 = (char)sys_i386;
+        }
+        if (sys_i386) return p;
+    }
     g_st_redirected++;
     if (g_log) fprintf(stderr, "[intel] %s\n", z);
     return z;
+}
+
+/* /var/run/utmpx (who, w, users): records in host byte order; reading, the guest gets a converted copy (struct
+   utmpx, 628 bytes: ut_user[256], ut_id[4], ut_line[32], ut_pid @292, ut_type (16) @296, ut_tv @300, ut_host[256]
+   @308, ut_pad[16] @564) */
+#define UTMPX_PATH "/var/run/utmpx"
+#define UTMPX_SIZE 628
+typedef char utmpx_size_check[sizeof(struct utmpx) == UTMPX_SIZE ? 1 : -1];
+
+static int utmpx_open_copy(void)
+{
+    struct stat st;
+    char tmpl[] = "/tmp/rosetta-utmpx.XXXXXX";
+    uint8_t *b;
+    int in = open(UTMPX_PATH, O_RDONLY), out = -1;
+    ssize_t n;
+    uint32_t o;
+    if (in < 0) return -1;
+    if (fstat(in, &st) < 0 || st.st_size > (16 << 20) || !(b = malloc((size_t)st.st_size + 1))) { close(in); return -1; }
+    n = read(in, b, (size_t)st.st_size);
+    close(in);
+    for (o = 0; n > 0 && o + UTMPX_SIZE <= (uint32_t)n; o += UTMPX_SIZE) {
+        uint32_t a = (uint32_t)(uintptr_t)(b + o);
+        sw32(a + 292); sw16(a + 296); sw32(a + 300); sw32(a + 304); sw32_range(a, 564, 628);
+    }
+    if (n >= 0 && (out = mkstemp(tmpl)) >= 0) {
+        unlink(tmpl);
+        if (write(out, b, (size_t)n) != n || lseek(out, 0, SEEK_SET) != 0) { close(out); out = -1; }
+    }
+    free(b);
+    return out;
 }
 
 /* ---------- system call switch ---------- */
@@ -1003,6 +1245,7 @@ void sys_bsd(Cpu *c, int sysenter)
     /* i386 libSystem puts the length of the arguments in the upper 16 bits */
     uint32_t n = no_nocancel(c->r[EAX] & 0xffff);
     if (!sysenter) g_arg_base = c->r[ESP];
+    g_call_eip = c->eip;
     if (g_log)
         fprintf(stderr, "[bsd %u %s] %08x %08x %08x %08x\n", n, sys_name(n), arg(0), arg(1), arg(2), arg(3));
     switch (n) {
@@ -1012,7 +1255,15 @@ void sys_bsd(Cpu *c, int sysenter)
         return;
     case SYS_read: HOST(f_read((int)arg(0), PTR_ARG(1), arg(2))); return;
     case SYS_write: HOST(f_write((int)arg(0), PTR_ARG(1), arg(2))); return;
-    case SYS_open: { int r = open(gpath(arg(0)), (int)arg(1), (int)arg(2)); if (r >= 0) jit_fd_off(r); HOST(r); return; }
+    case SYS_open: {
+        const char *p = gpath_open(arg(0), (int)arg(1));
+        int r = -1;
+        if (!((int)arg(1) & O_ACCMODE) && !strcmp(p, UTMPX_PATH)) r = utmpx_open_copy();
+        if (r < 0) r = open(p, (int)arg(1), (int)arg(2));
+        if (r >= 0) jit_fd_off(r);
+        HOST(r);
+        return;
+    }
     case SYS_close: jit_fd_off((int)arg(0)); HOST(close((int)arg(0))); return;
     case SYS_unlink: HOST(unlink((const char *)PTR_ARG(0))); return;
     case SYS_chdir: HOST(chdir((const char *)PTR_ARG(0))); return;
@@ -1522,7 +1773,18 @@ void sys_bsd(Cpu *c, int sysenter)
         if (req == TIOCSTI) { HOST(ioctl((int)arg(0), req, PTR_ARG(2))); return; }          /* char */
         if (req == 0x80086804) { set_result(c, 0, 0); return; }     /* dtrace helper: do not register the guest DOF */
         if ((req & IOC_DIRMASK) == IOC_VOID) { HOST(ioctl((int)arg(0), req)); return; }   /* no data: as it is */
-        fprintf(stderr, "rosetta: ioctl %08lx not implemented yet\n", req);
+        if ((req & IOC_DIRMASK) == IOC_OUT && IOCPARM_LEN(req) <= 1024) {
+            /* only output, layout unknown: ask the host into a scratch buffer; the usual answer for a descriptor of
+               another kind (MTIOCGET on a file: ENOTTY) needs no conversion */
+            uint8_t scratch[1024];
+            if (ioctl((int)arg(0), req, scratch) < 0) { set_result(c, 0, errno); return; }
+        }
+        {
+            static unsigned long reported[16];
+            int k;
+            for (k = 0; k < 16 && reported[k] && reported[k] != req; k++) ;
+            if (k < 16 && !reported[k]) { reported[k] = req; fprintf(stderr, "rosetta: ioctl %08lx not implemented yet\n", req); }
+        }
         set_result(c, 0, ENOTTY);
         return;
     }
@@ -1803,6 +2065,15 @@ void sys_bsd(Cpu *c, int sysenter)
         HOST(syscall(169, (int)arg(0), (int)arg(1), PTR_ARG(2), arg(3)));
         return;
     case 180: set_result(c, 0, 0); return;  /* kdebug_trace */
+    case 380:                               /* __mac_execve(path, argv, envp, label): the label is not passed on */
+        set_result(c, 0, proc_exec((const char *)PTR_ARG(0), arg(1), arg(2), g_sig_mask));
+        return;
+    case 381 ... 395: case 424 ... 426:     /* MAC framework (sandbox, quarantine, labels): not offered to the guest */
+        set_result(c, 0, ENOSYS);
+        return;
+    case 165:                               /* quotactl: as on a volume without quotas */
+        set_result(c, 0, ENOTSUP);
+        return;
     case 44: set_result(c, 0, 0); return;   /* profil: no kernel profiling of translated code */
     /* ---------- files ---------- */
     case SYS_chown: HOST(chown((const char *)PTR_ARG(0), (uid_t)arg(1), (gid_t)arg(2))); return;
@@ -1868,7 +2139,7 @@ void sys_bsd(Cpu *c, int sysenter)
     }
     /* *_extended: like the plain calls; ACLs (filesec) are not passed on */
     case 277: {                             /* open_extended(path, flags, uid, gid, mode, filesec) */
-        int r = open(gpath(arg(0)), (int)arg(1), (int)arg(4));
+        int r = open(gpath_open(arg(0), (int)arg(1)), (int)arg(1), (int)arg(4));
         if (r >= 0) jit_fd_off(r);
         HOST(r);
         return;

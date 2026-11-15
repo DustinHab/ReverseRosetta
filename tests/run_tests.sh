@@ -70,6 +70,10 @@ t_vd()    { ./rosetta ./vdsp_d; }
 r_vd()    { ROSETTA_NO_CACHE=1 ROSETTA_THRESHOLD=2 ROSETTA_ONLY=0-0 ./rosetta ./vdsp_d; }    # interpreted, native math as above
 t_sys()   { sh ../tests/with_timeout.sh 60 ./rosetta ./syscalls; }
 r_sys()   { ./syscalls.ppc; }
+t_flt()   { sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
+r_flt()   { cat ../tests/faults.expected; }
+t_flti()  { ROSETTA_INTERP=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
+t_fltj()  { ROSETTA_THRESHOLD=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
 t_cmpsb() { ROSETTA_THRESHOLD=1 ./rosetta ./cmpsb; }
 r_cmpsb() { ROSETTA_INTERP=1 ./rosetta ./cmpsb; }
 same raw_arith t_raw r_raw
@@ -88,6 +92,9 @@ fi
 same word16 t_w16 r_w16
 same "signals (handler, mask, alarm, pause, SIGPIPE)" t_sig r_sig
 same "processes, kqueue, locks, semaphores, files, blocked signals, pty" t_sys r_sys
+same "exceptions to the program's handlers (SIGFPE, SIGILL, SIGTRAP)" t_flt r_flt
+same "exceptions, interpreter only" t_flti r_flt
+same "exceptions, translated at once" t_fltj r_flt
 same "signal without handler terminates" t_sige r_sige
 same "sed (Intel)" t_sed r_sed
 same fpcompare t_fpc r_fpc

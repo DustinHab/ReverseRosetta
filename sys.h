@@ -14,6 +14,12 @@ void sys_stats(void);                /* ROSETTA_STATS: time per system call */
    parent (blocked signals become the guest mask, ignored ones stay ignored) */
 void sys_init(void);
 
+/* the guest's arguments and program path (KERN_PROCARGS2 and p_comm of the own process) */
+void sys_set_args(int argc, char **argv, const char *path);
+
+/* address range of dyld (main.c): system calls from there are the loader's (Intel library redirection) */
+extern uint32_t g_dyld_from, g_dyld_to;
+
 /* signals to the guest: pending (from the host handler or kill to itself) and mask of the guest; the dispatcher
    calls sig_deliver when (g_sig_pending & ~g_sig_mask) != 0 */
 extern volatile uint32_t g_sig_pending;
@@ -32,7 +38,9 @@ int sys_host_range(Cpu *c, uint32_t a, uint32_t len, const char *was);
 void sys_mem_note(Cpu *c, char kind, uint32_t a, uint32_t len);
 void sys_mem_show(uint32_t addr);
 
-/* signal to the guest; for now: report and terminate */
-void sys_signal(Cpu *c, int sig, const char *reason);
+/* synchronous exception of the guest (sig, si_code) at c->eip: 1 = delivered to its handler (pending, the
+   dispatcher builds the frame), 0 = reported, program finished; g_end_signal is then the signal rosetta ends with */
+int sys_signal(Cpu *c, int sig, int code, const char *reason);
+extern int g_end_signal;
 
 #endif

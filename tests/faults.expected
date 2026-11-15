@@ -1,0 +1,6 @@
+7 / 0: signal 8, code 7, at idiv yes
+INT_MIN / -1: signal 8, code 7, at idiv yes
+ud2: signal 4, code 1, at ud2 yes
+int3: signal 5, code 1, continued after it
+skipped division: result 42
+after siglongjmp: SIGFPE blocked 0

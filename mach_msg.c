@@ -26,6 +26,7 @@ extern kern_return_t mk_timer_destroy(mach_port_name_t name);
 extern kern_return_t mk_timer_arm(mach_port_name_t name, uint64_t deadline);
 extern kern_return_t mk_timer_cancel(mach_port_name_t name, uint64_t *deadline);
 extern mach_port_name_t mach_reply_port(void);
+extern kern_return_t map_fd(int fd, vm_offset_t offset, vm_offset_t *va, boolean_t findspace, vm_size_t size);
 
 static uint32_t g_base;
 static inline uint32_t arg(int i) { return ld32(g_base + 4 + 4 * (uint32_t)i); }
@@ -567,6 +568,12 @@ void mach_trap(Cpu *c, int n, uint32_t base)
         glock_acquire(fc);
         g_base = trunc;
         c->r[EAX] = (uint32_t)k;
+        return;
+    }
+    case 43: {                              /* map_fd(fd, offset, va *, findspace, size): old file mapping (lipo, nm) */
+        vm_offset_t va = ld32(arg(2));
+        c->r[EAX] = (uint32_t)map_fd((int)arg(0), arg(1), &va, (boolean_t)arg(3), arg(4));
+        if (c->r[EAX] == KERN_SUCCESS) { st32(arg(2), (uint32_t)va); jit_new_mapped((uint32_t)va, arg(4)); }
         return;
     }
     case 46: {                              /* pid_for_task(task, int *pid) */

@@ -5,7 +5,10 @@
 #include "cpu.h"
 #include "decoder.h"
 
-enum { RUN_OK = 0, RUN_END, RUN_UNKNOWN, RUN_ERROR };
+/* RUN_SIGNAL: a synchronous exception (division error, ud2, int3, hlt) went to the guest's handler; eip is unchanged
+   (int3: after the instruction) and the signal is pending, the caller continues at the dispatcher, which delivers
+   it. step() returns it as it is (translated code leaves the block on any value but RUN_OK). */
+enum { RUN_OK = 0, RUN_END, RUN_UNKNOWN, RUN_ERROR, RUN_SIGNAL };
 
 /* execute one instruction */
 int step(Cpu *c);

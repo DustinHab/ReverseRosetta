@@ -272,9 +272,10 @@ static uint32_t shift(Cpu *c, int kind, int sz, uint32_t a, uint32_t n)
     }
 }
 
-static void error_div(Cpu *c)
+/* #DE: eip stays at the division (fault) */
+static int error_div(Cpu *c)
 {
-    sys_signal(c, 8 /* SIGFPE */, "division by zero or overflow");
+    return sys_signal(c, 8 /* SIGFPE */, 7 /* FPE_INTDIV */, "division by zero or overflow") ? RUN_SIGNAL : RUN_ERROR;
 }
 
 /* group 3 */
@@ -313,22 +314,22 @@ static int group3(Cpu *c, const Insn *b, int sz)
         break;
     }
     case 6: case 7: {                       /* div, idiv */
-        if (v == 0) { error_div(c); return RUN_ERROR; }
+        if (v == 0) return error_div(c);
         if (sz == 1) {
             uint32_t ax = c->r[EAX] & 0xffff, q, r;
-            if (b->reg == 6) { q = ax / v; r = ax % v; if (q > 0xff) { error_div(c); return RUN_ERROR; } }
+            if (b->reg == 6) { q = ax / v; r = ax % v; if (q > 0xff) return error_div(c); }
             else {
                 int32_t sq = (int16_t)ax / (int8_t)v, sr = (int16_t)ax % (int8_t)v;
-                if (sq > 127 || sq < -128) { error_div(c); return RUN_ERROR; }
+                if (sq > 127 || sq < -128) return error_div(c);
                 q = (uint32_t)sq & 0xff; r = (uint32_t)sr & 0xff;
             }
             reg_write(c, EAX, 2, (r << 8) | (q & 0xff));
         } else if (sz == 2) {
             uint32_t n = ((c->r[EDX] & 0xffff) << 16) | (c->r[EAX] & 0xffff), q, r;
-            if (b->reg == 6) { q = n / v; r = n % v; if (q > 0xffff) { error_div(c); return RUN_ERROR; } }
+            if (b->reg == 6) { q = n / v; r = n % v; if (q > 0xffff) return error_div(c); }
             else {
                 int32_t sq = (int32_t)n / (int16_t)v, sr = (int32_t)n % (int16_t)v;
-                if (sq > 32767 || sq < -32768) { error_div(c); return RUN_ERROR; }
+                if (sq > 32767 || sq < -32768) return error_div(c);
                 q = (uint32_t)sq; r = (uint32_t)sr;
             }
             reg_write(c, EAX, 2, q);
@@ -337,13 +338,13 @@ static int group3(Cpu *c, const Insn *b, int sz)
             uint64_t n = (uint64_t)c->r[EDX] << 32 | c->r[EAX];
             if (b->reg == 6) {
                 uint64_t q = n / v;
-                if (q > 0xffffffffULL) { error_div(c); return RUN_ERROR; }
+                if (q > 0xffffffffULL) return error_div(c);
                 c->r[EAX] = (uint32_t)q; c->r[EDX] = (uint32_t)(n % v);
             } else {
                 int64_t sn = (int64_t)n, q;
-                if ((int32_t)v == -1 && sn == INT64_MIN) { error_div(c); return RUN_ERROR; }
+                if ((int32_t)v == -1 && sn == INT64_MIN) return error_div(c);
                 q = sn / (int32_t)v;
-                if (q > INT32_MAX || q < INT32_MIN) { error_div(c); return RUN_ERROR; }
+                if (q > INT32_MAX || q < INT32_MIN) return error_div(c);
                 c->r[EAX] = (uint32_t)q; c->r[EDX] = (uint32_t)(sn % (int32_t)v);
             }
         }
@@ -673,9 +674,8 @@ static inline __attribute__((always_inline)) int step_core(Cpu *c)
         c->r[EBP] = pop(c);
         break;
     case 0xcc:
-        c->eip = following;
-        sys_signal(c, 5 /* SIGTRAP */, "int3");
-        return RUN_ERROR;
+        c->eip = following;                 /* trap: eip after the instruction */
+        return sys_signal(c, 5 /* SIGTRAP */, 1 /* TRAP_BRKPT */, "int3") ? RUN_SIGNAL : RUN_ERROR;
     case 0xcd:
         c->eip = following;                 /* system calls see eip after the instruction */
         switch (b.imm & 0xff) {
@@ -703,8 +703,7 @@ static inline __attribute__((always_inline)) int step_core(Cpu *c)
         following += b.imm;
         break;
     case 0xf4:
-        sys_signal(c, 11, "hlt");
-        return RUN_ERROR;
+        return sys_signal(c, 4 /* SIGILL */, 3 /* ILL_PRVOPC */, "hlt") ? RUN_SIGNAL : RUN_ERROR;  /* #GP */
     case 0xf5:
         flags_set(c, flags_fetch(c) ^ F_CF);
         break;
@@ -750,8 +749,7 @@ static inline __attribute__((always_inline)) int step_core(Cpu *c)
 
     /* ---------- 0F ---------- */
     case OP_0F | 0x0b:
-        sys_signal(c, 4 /* SIGILL */, "ud2");
-        return RUN_ERROR;
+        return sys_signal(c, 4 /* SIGILL */, 1 /* ILL_ILLOPC */, "ud2") ? RUN_SIGNAL : RUN_ERROR;
     case OP_0F | 0x0d: case OP_0F | 0x18: case OP_0F | 0x19: case OP_0F | 0x1a: case OP_0F | 0x1b:
     case OP_0F | 0x1c: case OP_0F | 0x1d: case OP_0F | 0x1e: case OP_0F | 0x1f:
         break;                              /* prefetch, nop r/m */
@@ -908,7 +906,7 @@ int steps(Cpu *c, int max, int *n, int *jumped, volatile int *halt)
         uint32_t e0 = c->eip;
         r = step_core(c);
         k++;
-        if (r != RUN_OK || c->finished) break;
+        if (r != RUN_OK || c->finished) break;     /* also RUN_SIGNAL: the dispatcher delivers it first */
         if (c->eip - e0 - 1 >= 15) { *jumped = 1; break; }
         if (*halt || c->eip - COMMPAGE_BASE < COMMPAGE_SIZE) break;
     }
@@ -947,7 +945,7 @@ static int run_halt(Cpu *c, const uint32_t *halt, int nh)
                     fprintf(stderr, "\n");
                 }
             }
-        if ((r = step_core(c)) != RUN_OK) return r;
+        if ((r = step_core(c)) != RUN_OK && r != RUN_SIGNAL) return r;
         if (g_sig_pending & ~g_sig_mask) { sig_deliver(c); if (c->finished) return RUN_END; }
     }
 }
@@ -963,7 +961,7 @@ int run(Cpu *c)
         while (h && *h && nh < 8) { halt[nh++] = (uint32_t)strtoul(h, (char **)&h, 16); if (*h == ',') h++; else break; }
     }
     if (nh > 0) return run_halt(c, halt, nh);
-    while ((r = step_core(c)) == RUN_OK) {
+    while ((r = step_core(c)) == RUN_OK || r == RUN_SIGNAL) {
         if (g_thread_waiting | c->yield) thread_yield(c);     /* other guest threads (thread.c) */
         if (g_sig_pending & ~g_sig_mask) {   /* signal to the guest */
             sig_deliver(c);

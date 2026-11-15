@@ -1,7 +1,8 @@
 /* syscalls.c - process, signal and file system calls; the output must match the native PowerPC build.
  * fork, vfork, execve (native, translated, script), system, popen, posix_spawn with file actions, waitid,
  * kqueue/kevent, fcntl locks against a child, POSIX semaphores, fifo, truncate, futimes, chflags, setattrlist,
- * blocked signals with and without handler (sigpending, sigwait), terminal settings on a pty, FIONBIO.
+ * blocked signals with and without handler (sigpending, sigwait), terminal settings on a pty, FIONBIO, sysctl
+ * structures (kinfo_proc, own arguments, loadavg, swap usage, clock rate), getifaddrs, utmpx.
  * Prints no pids, times or paths. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,14 @@
 #include <sys/attr.h>
 #include <sys/resource.h>
 #include <sys/ptrace.h>
+#include <sys/sysctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <net/if_dl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <utmpx.h>
 #include <mach/vm_inherit.h>
 
 extern char **environ;
@@ -473,6 +482,74 @@ static void t_tty(void)
     close(m);
 }
 
+static void t_sysctl(void)
+{
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() }, k;
+    struct kinfo_proc kp;
+    size_t len = sizeof kp;
+    struct loadavg la;
+    struct xsw_usage sw;
+    struct clockinfo ci;
+    struct ifaddrs *ifa, *i;
+    struct utmpx *u;
+    char args[8192];
+    memset(&kp, 0, sizeof kp);
+    if (sysctl(mib, 4, &kp, &len, 0, 0) < 0) printf("KERN_PROC: %s\n", strerror(errno));
+    else printf("KERN_PROC: size %d, pid %s, ppid %s, uid %s, ruid %s, pgid %s, name %s, traced %d, state %d\n", (int)len,
+                kp.kp_proc.p_pid == getpid() ? "right" : "wrong", kp.kp_eproc.e_ppid == getppid() ? "right" : "wrong",
+                kp.kp_eproc.e_ucred.cr_uid == getuid() ? "right" : "wrong",
+                kp.kp_eproc.e_pcred.p_ruid == getuid() ? "right" : "wrong", kp.kp_eproc.e_pgid == getpgrp() ? "right" : "wrong",
+                strncmp(kp.kp_proc.p_comm, "syscalls", 8) ? kp.kp_proc.p_comm : "this program",
+                (kp.kp_proc.p_flag & P_TRACED) != 0, kp.kp_proc.p_stat);
+    mib[1] = KERN_PROCARGS2; mib[2] = getpid();
+    len = sizeof args;
+    if (sysctl(mib, 3, args, &len, 0, 0) < 0) printf("KERN_PROCARGS2: %s\n", strerror(errno));
+    else {
+        int argc;
+        char *p = args + 4;
+        memcpy(&argc, args, 4);
+        printf("KERN_PROCARGS2: argc %d, path %s", argc, strstr(p, "syscalls") ? "this program" : p);
+        p += strlen(p);
+        while (p < args + len && !*p) p++;
+        printf(", argv[0] %s\n", strstr(p, "syscalls") ? "this program" : p);
+    }
+    mib[0] = CTL_VM; mib[1] = VM_LOADAVG; len = sizeof la;
+    sysctl(mib, 2, &la, &len, 0, 0);
+    printf("loadavg: fscale %ld, sane %d\n", la.fscale, la.ldavg[0] < 1000u * (unsigned)la.fscale && la.ldavg[2] < 1000u * (unsigned)la.fscale);
+    mib[1] = VM_SWAPUSAGE; len = sizeof sw;
+    sysctl(mib, 2, &sw, &len, 0, 0);
+    printf("swapusage: page size %u, used <= total %d\n", sw.xsu_pagesize, sw.xsu_used <= sw.xsu_total);
+    mib[0] = CTL_KERN; mib[1] = KERN_CLOCKRATE; len = sizeof ci;
+    sysctl(mib, 2, &ci, &len, 0, 0);
+    printf("clockrate: hz %d, tick %d\n", ci.hz, ci.tick);
+    if (getifaddrs(&ifa) == 0) {
+        for (i = ifa, k = 0; i && k < 24; i = i->ifa_next, k++) {
+            int fam = i->ifa_addr ? i->ifa_addr->sa_family : -1;
+            printf("ifaddr %s: family %d, flags %x", i->ifa_name, fam, i->ifa_flags);
+            if (fam == AF_LINK) {
+                struct sockaddr_dl *d = (struct sockaddr_dl *)i->ifa_addr;
+                printf(", index %d, type %d, name length %d, address length %d", d->sdl_index, d->sdl_type, d->sdl_nlen, d->sdl_alen);
+            } else if (fam == AF_INET) {
+                printf(", %s", inet_ntoa(((struct sockaddr_in *)i->ifa_addr)->sin_addr));
+                if (i->ifa_netmask) printf("/%s", inet_ntoa(((struct sockaddr_in *)i->ifa_netmask)->sin_addr));
+            } else if (fam == AF_INET6) {
+                printf(", scope %u", ((struct sockaddr_in6 *)i->ifa_addr)->sin6_scope_id);
+            }
+            printf("\n");
+        }
+        freeifaddrs(ifa);
+    }
+    printf("if_nametoindex lo0: %u\n", if_nametoindex("lo0"));
+    setutxent();
+    for (k = 0; (u = getutxent()) != 0; )
+        if (u->ut_type == USER_PROCESS) {
+            if (!k++) printf("utmpx: first user on %s, pid %s, time %s\n", u->ut_line, u->ut_pid > 0 ? "set" : "missing",
+                             u->ut_tv.tv_sec > 1000000000 ? "plausible" : "wrong");
+        }
+    endutxent();
+    printf("utmpx: %d user entries\n", k);
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, 0, _IONBF, 0);
@@ -488,6 +565,7 @@ int main(int argc, char **argv)
     t_files();
     t_signals();
     t_tty();
+    t_sysctl();
     t_process();
     return 0;
 }

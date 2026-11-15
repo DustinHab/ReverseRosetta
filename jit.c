@@ -7800,6 +7800,7 @@ static int cold_run(Cpu *c)
        execution goes into the dispatcher anyway) */
     r = steps(c, 256, &n, &jumped, &g_flush);
     g_st_cold_insn += (unsigned long)n;
+    if (r == RUN_SIGNAL) return RUN_OK;     /* exception for the guest handler: the dispatcher delivers it */
     if (r != RUN_OK || c->finished) return r;
     if (jumped) {
         uint32_t before = (c->shadow & ~(64u * 1024 * 8 - 1)) | ((c->shadow - 8) & (64u * 1024 * 8 - 1));
@@ -7809,6 +7810,14 @@ static int cold_run(Cpu *c)
 }
 
 static int dispatcher(Cpu *c);
+
+/* one interpreted instruction at the dispatcher: an exception for the guest handler (RUN_SIGNAL) is delivered at the
+   start of the next round */
+static inline int dstep(Cpu *c)
+{
+    int r = step(c);
+    return r == RUN_SIGNAL ? RUN_OK : r;
+}
 
 /* register the thread (ring, swap patterns of the Cpu) */
 static void thread_setup(Cpu *c, uint32_t ring)
@@ -7889,7 +7898,7 @@ static int dispatcher(Cpu *c)
         if (g_vt_on) vt_tally(eip, c->jit_kind > KIND_INVALID ? 3 : c->jit_kind);
         if (eip - COMMPAGE_BASE < COMMPAGE_SIZE && !commpage_stub(eip)) {
             uint32_t before;
-            r = step(c);
+            r = dstep(c);
             if (r != RUN_OK || c->finished) return c->finished ? RUN_END : r;
             /* commpage routine has returned (without a ret in translated code): remove its shadow entry */
             before = (c->shadow & ~(64u * 1024 * 8 - 1)) | ((c->shadow - 8) & (64u * 1024 * 8 - 1));
@@ -7922,7 +7931,7 @@ static int dispatcher(Cpu *c)
         if (!code) {
             g_st_interp++;
             interp_tally(c->eip);
-            r = step(c);
+            r = dstep(c);
             if (r != RUN_OK || c->finished) return c->finished ? RUN_END : r;
             continue;
         }
@@ -7953,7 +7962,7 @@ static int dispatcher(Cpu *c)
         if (c->jit_kind == KIND_INTERPRET) {
             g_st_interp++;
             interp_tally(c->eip);
-            r = step(c);
+            r = dstep(c);
             if (r != RUN_OK || c->finished) return c->finished ? RUN_END : r;
         } else if (c->jit_kind == KIND_INTERRUPT) {
             ;                               /* done above */
@@ -7968,7 +7977,7 @@ static int dispatcher(Cpu *c)
                    once and keep the block; afterwards its bytes match (otherwise translate twice and redirect the
                    old block, which copies mapped pages) */
                 g_st_inval_cache++;
-                r = step(c);
+                r = dstep(c);
                 if (r != RUN_OK || c->finished) return c->finished ? RUN_END : r;
             } else {
                 g_st_invalid++;
