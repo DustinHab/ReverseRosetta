@@ -7532,7 +7532,9 @@ static int cache_images(CacheImage *b, int max)
         uint32_t head[4];
         vm_size_t was_read = 0;
         n = VM_REGION_BASIC_INFO_COUNT;
-        if (vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO, (vm_region_info_t)&info, &n, &obj) || a >= 0x90000000u) break;
+        if (vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO, (vm_region_info_t)&info, &n, &obj) || a >= 0xffff0000u) break;
+        if (a >= 0x90000000u && a < 0xb0000000u) { a = 0xb0000000u; continue; }   /* the host's libraries; guest images
+                                                                                     can lie above them (0xc0000000) */
         if ((info.protection & VM_PROT_READ) && sz >= 4096 &&
             vm_read_overwrite(mach_task_self(), a, 16, (vm_address_t)head, &was_read) == KERN_SUCCESS && was_read == 16 &&
             ld32((uint32_t)(uintptr_t)&head[0]) == 0xfeedface && ld32((uint32_t)(uintptr_t)&head[1]) == 7) {
@@ -7578,12 +7580,23 @@ static int cache_images(CacheImage *b, int max)
     return nb;
 }
 
+/* guest address in one of the images (or the commpage) */
+static int in_images(uint32_t eip, const CacheImage *b, uint32_t n)
+{
+    uint32_t j;
+    if (eip - COMMPAGE_BASE < COMMPAGE_SIZE) return 1;
+    for (j = 0; j < n; j++) if (eip >= b[j].start && eip < b[j].end) return 1;
+    return 0;
+}
+
 static void cache_write(void)
 {
     CacheHead k;
     CacheImage *b;
     char tmp[1100];
-    uint32_t i, *t;
+    uint32_t i, *t, nforeign = 0, n;
+    uint8_t *foreign = 0;
+    uint32_t **stub = 0;
     int fd, ok = 1;
     cache_path();
     if (g_cache_show && g_cache_path[0] && g_st_flushes) fprintf(stderr, "rosetta: translation cache not written (%lu flushes)\n", g_st_flushes);
@@ -7615,24 +7628,43 @@ static void cache_write(void)
     k.prolog = (uint32_t)((uint8_t *)g_cache_start - (uint8_t *)g_cache);
     k.code = (uint32_t)((uint8_t *)g_free - (uint8_t *)g_cache);
     k.nimages = (uint32_t)cache_images(b, CACHE_IMAGES);
-    /* only code from files (and the commpage): what came from anonymous memory (guest JIT) may differ next time */
+    /* only code from files (and the commpage) goes into the map: what came from anonymous memory (trampolines that a
+       framework generates at run time) may differ or be missing next time. Such blocks stay in the code region, but
+       in the written copy their first instruction jumps to an exit stub (KIND_INVALID with their eip): chained jumps
+       into them reach the dispatcher, which translates what is there then */
+    nforeign = 0;
+    foreign = calloc((size_t)g_nused + 1, 1);
+    if (!foreign) { free(b); free(t); return; }
     for (i = 0; i < g_nused; i++) {
-        uint32_t eip = g_map[g_inuse[i]].eip, j;
+        uint32_t eip = g_map[g_inuse[i]].eip;
         if (!g_map[g_inuse[i]].code || !eip || eip == 0xffffffffu || eip - COMMPAGE_BASE < COMMPAGE_SIZE) continue;
-        for (j = 0; j < k.nimages && (eip < b[j].start || eip >= b[j].end); j++) ;
-        if (j == k.nimages) {
-            if (g_cache_show) fprintf(stderr, "rosetta: translation cache not written (block %08x in no image)\n", eip);
-            free(b); free(t); return;
-        }
+        if (!in_images(eip, b, k.nimages)) { foreign[i] = 1; nforeign++; }
     }
+    if (nforeign) {
+        uint32_t *keep = p;
+        int wb = g_sl_wb_now;
+        if ((uint32_t)(g_cache_end - g_free) < 16 * nforeign + 64) { free(foreign); free(b); free(t); return; }
+        stub = malloc(sizeof *stub * nforeign);
+        if (!stub) { free(foreign); free(b); free(t); return; }
+        g_sl_wb_now = 0;
+        p = g_free;
+        for (i = 0, n = 0; i < g_nused; i++)
+            if (foreign[i]) { stub[n++] = p; exit_kind(g_map[g_inuse[i]].eip, KIND_INVALID); }
+        sys_icache_invalidate(g_free, (size_t)((uint8_t *)p - (uint8_t *)g_free));
+        g_free = p;
+        p = keep;
+        g_sl_wb_now = wb;
+        if (g_cache_show) fprintf(stderr, "rosetta: %u blocks outside the images left out of the translation cache\n", nforeign);
+    }
+    k.code = (uint32_t)((uint8_t *)g_free - (uint8_t *)g_cache);   /* with the exit stubs */
     k.vlring = (uint32_t)g_vl_nring;
     k.ncpool = (uint32_t)g_cpool_n;
     snprintf(tmp, sizeof tmp, "%s.%d", g_cache_path, (int)getpid());
-    if ((fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644)) < 0) { free(b); free(t); return; }
+    if ((fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644)) < 0) { free(foreign); free(stub); free(b); free(t); return; }
     /* map: eip, offset in the cache */
     for (i = 0; i < g_nused; i++) {
         uint32_t h = g_inuse[i];
-        if (!g_map[h].code || !g_map[h].eip || g_map[h].eip == 0xffffffffu) continue;
+        if (!g_map[h].code || !g_map[h].eip || g_map[h].eip == 0xffffffffu || foreign[i]) continue;
         t[2 * k.nmap] = g_map[h].eip;
         t[2 * k.nmap + 1] = (uint32_t)((uint8_t *)g_map[h].code - (uint8_t *)g_cache);
         k.nmap++;
@@ -7642,7 +7674,8 @@ static void cache_write(void)
         for (i = 0; i < (1u << 15); i++) if (g_codepages[i]) { s[2 * k.npages] = i; s[2 * k.npages + 1] = g_codepages[i]; k.npages++; }
         s += 2 * k.npages;
         for (i = 0; i < VAR_N; i++)
-            if (g_var[i].code) { s[3 * k.nvar] = g_var[i].loc; s[3 * k.nvar + 1] = g_var[i].target;
+            if (g_var[i].code && in_images(g_var[i].loc, b, k.nimages) && in_images(g_var[i].target, b, k.nimages)) {
+                s[3 * k.nvar] = g_var[i].loc; s[3 * k.nvar + 1] = g_var[i].target;
                                  s[3 * k.nvar + 2] = (uint32_t)((uint8_t *)g_var[i].code - (uint8_t *)g_cache); k.nvar++; }
         s += 3 * k.nvar;
         memcpy(s, g_cpool, 8 * (size_t)k.ncpool);
@@ -7652,7 +7685,7 @@ static void cache_write(void)
         /* jump table (targets of indirect jumps): otherwise every run fills it again through misses in the dispatcher */
         for (i = 0; i < (g_tab_full ? TABLE : g_tab_n); i++) {
             uint32_t x = g_tab_full ? i : g_tab_slot[i], eip = g_table[2 * x], *code = (uint32_t *)(uintptr_t)g_table[2 * x + 1];
-            if (!eip || code < g_cache_start || code >= g_free) continue;
+            if (!eip || code < g_cache_start || code >= g_free || !in_images(eip, b, k.nimages)) continue;
             s[2 * k.ntab] = eip;
             s[2 * k.ntab + 1] = (uint32_t)((uint8_t *)code - (uint8_t *)g_cache);
             k.ntab++;
@@ -7668,14 +7701,28 @@ static void cache_write(void)
             size_t front = sizeof k + sizeof *b * k.nimages + 4 * (size_t)(s - t);
             static const char null[4096];
             k.codeoffset = (uint32_t)((front + 4095) & ~(size_t)4095);
-            ok = write(fd, &k, sizeof k) == (ssize_t)sizeof k &&
+            uint32_t *code = (uint32_t *)(void *)g_cache_start;
+            size_t len = k.code - k.prolog;
+            if (nforeign && (code = malloc(len)) != 0) {   /* copy: blocks outside the images start with the exit */
+                memcpy(code, g_cache_start, len);
+                for (i = 0, n = 0; i < g_nused; i++)
+                    if (foreign[i]) {
+                        uint32_t *at = g_map[g_inuse[i]].code;
+                        code[at - g_cache_start] = B_((uint32_t)(uintptr_t)stub[n] - (uint32_t)(uintptr_t)at);
+                        n++;
+                    }
+            }
+            ok = code && write(fd, &k, sizeof k) == (ssize_t)sizeof k &&
                  write(fd, b, sizeof *b * k.nimages) == (ssize_t)(sizeof *b * k.nimages) &&
                  write(fd, t, 4 * (size_t)(s - t)) == (ssize_t)(4 * (size_t)(s - t)) &&
                  (k.codeoffset == front || write(fd, null, k.codeoffset - front) == (ssize_t)(k.codeoffset - front)) &&
-                 write(fd, g_cache_start, k.code - k.prolog) == (ssize_t)(k.code - k.prolog);
+                 write(fd, code, len) == (ssize_t)len;
+            if (code && code != (uint32_t *)(void *)g_cache_start) free(code);
         }
     }
     if (close(fd) == 0 && ok) rename(tmp, g_cache_path); else unlink(tmp);
+    free(foreign);
+    free(stub);
     free(b);
     free(t);
     {   /* translation caches and hot lists of other builds of rosetta never fit again, for any program: delete them
