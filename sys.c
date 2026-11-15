@@ -1228,9 +1228,13 @@ static unsigned long g_st_redirected;
 uint32_t g_dyld_from, g_dyld_to;            /* main.c: where dyld is (calls from there are the loader's) */
 static uint32_t g_call_eip;                 /* eip of the current system call */
 
-static const char *gpath_as(uint32_t a, int loader);
-#define gpath(a) gpath_as((a), g_call_eip - g_dyld_from < g_dyld_to - g_dyld_from)
-const char *sys_guest_path(const char *p) { return gpath_as((uint32_t)(uintptr_t)p, 1); }
+/* how a path is used: the loader's accesses go to the root (prebound copies); a program that reads or asks about a
+   file gets the system file if that has an i386 part (stat and read must agree); symbolic links are the same in the
+   root and the system (intel_links.sh), readlink needs no look into the file */
+enum { GP_DATA, GP_LOADER };
+static const char *gpath_as(uint32_t a, int use);
+#define gpath(a) gpath_as((a), g_call_eip - g_dyld_from < g_dyld_to - g_dyld_from ? GP_LOADER : GP_DATA)
+const char *sys_guest_path(const char *p) { return gpath_as((uint32_t)(uintptr_t)p, GP_LOADER); }
 
 /* remembered answers (dyld queries the same path several times with stat, open, ...): per path, whether it exists
    in the Intel root, and whether the system file has an i386 part itself (-1: not checked yet) */
@@ -1262,7 +1266,7 @@ static const char *gpath_open(uint32_t a, int flags)
     return (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)) ? (const char *)(uintptr_t)a : gpath(a);
 }
 
-static const char *gpath_as(uint32_t a, int loader)
+static const char *gpath_as(uint32_t a, int use)
 {
     static char fresh[2][1200];
     static int which;
@@ -1300,7 +1304,7 @@ static const char *gpath_as(uint32_t a, int loader)
         } else i = GPATH_N;                   /* not remembered */
     }
     if (!in_root) return p;
-    if (!loader) {                           /* data read by the program: the system file, if it would do */
+    if (use == GP_DATA) {                    /* read by the program: the system file, if it would do */
         if (sys_i386 < 0) {
             sys_i386 = file_has_i386(p);
             if (i < GPATH_N) g_gpath[i].sys_i386 = (char)sys_i386;
@@ -1433,7 +1437,7 @@ void sys_bsd(Cpu *c, int sysenter)
         return;
     case SYS_umask: set_result(c, umask((mode_t)arg(0)), 0); return;
     case SYS_getdtablesize: set_result(c, (uint32_t)getdtablesize(), 0); return;
-    case SYS_readlink: HOST(readlink(gpath(arg(0)), PTR_ARG(1), arg(2))); return;
+    case SYS_readlink: HOST(readlink(gpath_as(arg(0), GP_LOADER), PTR_ARG(1), arg(2))); return;   /* same links */
     case SYS_mkdir: HOST(mkdir((const char *)PTR_ARG(0), (mode_t)arg(1))); return;
     case SYS_rmdir: HOST(rmdir((const char *)PTR_ARG(0))); return;
     case SYS_rename: HOST(rename((const char *)PTR_ARG(0), (const char *)PTR_ARG(1))); return;

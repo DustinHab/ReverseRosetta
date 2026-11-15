@@ -6,8 +6,8 @@ passes system calls and Mach messages to the PowerPC kernel and system services.
 Apple's Rosetta, which ran PowerPC programs on Intel Macs.
 
 > **Translated Intel code runs at up to native speed on a PowerPC G4.** Integer code reaches 102 % of the speed of the
-> same program compiled natively for PowerPC, call-heavy code 81 %, control flow 72 %, libm code 69 %, packed SSE2
-> code 67 %, floating point 59 %. A Foundation program starts in 66 ms (native: 46 ms).
+> same program compiled natively for PowerPC, call-heavy code 83 %, control flow 72 %, packed SSE2 code 68 %, libm
+> code 67 %, floating point 60 %. A Foundation program starts in 69 ms (native: 47 ms).
 
 ![Transmission 2.42 (x86_64/i386 only) running on an iBook G4](docs/transmission-on-ibook-g4.png)
 
@@ -23,12 +23,12 @@ which the measurement compares.
 
 | Benchmark | What it does | Translated | Native | Speed vs. native |
 |---|---|---|---|---|
-| `bench_integer` | integer arithmetic, loops, arrays: sieve, hashing, sorting, Collatz | 1932 MIPS | 1886 MIPS | **102 %** |
-| `bench_calls` | direct calls, calls through function pointers (one and changing targets), recursion | 1161 MIPS | 1427 MIPS | **81 %** |
-| `bench_control_flow` | recursion, qsort with a compare callback, a switch-table machine, strtok | 912 MIPS | 1261 MIPS | **72 %** |
-| `bench_libm` | sin, cos, exp, log, pow, atan2, fmod, floor, sqrt with x87 return values | 273 MIPS | 397 MIPS | **69 %** |
-| `bench_sse2` | packed SSE2 doubles: daxpy, dot product, complex multiply, sqrt/div, min/max, compares | 210 MIPS | 315 MIPS | **67 %** |
-| `bench_float` | matrix product, n-body with sqrt, float vectors, int/float conversions | 258 MIPS | 434 MIPS | **59 %** |
+| `bench_integer` | integer arithmetic, loops, arrays: sieve, hashing, sorting, Collatz | 1919 MIPS | 1880 MIPS | **102 %** |
+| `bench_calls` | direct calls, calls through function pointers (one and changing targets), recursion | 1170 MIPS | 1416 MIPS | **83 %** |
+| `bench_control_flow` | recursion, qsort with a compare callback, a switch-table machine, strtok | 903 MIPS | 1262 MIPS | **72 %** |
+| `bench_sse2` | packed SSE2 doubles: daxpy, dot product, complex multiply, sqrt/div, min/max, compares | 209 MIPS | 307 MIPS | **68 %** |
+| `bench_libm` | sin, cos, exp, log, pow, atan2, fmod, floor, sqrt with x87 return values | 265 MIPS | 396 MIPS | **67 %** |
+| `bench_float` | matrix product, n-body with sqrt, float vectors, int/float conversions | 261 MIPS | 433 MIPS | **60 %** |
 
 MIPS is the number of i386 instructions per round (counted by the interpreter) divided by the time per round; the
 time per round is the slope between a short and a long run, so startup costs drop out. The native column uses the
@@ -39,11 +39,11 @@ Startup time, translated against native, fastest of 7 runs with the translation 
 
 | Program | Translated | Native |
 |---|---|---|
-| hello world (libSystem) | 22 ms | 12 ms |
-| CoreFoundation test | 40 ms | 18 ms |
-| Objective-C test | 28 ms | 14 ms |
-| Foundation test | 66 ms | 46 ms |
-| `/bin/ls -la /usr/lib` (i386 part of the universal binary) | 76 ms | 42 ms |
+| hello world (libSystem) | 23 ms | 13 ms |
+| CoreFoundation test | 41 ms | 18 ms |
+| Objective-C test | 29 ms | 14 ms |
+| Foundation test | 69 ms | 47 ms |
+| `/bin/ls -la /usr/lib` (i386 part of the universal binary) | 71 ms | 42 ms |
 
 ## What runs
 
@@ -219,7 +219,11 @@ login session exists.
 
 `cli_matrix.sh` runs each command natively, translated, and natively again (output that changes between the native
 runs, such as a clock, is set aside) in an empty working directory, without arguments and with input from
-`/dev/null`; programs that could send mail, print, change settings or start services are never run.
+`/dev/null`; programs that could send mail, print, change settings or start services are never run. Current result
+on the iBook: 580 of 644 commands give byte-identical output and exit status, 15 change between native runs. Most of
+the rest differ on purpose (they report the Intel processor: `arch`, `machine`, `uname`, compiler driver names),
+need Intel libraries that the update does not contain (AppleTalk, Tcl, OpenDirectory, Samba), or crash natively as
+well.
 
 ## Limitations
 
