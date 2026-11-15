@@ -33,6 +33,9 @@ int thread_wq_ops(Cpu *c, uint32_t kind, uint32_t ent, uint32_t prio);
    waiting (starts with the first thread or signal handler) */
 void thread_watchdog_start(void);
 
+/* fork child: reset the lock and thread bookkeeping (only the calling thread survives) */
+void thread_after_fork(Cpu *c);
+
 /* statistics (ROSETTA_STATS) */
 void thread_stats(void);
 

@@ -68,6 +68,8 @@ t_pdo()   { ROSETTA_THRESHOLD=1 ./rosetta ./pd_ops; }
 r_pdo()   { ROSETTA_INTERP=1 ./rosetta ./pd_ops; }
 t_vd()    { ./rosetta ./vdsp_d; }
 r_vd()    { ROSETTA_NO_CACHE=1 ROSETTA_THRESHOLD=2 ROSETTA_ONLY=0-0 ./rosetta ./vdsp_d; }    # interpreted, native math as above
+t_sys()   { sh ../tests/with_timeout.sh 60 ./rosetta ./syscalls; }
+r_sys()   { ./syscalls.ppc; }
 t_cmpsb() { ROSETTA_THRESHOLD=1 ./rosetta ./cmpsb; }
 r_cmpsb() { ROSETTA_INTERP=1 ./rosetta ./cmpsb; }
 same raw_arith t_raw r_raw
@@ -85,6 +87,7 @@ if [ -d $R/intel/root ]; then      # stage 4: Intel frameworks from the Combo Up
 fi
 same word16 t_w16 r_w16
 same "signals (handler, mask, alarm, pause, SIGPIPE)" t_sig r_sig
+same "processes, kqueue, locks, semaphores, files, blocked signals, pty" t_sys r_sys
 same "signal without handler terminates" t_sige r_sige
 same "sed (Intel)" t_sed r_sed
 same fpcompare t_fpc r_fpc

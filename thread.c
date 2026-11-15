@@ -393,6 +393,24 @@ int thread_wq_ops(Cpu *c, uint32_t kind, uint32_t ent, uint32_t prio)
     return EINVAL;
 }
 
+/* child after fork: only the calling thread exists, and it holds the lock. The mutex may have been held by another
+   thread at the moment of the fork, so it is created anew; the watchdog thread did not survive either. */
+void thread_after_fork(Cpu *c)
+{
+    int watchdog_was_on = g_watchdog_on;
+    pthread_mutex_init(&g_m, 0);
+    pthread_cond_init(&g_cv, 0);
+    pthread_cond_init(&g_wq_cv, 0);
+    g_taken = 1;
+    g_threads = 1;
+    g_thread_waiting = 0;
+    g_thread_cur = c;
+    g_nwq = g_wq_threads = g_wq_idle = 0;
+    g_empty_since = 0;
+    g_watchdog_on = 0;
+    if (watchdog_was_on) thread_watchdog_start();
+}
+
 void thread_stats(void)
 {
     if (g_watchdog_on) fprintf(stderr, "rosetta: watchdog stopped a thread in a loop %lu times\n", g_st_watchdog);

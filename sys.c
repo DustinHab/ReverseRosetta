@@ -33,6 +33,7 @@
 #include <sys/mount.h>
 #include <sys/attr.h>
 #include <sys/wait.h>
+#include <sys/event.h>
 #include <termios.h>
 #include <signal.h>
 #include <mach/mach.h>
@@ -97,6 +98,8 @@ static void set_result(Cpu *c, uint32_t r, int errnum)
 
 #define HOST(expr) do { long r_ = (long)(expr); set_result(c, (uint32_t)r_, r_ == -1 ? errno : 0); } while (0)
 
+#define KAUTH_ID_NONE 0xffffff9bu           /* KAUTH_UID_NONE, KAUTH_GID_NONE (sys/kauth.h): "do not change" */
+
 /* Blocking host calls release the guest thread lock (thread.c) so other threads run in the meantime. The
    arguments are already evaluated when the wrapper is called; afterwards g_arg_base (another thread may have made
    system calls in the meantime) and errno hold their previous values again */
@@ -118,9 +121,16 @@ static ssize_t f_sendto(int d, const void *b, size_t n, int fl, const struct soc
 { ssize_t r; FREE_ON; r = sendto(d, b, n, fl, a, l); FREE_OFF; return r; }
 static ssize_t f_recvmsg(int d, struct msghdr *m, int fl) { ssize_t r; FREE_ON; r = recvmsg(d, m, fl); FREE_OFF; return r; }
 static ssize_t f_sendmsg(int d, const struct msghdr *m, int fl) { ssize_t r; FREE_ON; r = sendmsg(d, m, fl); FREE_OFF; return r; }
-static long f_semwait(int n, int a, int b, int d, int e, long f, int g)
+static long f_syscall(int n, int a, int b, int d, int e, long f, int g)
 { long r; FREE_ON; r = syscall(n, a, b, d, e, f, g); FREE_OFF; return r; }
 static void f_short_wait(void) { FREE_ON; usleep(1000); FREE_OFF; }
+static int f_kevent(int q, const struct kevent *ch, int nch, struct kevent *ev, int nev, const struct timespec *t)
+{ int r; FREE_ON; r = kevent(q, ch, nch, ev, nev, t); FREE_OFF; return r; }
+static int f_fcntl_ptr(int d, int cmd, void *p) { int r; FREE_ON; r = fcntl(d, cmd, p); FREE_OFF; return r; }
+static int f_ioctl(int d, unsigned long req, void *p) { int r; FREE_ON; r = ioctl(d, req, p); FREE_OFF; return r; }
+static int f_sendfile(int d, int s, off_t o, off_t *l, struct sf_hdtr *h, int fl)
+{ int r; FREE_ON; r = sendfile(d, s, o, l, h, fl); FREE_OFF; return r; }
+static pid_t f_waitpid(pid_t p, int *st) { pid_t r; FREE_ON; r = waitpid(p, st, 0); FREE_OFF; return r; }
 
 void sys_signal(Cpu *c, int sig, const char *reason)
 {
@@ -306,20 +316,16 @@ static void attrlist_read(uint32_t a, struct attrlist *l)
     l->forkattr = ld32(a + 20);
 }
 
-/* swap the result of one entry (length in front, at guest address a, at most size bytes, already copied raw);
-   returns the length of the entry */
-static uint32_t attr_swap(uint32_t a, uint32_t size, const struct attrlist *l)
+/* swap the numeric fields of the attributes in l in place, from offset o up to len. Swapping the bytes of a field
+   is the same operation in both directions: getattrlist (host -> guest) and setattrlist (guest -> host). */
+static void attr_swap_fields(uint32_t a, uint32_t o, uint32_t len, const struct attrlist *l, const char *call)
 {
     const AttrType *tab[5] = { g_attr_cmn, g_attr_vol, g_attr_dir, g_attr_file, g_attr_branch };
-    uint32_t masks[5], len, o = 4, rest;
+    uint32_t masks[5], rest;
     int g, k;
     static int reported;
     uint8_t *p = (uint8_t *)(uintptr_t)a;
-    if (size < 4) return 0;
     masks[0] = l->commonattr; masks[1] = l->volattr; masks[2] = l->dirattr; masks[3] = l->fileattr; masks[4] = l->forkattr;
-    len = *(uint32_t *)p;                /* host byte order */
-    st32(a, len);
-    if (len > size) len = size;
     for (g = 0; g < 5; g++) {
         rest = masks[g];
         for (k = 0; tab[g][k].bit && rest; k++) {
@@ -335,11 +341,23 @@ static uint32_t attr_swap(uint32_t a, uint32_t size, const struct attrlist *l)
             default: break;
             }
         }
-        if (rest) {                         /* unknown attribute: size unknown, the rest stays in host byte order */
-            if (!reported++) fprintf(stderr, "rosetta: getattrlist: unknown attributes %u:%08x\n", g, rest);
+        if (rest) {                         /* unknown attribute: size unknown, the rest stays as it is */
+            if (!reported++) fprintf(stderr, "rosetta: %s: unknown attributes %u:%08x\n", call, g, rest);
             break;
         }
     }
+}
+
+/* swap the result of one entry (length in front, at guest address a, at most size bytes, already copied raw);
+   returns the length of the entry */
+static uint32_t attr_swap(uint32_t a, uint32_t size, const struct attrlist *l)
+{
+    uint32_t len;
+    if (size < 4) return 0;
+    len = *(uint32_t *)(uintptr_t)a;     /* host byte order */
+    st32(a, len);
+    if (len > size) len = size;
+    attr_swap_fields(a, 4, len, l, "getattrlist");
     return len;
 }
 
@@ -477,7 +495,7 @@ static void dirent64_convert(uint32_t a, long n)
 /* ---------- signals to the guest ----------
  * sigaction records handler, trampoline (_sigtramp of libc), mask and flags. For signals with a handler a host
  * handler catches the signal and only marks it pending (g_sig_pending); SIG_IGN/SIG_DFL also apply in the host
- * (SIGPIPE ignored -> EPIPE). Own signals (kill, __pthread_kill) are marked pending the same way. Delivery happens
+ * (SIGPIPE ignored -> EPIPE; SIG_DFL only while the guest does not block the signal, see sig_sync). Own signals (kill, __pthread_kill) are marked pending the same way. Delivery happens
  * at the dispatcher (jit.c, jit_run) with a stack frame like the kernel's (xnu sendsig, 32 bit): mcontext32
  * (600 bytes), siginfo (64), ucontext32 (32), sigframe32 (retaddr -1, catcher, sigstyle, sig, sinfo, uctx; esp
  * points to it, aligned to 16 bytes after the return word), eip = trampoline. libc calls the handler and then
@@ -516,6 +534,30 @@ static int sig_own(int sig)
            (sig == SIGALRM && getenv("ROSETTA_HPROFILE"));
 }
 
+/* SIG_DFL signals that the guest blocks are caught by the host as well: they are only marked pending, and the
+   default action happens when the guest unblocks them (sig_deliver -> sig_default), or sigwait takes them. The
+   guest mask exists only in the translator; without this a SIGUSR1 blocked by the guest would still terminate the
+   process. Unblocked SIG_DFL signals keep the host default action (no cost). Called after every change of a
+   handler or of the mask. */
+static uint32_t g_dfl_caught;               /* SIG_DFL signals the host currently catches */
+
+static void sig_sync(void)
+{
+    int sig;
+    for (sig = 1; sig < 32; sig++) {
+        uint32_t b = SIG_BIT(sig);
+        int want;
+        struct sigaction sa;
+        if (sig_own(sig) || g_handler[sig] != 0) continue;
+        want = (g_sig_mask & b) != 0;
+        if (want == ((g_dfl_caught & b) != 0)) continue;
+        memset(&sa, 0, sizeof sa);
+        if (want) { sa.sa_sigaction = sig_host; sa.sa_flags = SA_SIGINFO | SA_RESTART; g_dfl_caught |= b; }
+        else { sa.sa_handler = SIG_DFL; g_dfl_caught &= ~b; }
+        sigaction(sig, &sa, 0);
+    }
+}
+
 /* host behavior after the guest handler */
 static void sig_host_set(int sig)
 {
@@ -529,6 +571,8 @@ static void sig_host_set(int sig)
         sa.sa_flags = SA_SIGINFO | ((g_handler_flags[sig] & SA_RESTART) ? SA_RESTART : 0);
     }
     sigaction(sig, &sa, 0);
+    g_dfl_caught &= ~SIG_BIT(sig);
+    sig_sync();
 }
 
 static void sig_schedule(int sig, int code)
@@ -573,8 +617,11 @@ void sig_deliver(Cpu *c)
     if (sig >= 32) return;
     __sync_fetch_and_and(&g_sig_pending, ~SIG_BIT(sig));
     h = g_handler[sig];
-    if (h == 1) return;                     /* SIG_IGN */
-    if (h == 0) { sig_default(c, sig); return; }
+    if (h <= 1) {                           /* SIG_IGN or SIG_DFL: no handler that would restore the mask of sigsuspend */
+        if (g_sig_after_valid) { g_sig_mask = g_sig_after; g_sig_after_valid = 0; sig_sync(); }
+        if (h == 0) sig_default(c, sig);
+        return;
+    }
     saved = g_sig_after_valid ? g_sig_after : g_sig_mask;
     g_sig_after_valid = 0;
     xmm_intel(c);
@@ -618,6 +665,7 @@ void sig_deliver(Cpu *c)
     /* mask in the handler, SA_RESETHAND */
     g_sig_mask = (g_sig_mask | g_handler_mask[sig] | ((g_handler_flags[sig] & SA_NODEFER) ? 0 : SIG_BIT(sig))) & ~SIG_NEVER;
     if (g_handler_flags[sig] & SA_RESETHAND) { g_handler[sig] = 0; sig_host_set(sig); }
+    sig_sync();
     c->r[ESP] = fp;
     c->eip = g_tramp;
     if (g_log) fprintf(stderr, "[signal %d] handler %08x via %08x, frame %08x\n", sig, h, g_tramp, fp);
@@ -629,6 +677,7 @@ static void sig_back(Cpu *c, uint32_t uctx)
     uint32_t mctx = ld32(uctx + 28), f = mctx + 76;
     int k;
     g_sig_mask = ld32(uctx + 4) & ~SIG_NEVER;
+    sig_sync();
     c->r[EAX] = ld32(mctx + 12); c->r[EBX] = ld32(mctx + 16); c->r[ECX] = ld32(mctx + 20); c->r[EDX] = ld32(mctx + 24);
     c->r[EDI] = ld32(mctx + 28); c->r[ESI] = ld32(mctx + 32); c->r[EBP] = ld32(mctx + 36); c->r[ESP] = ld32(mctx + 40);
     flags_set(c, ld32(mctx + 48) & ~F_TF);
@@ -640,6 +689,227 @@ static void sig_back(Cpu *c, uint32_t uctx)
         c->st_top = (int)(ld32(f + 300) & 7); c->x87_depth = ld32(f + 304) > 8 ? 8 : ld32(f + 304);
     }
     g_sig_eip_set = 1;
+}
+
+/* wait until one of the signals in bits is pending for the guest (sigsuspend, sigwait) */
+static void sig_wait_for(uint32_t bits)
+{
+    sigset_t all, before;
+    if (g_threads > 1) {                     /* the host delivers the signal to any thread: check instead of sleeping */
+        while (!(g_sig_pending & bits)) f_short_wait();
+        return;
+    }
+    sigfillset(&all);
+    sigprocmask(SIG_BLOCK, &all, &before);  /* do not lose a signal between check and wait */
+    while (!(g_sig_pending & bits)) sigsuspend(&before);
+    sigprocmask(SIG_SETMASK, &before, 0);
+}
+
+/* ---------- processes ----------
+ * fork: the host forks (its libc prepares malloc and its own state); in the child only the calling thread exists
+ * (thread_after_fork). i386 convention: edx = 1 and eax = own pid in the child, edx = 0 and eax = pid of the child
+ * in the parent. vfork is a fork: the child shares no memory, which programs that only exec or _exit afterwards
+ * cannot tell.
+ * execve: a program that runs on PowerPC (thin ppc, fat with a ppc part, scripts, everything unknown) is started
+ * by the kernel itself; an Intel-only program (thin i386, fat without ppc) runs through rosetta again, with the
+ * caller's argv[0] passed by -0. The host signal mask becomes the guest mask, so the new program inherits it as it
+ * would natively; when that program is rosetta, sys_init turns it back into the guest mask. */
+static char g_self[PATH_MAX];               /* this rosetta binary (absolute) */
+
+void sys_init(void)
+{
+    char exe[PATH_MAX];
+    uint32_t n = sizeof exe;
+    sigset_t m, none;
+    int sig;
+    if (_NSGetExecutablePath(exe, &n) != 0 || !realpath(exe, g_self)) g_self[0] = 0;
+    for (sig = 1; sig < 32; sig++) {        /* ignored by the parent: the guest sees SIG_IGN (nohup, background jobs) */
+        struct sigaction sa;
+        if (!sig_own(sig) && sigaction(sig, 0, &sa) == 0 && sa.sa_handler == SIG_IGN) g_handler[sig] = 1;
+    }
+    sigprocmask(SIG_BLOCK, 0, &m);
+    for (sig = 1; sig < 32; sig++) if (sigismember(&m, sig)) g_sig_mask |= SIG_BIT(sig);
+    g_sig_mask &= ~SIG_NEVER;
+    sig_sync();                              /* catch the blocked ones before the host unblocks them */
+    sigemptyset(&none);
+    sigprocmask(SIG_SETMASK, &none, 0);
+}
+
+static uint32_t be32(const unsigned char *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+
+/* 1: the file is an Intel program that PowerPC cannot run (CPU types: 7 i386, 18 ppc) */
+static int exec_intel(const char *path)
+{
+    unsigned char h[4096];
+    int fd = open(path, O_RDONLY), n, ppc = 0, intel = 0;
+    uint32_t nfat, k;
+    if (fd < 0) return 0;                    /* the kernel reports the error */
+    n = (int)read(fd, h, sizeof h);
+    close(fd);
+    if (n < 8) return 0;
+    if (be32(h) == 0xcefaedfeu) return h[4] == 7 && !h[5] && !h[6] && !h[7];   /* thin, little-endian header */
+    if (be32(h) != 0xcafebabeu) return 0;
+    nfat = be32(h + 4);
+    if (nfat == 0 || nfat > (uint32_t)(n - 8) / 20) return 0;               /* also Java class files */
+    for (k = 0; k < nfat; k++) {
+        uint32_t cpu = be32(h + 8 + 20 * k);
+        if (cpu == 18) ppc = 1;
+        if (cpu == 7) intel = 1;
+    }
+    return intel && !ppc;
+}
+
+/* execve with guest argv/envp (arrays of guest pointers) and the signal mask the new program starts with; returns
+   only on failure (errno) */
+static int proc_exec(const char *path, uint32_t gargv, uint32_t genv, uint32_t mask)
+{
+    uint32_t na = 0, ne = 0, i, k = 0;
+    char **av, **ev;
+    sigset_t m, before;
+    int sig, e, intel = exec_intel(path);
+    if (intel && !g_self[0]) return EBADARCH;
+    while (gargv && ld32(gargv + 4 * na)) na++;
+    while (genv && ld32(genv + 4 * ne)) ne++;
+    av = malloc((na + 6) * sizeof *av);
+    ev = malloc((ne + 1) * sizeof *ev);
+    if (!av || !ev) { free(av); free(ev); return ENOMEM; }
+    if (intel) {
+        av[k++] = g_self;
+        av[k++] = (char *)"-0";
+        av[k++] = na ? (char *)(uintptr_t)ld32(gargv) : (char *)path;
+        av[k++] = (char *)"--";
+        av[k++] = (char *)path;
+        for (i = 1; i < na; i++) av[k++] = (char *)(uintptr_t)ld32(gargv + 4 * i);
+    } else
+        for (i = 0; i < na; i++) av[k++] = (char *)(uintptr_t)ld32(gargv + 4 * i);
+    av[k] = 0;
+    for (i = 0; i < ne; i++) ev[i] = (char *)(uintptr_t)ld32(genv + 4 * i);
+    ev[ne] = 0;
+    sigemptyset(&m);
+    for (sig = 1; sig < 32; sig++) if ((mask & SIG_BIT(sig)) && !sig_own(sig)) sigaddset(&m, sig);
+    fflush(0);
+    sigprocmask(SIG_SETMASK, &m, &before);
+    execve(intel ? g_self : path, av, ev);
+    e = errno;
+    sigprocmask(SIG_SETMASK, &before, 0);
+    free(av);
+    free(ev);
+    return e;
+}
+
+static pid_t proc_fork(Cpu *c)
+{
+    pid_t p;
+    fflush(0);
+    p = fork();
+    if (p == 0) {
+        thread_after_fork(c);
+        g_sig_pending = 0;                   /* a new process has no pending signals */
+    }
+    return p;
+}
+
+/* posix_spawn (10.5): descriptor {attr size, attr, file actions size, file actions, port actions size, port
+   actions}; attr: flags (16 bit) @0, sigdefault @4, sigmask @8, pgroup @12; file actions: count @4, actions from @8,
+   1040 bytes each: type @0, fd @4, open flags or dup2 target @8, mode (16 bit) @12, path @14. */
+#define PSA_RESETIDS 0x01
+#define PSA_SETPGROUP 0x02
+#define PSA_SETSIGDEF 0x04
+#define PSA_SETSIGMASK 0x08
+#define PSA_SETEXEC 0x40
+#define PSFA_OPEN 0
+#define PSFA_CLOSE 1
+#define PSFA_DUP2 2
+#define PSFA_SIZE 1040u
+
+/* in the new process: file actions and attributes; *report is the fd of the error pipe (moved out of the way if
+   an action would hit it); returns errno */
+static int spawn_setup(uint32_t attr, uint32_t acts, uint32_t *mask, int *report)
+{
+    uint32_t k, n = acts ? ld32(acts + 4) : 0;
+    int top = -1;
+    for (k = 0; k < n; k++) {
+        uint32_t a = acts + 8 + PSFA_SIZE * k;
+        int fd = (int)ld32(a + 4), to = ld32(a) == PSFA_DUP2 ? (int)ld32(a + 8) : fd;
+        if (fd > top) top = fd;
+        if (to > top) top = to;
+    }
+    if (report && *report >= 0 && *report <= top) {
+        int moved = fcntl(*report, F_DUPFD, top + 1);
+        if (moved >= 0) { fcntl(moved, F_SETFD, FD_CLOEXEC); close(*report); *report = moved; }
+    }
+    for (k = 0; k < n; k++) {
+        uint32_t a = acts + 8 + PSFA_SIZE * k, type = ld32(a);
+        int fd = (int)ld32(a + 4);
+        if (type == PSFA_OPEN) {
+            int t = open((const char *)(uintptr_t)(a + 14), (int)ld32(a + 8), (int)ld16(a + 12));
+            if (t < 0) return errno;
+            if (t != fd) {
+                int e = dup2(t, fd) < 0 ? errno : 0;
+                close(t);
+                if (e) return e;
+            }
+        } else if (type == PSFA_CLOSE) {
+            if (close(fd) < 0) return errno;
+        } else if (type == PSFA_DUP2) {
+            if (dup2(fd, (int)ld32(a + 8)) < 0) return errno;
+        } else return EINVAL;
+    }
+    if (attr) {
+        uint32_t fl = ld16(attr);
+        if (fl & PSA_SETSIGMASK) *mask = ld32(attr + 8) & ~SIG_NEVER;
+        if (fl & PSA_SETSIGDEF) {
+            uint32_t d = ld32(attr + 4);
+            int sig;
+            for (sig = 1; sig < 32; sig++)
+                if ((d & SIG_BIT(sig)) && !sig_own(sig)) signal(sig, SIG_DFL);
+        }
+        if ((fl & PSA_SETPGROUP) && setpgid(0, (pid_t)ld32(attr + 12)) < 0) return errno;
+        if ((fl & PSA_RESETIDS) && (setgid(getgid()) < 0 || setuid(getuid()) < 0)) return errno;
+    }
+    return 0;
+}
+
+/* posix_spawn(pid *, path, desc *, argv, envp): fork, set up the child, execve as above; a pipe with close-on-exec
+   reports a failed exec to the parent, which then returns its errno like the kernel */
+static int proc_spawn(uint32_t pidp, const char *path, uint32_t desc, uint32_t gargv, uint32_t genv)
+{
+    uint32_t attr = 0, acts = 0, mask = g_sig_mask;
+    int pfd[2], e = 0, st;
+    pid_t p;
+    ssize_t got;
+    if (desc) {
+        if (ld32(desc)) attr = ld32(desc + 4);
+        if (ld32(desc + 8)) acts = ld32(desc + 12);
+        if (ld32(desc + 16) && g_log) fprintf(stderr, "[posix_spawn] port actions ignored\n");
+    }
+    if (attr && (ld16(attr) & PSA_SETEXEC)) {   /* exec in this process */
+        e = spawn_setup(attr, acts, &mask, 0);
+        return e ? e : proc_exec(path, gargv, genv, mask);
+    }
+    if (pipe(pfd) < 0) return errno;
+    fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+    fflush(0);
+    p = fork();
+    if (p < 0) { e = errno; close(pfd[0]); close(pfd[1]); return e; }
+    if (p == 0) {                            /* child: no guest code runs here */
+        int w = pfd[1];
+        close(pfd[0]);
+        e = spawn_setup(attr, acts, &mask, &w);
+        if (!e) e = proc_exec(path, gargv, genv, mask);
+        while (write(w, &e, sizeof e) < 0 && errno == EINTR) ;
+        _exit(127);
+    }
+    close(pfd[1]);
+    do got = f_read(pfd[0], &e, sizeof e); while (got < 0 && errno == EINTR);
+    close(pfd[0]);
+    if (got == (ssize_t)sizeof e && e) {
+        f_waitpid(p, &st);
+        return e;
+    }
+    if (pidp) st32(pidp, (uint32_t)p);
+    return 0;
 }
 
 /* ---------- Intel versions of the system libraries (stage 4) ----------
@@ -721,7 +991,8 @@ static uint32_t no_nocancel(uint32_t n)
     static const uint16_t base[] = {
         SYS_read, SYS_write, SYS_open, SYS_close, SYS_wait4, SYS_recvmsg, SYS_sendmsg, SYS_recvfrom, SYS_accept,
         SYS_msync, SYS_fcntl, SYS_select, SYS_fsync, SYS_connect, SYS_sigsuspend, SYS_readv, SYS_writev, SYS_sendto,
-        SYS_pread, SYS_pwrite, SYS_waitid, SYS_poll, 0, 0, 0, 0, 0, 0
+        SYS_pread, SYS_pwrite, SYS_waitid, SYS_poll, 0, 0, 271 /* sem_wait */, 0, 330 /* __sigwait */,
+        334 /* __semwait_signal */
     };
     if (n >= 396 && n <= 423 && base[n - 396]) return base[n - 396];
     return n;
@@ -1142,9 +1413,56 @@ void sys_bsd(Cpu *c, int sysenter)
         int cmd = (int)arg(1);
         switch (cmd) {
         case F_GETPATH: HOST(fcntl((int)arg(0), cmd, PTR_ARG(2))); return;
-        case F_GETLK: case F_SETLK: case F_SETLKW:
-            set_result(c, 0, 0);              /* locks: report success */
+        case F_GETLK: case F_SETLK: case F_SETLKW: {
+            /* struct flock (i386 and PowerPC): l_start (64) @0, l_len (64) @8, l_pid @16, l_type (16) @20,
+               l_whence (16) @22; F_SETLKW waits without the thread lock */
+            struct flock l;
+            uint32_t a = arg(2);
+            int r;
+            l.l_start = (off_t)ld64(a); l.l_len = (off_t)ld64(a + 8); l.l_pid = (pid_t)ld32(a + 16);
+            l.l_type = (short)ld16(a + 20); l.l_whence = (short)ld16(a + 22);
+            r = cmd == F_SETLKW ? f_fcntl_ptr((int)arg(0), cmd, &l) : fcntl((int)arg(0), cmd, &l);
+            if (r < 0) { set_result(c, 0, errno); return; }
+            if (cmd == F_GETLK) {
+                st64(a, (uint64_t)l.l_start); st64(a + 8, (uint64_t)l.l_len); st32(a + 16, (uint32_t)l.l_pid);
+                st16(a + 20, (uint16_t)l.l_type); st16(a + 22, (uint16_t)l.l_whence);
+            }
+            set_result(c, (uint32_t)r, 0);
             return;
+        }
+        case F_PREALLOCATE: {               /* fstore_t: flags @0, posmode @4, offset @8, length @16, bytesalloc @24 */
+            fstore_t f;
+            uint32_t a = arg(2);
+            int r;
+            f.fst_flags = ld32(a); f.fst_posmode = (int)ld32(a + 4);
+            f.fst_offset = (off_t)ld64(a + 8); f.fst_length = (off_t)ld64(a + 16); f.fst_bytesalloc = 0;
+            r = f_fcntl_ptr((int)arg(0), cmd, &f);
+            if (r < 0) { set_result(c, 0, errno); return; }
+            st64(a + 24, (uint64_t)f.fst_bytesalloc);
+            set_result(c, (uint32_t)r, 0);
+            return;
+        }
+        case F_SETSIZE: {                   /* off_t * */
+            off_t s = (off_t)ld64(arg(2));
+            HOST(fcntl((int)arg(0), cmd, &s));
+            return;
+        }
+        case F_RDADVISE: {                  /* struct radvisory: offset (64) @0, count @8 */
+            struct radvisory ra;
+            ra.ra_offset = (off_t)ld64(arg(2)); ra.ra_count = (int)ld32(arg(2) + 8);
+            HOST(fcntl((int)arg(0), cmd, &ra));
+            return;
+        }
+        case F_LOG2PHYS: {                  /* struct log2phys: flags @0, contigbytes (64) @4, devoffset (64) @12 */
+            struct log2phys l;
+            int r;
+            memset(&l, 0, sizeof l);
+            r = fcntl((int)arg(0), cmd, &l);
+            if (r < 0) { set_result(c, 0, errno); return; }
+            st32(arg(2), l.l2p_flags); st64(arg(2) + 4, (uint64_t)l.l2p_contigbytes); st64(arg(2) + 12, (uint64_t)l.l2p_devoffset);
+            set_result(c, (uint32_t)r, 0);
+            return;
+        }
         default: HOST(fcntl((int)arg(0), cmd, (int)arg(2))); return;
         }
     }
@@ -1168,15 +1486,42 @@ void sys_bsd(Cpu *c, int sysenter)
             set_result(c, 0, 0);
             return;
         }
-        if (req == FIONREAD || req == FIODTYPE) {
+        if (req == TIOCSETA || req == TIOCSETAW || req == TIOCSETAF) {   /* tcsetattr: same layout as TIOCGETA */
+            struct termios t;
+            uint32_t a = arg(2);
+            t.c_iflag = ld32(a); t.c_oflag = ld32(a + 4); t.c_cflag = ld32(a + 8); t.c_lflag = ld32(a + 12);
+            memcpy(t.c_cc, (const void *)(uintptr_t)(a + 16), 20);
+            t.c_ispeed = ld32(a + 0x24); t.c_ospeed = ld32(a + 0x28);
+            HOST(f_ioctl((int)arg(0), req, &t));     /* TIOCSETAW/F wait until the output is written */
+            return;
+        }
+        if (req == TIOCSWINSZ) {
+            struct winsize w;
+            uint32_t a = arg(2);
+            w.ws_row = ld16(a); w.ws_col = ld16(a + 2); w.ws_xpixel = ld16(a + 4); w.ws_ypixel = ld16(a + 6);
+            HOST(ioctl((int)arg(0), req, &w));
+            return;
+        }
+        if (req == FIONREAD || req == FIODTYPE || req == FIOGETOWN || req == TIOCGPGRP || req == TIOCOUTQ ||
+            req == TIOCMGET || req == TIOCGETD) {  /* int out */
             int v;
             if (ioctl((int)arg(0), req, &v) < 0) { set_result(c, 0, errno); return; }
             st32(arg(2), (uint32_t)v);
             set_result(c, 0, 0);
             return;
         }
-        if (req == FIOCLEX || req == FIONCLEX) { HOST(ioctl((int)arg(0), req)); return; }
+        if (req == FIONBIO || req == FIOASYNC || req == FIOSETOWN || req == TIOCSPGRP || req == TIOCFLUSH ||
+            req == TIOCMSET || req == TIOCMBIS || req == TIOCMBIC || req == TIOCSETD) {     /* int in */
+            int v = (int)ld32(arg(2));
+            HOST(ioctl((int)arg(0), req, &v));
+            return;
+        }
+#ifdef TIOCPTYGNAME
+        if (req == TIOCPTYGNAME) { HOST(ioctl((int)arg(0), req, PTR_ARG(2))); return; }     /* char[128] */
+#endif
+        if (req == TIOCSTI) { HOST(ioctl((int)arg(0), req, PTR_ARG(2))); return; }          /* char */
         if (req == 0x80086804) { set_result(c, 0, 0); return; }     /* dtrace helper: do not register the guest DOF */
+        if ((req & IOC_DIRMASK) == IOC_VOID) { HOST(ioctl((int)arg(0), req)); return; }   /* no data: as it is */
         fprintf(stderr, "rosetta: ioctl %08lx not implemented yet\n", req);
         set_result(c, 0, ENOTTY);
         return;
@@ -1215,7 +1560,7 @@ void sys_bsd(Cpu *c, int sysenter)
         set_result(c, 0, 0);
         return;
     }
-    case SYS_sigprocmask: {
+    case SYS_sigprocmask: case 329: {       /* sigprocmask, __pthread_sigmask(how, set, old): one mask for all threads */
         uint32_t how = arg(0), fresh = arg(1), prev = arg(2), old = g_sig_mask;
         if (fresh) {
             uint32_t m = ld32(fresh);
@@ -1223,25 +1568,35 @@ void sys_bsd(Cpu *c, int sysenter)
             else if (how == SIG_SETMASK) g_sig_mask = m;
             else { set_result(c, 0, EINVAL); return; }
             g_sig_mask &= ~SIG_NEVER;
+            if (g_sig_mask != old) sig_sync();
         }
         if (prev) st32(prev, old);
         set_result(c, 0, 0);              /* pending signals that became unblocked are delivered by the dispatcher right afterwards */
         return;
     }
-    case 111: {                             /* sigsuspend(mask): wait until a signal is pending for the guest */
-        sigset_t all, before;
+    case 111:                               /* sigsuspend(mask): wait until a signal is pending for the guest */
         g_sig_after = g_sig_mask;
         g_sig_mask = arg(0) & ~SIG_NEVER;
-        if (g_threads > 1)                   /* the host delivers the signal to any thread: check instead of sleeping */
-            while (!(g_sig_pending & ~g_sig_mask)) f_short_wait();
-        else {
-            sigfillset(&all);
-            sigprocmask(SIG_BLOCK, &all, &before);     /* do not lose a signal between check and wait */
-            while (!(g_sig_pending & ~g_sig_mask)) sigsuspend(&before);
-            sigprocmask(SIG_SETMASK, &before, 0);
-        }
+        sig_sync();
+        sig_wait_for(~g_sig_mask);
         g_sig_after_valid = 1;
         set_result(c, 0, EINTR);
+        return;
+    case 52:                                /* sigpending(set): pending and blocked */
+        if (arg(0)) st32(arg(0), g_sig_pending & g_sig_mask);
+        set_result(c, 0, 0);
+        return;
+    case 330: {                             /* __sigwait(set, sig): take one of the (blocked) signals in set */
+        uint32_t want = ld32(arg(0)) & ~SIG_NEVER, got;
+        int sig;
+        if (!want) { set_result(c, 0, EINVAL); return; }
+        sig_wait_for(want | ~g_sig_mask);
+        got = g_sig_pending & want;
+        if (!got) { set_result(c, 0, EINTR); return; }  /* an unblocked signal came first: its handler runs */
+        for (sig = 1; !(got & SIG_BIT(sig)); sig++) ;
+        __sync_fetch_and_and(&g_sig_pending, ~SIG_BIT(sig));
+        if (arg(1)) st32(arg(1), (uint32_t)sig);
+        set_result(c, 0, 0);
         return;
     }
     case 184:                               /* sigreturn(uctx, sigstyle) */
@@ -1266,11 +1621,16 @@ void sys_bsd(Cpu *c, int sysenter)
         set_result(c, 0, 0);
         return;
     }
-    case 333: case 334:                     /* __semwait_signal(_nocancel)(cond, mutex, timeout, relative, sec, nsec):
-                                               usleep, nanosleep, pthread_cond_timedwait; only numbers and port names,
-                                               interruptible (EINTR for the handler). Before, 334 returned ETIMEDOUT
-                                               at once: usleep never slept */
-        HOST(f_semwait((int)n, (int)arg(0), (int)arg(1), (int)arg(2), (int)arg(3), (long)arg(4), (int)arg(5)));
+    case 334:                               /* __semwait_signal(cond, mutex, timeout, relative, sec, nsec), also the
+                                               _nocancel variant (423): usleep, nanosleep, pthread_cond_timedwait;
+                                               only numbers and port names, interruptible (EINTR for the handler) */
+        HOST(f_syscall(334, (int)arg(0), (int)arg(1), (int)arg(2), (int)arg(3), (long)arg(4), (int)arg(5)));
+        return;
+    case 332:                               /* __pthread_markcancel(thread port): guest threads are host threads, so */
+        HOST(syscall(332, arg(0)));          /* the kernel marks the right one and interrupts its waits */
+        return;
+    case 333:                               /* __pthread_canceled(action): enable/disable/test for the calling thread */
+        HOST(syscall(333, (int)arg(0)));
         return;
     case 328:                               /* __pthread_kill(thread, sig): only one thread */
         if (arg(1)) sig_schedule((int)arg(1), 0);
@@ -1281,13 +1641,17 @@ void sys_bsd(Cpu *c, int sysenter)
         set_result(c, 0, 0);
         return;
     case SYS_kill:
-        if ((pid_t)arg(0) == getpid()) {    /* to itself: mark pending (the dispatcher delivers right afterwards) */
-            if (arg(1) >= 32) { set_result(c, 0, EINVAL); return; }
-            if (arg(1)) sig_schedule((int)arg(1), 0x10001 /* SI_USER */);
+        /* Signals the translator uses itself (SIGSEGV, SIGBUS, SIGILL, ...) sent to itself are only marked pending.
+           All others go through the host: its disposition matches the guest's (handler or blocked: caught and
+           marked pending, delivered by the dispatcher right afterwards; ignored; default action), and kqueue
+           (EVFILT_SIGNAL) sees them. A group (0, < 0) also hits us via the host handler. */
+        if ((pid_t)arg(0) == getpid() && arg(1) && arg(1) < 32 && sig_own((int)arg(1)) && arg(1) != SIGKILL &&
+            arg(1) != SIGSTOP) {
+            sig_schedule((int)arg(1), 0x10001 /* SI_USER */);
             set_result(c, 0, 0);
             return;
         }
-        HOST(kill((pid_t)arg(0), (int)arg(1)));     /* a group (0, <0) also hits us via the host handler */
+        HOST(kill((pid_t)arg(0), (int)arg(1)));
         return;
     case 294:                               /* shared_region_check_np: no shared i386 region */
         set_result(c, 0, EINVAL);
@@ -1347,6 +1711,235 @@ void sys_bsd(Cpu *c, int sysenter)
         if (r < 0) { set_result(c, 0, errno); return; }
         for (i = 0; i < r && arg(0); i++) st32(arg(1) + 4 * (uint32_t)i, g[i]);
         set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    /* ---------- processes ---------- */
+    case SYS_fork: case 66: {               /* fork, vfork */
+        pid_t p = proc_fork(c);
+        if (p < 0) { set_result(c, 0, errno); return; }
+        c->r[EDX] = p == 0;
+        set_result(c, p == 0 ? (uint32_t)getpid() : (uint32_t)p, 0);
+        return;
+    }
+    case 59:                                /* execve(path, argv, envp): returns only on failure */
+        set_result(c, 0, proc_exec((const char *)PTR_ARG(0), arg(1), arg(2), g_sig_mask));
+        return;
+    case 244:                               /* posix_spawn(pid *, path, desc *, argv, envp) */
+        set_result(c, 0, proc_spawn(arg(0), (const char *)PTR_ARG(1), arg(2), arg(3), arg(4)));
+        return;
+    case SYS_waitid: {                      /* waitid(idtype, id, siginfo *, options): siginfo 64 bytes */
+        siginfo_t si;
+        long r;
+        memset(&si, 0, sizeof si);
+        r = f_syscall(SYS_waitid, (int)arg(0), (int)arg(1), (int)(uintptr_t)&si, (int)arg(3), 0, 0);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        if (arg(2)) {
+            uint32_t a = arg(2);
+            memset((void *)(uintptr_t)a, 0, 64);
+            st32(a, (uint32_t)si.si_signo); st32(a + 4, (uint32_t)si.si_errno); st32(a + 8, (uint32_t)si.si_code);
+            st32(a + 12, (uint32_t)si.si_pid); st32(a + 16, (uint32_t)si.si_uid); st32(a + 20, (uint32_t)si.si_status);
+            st32(a + 24, (uint32_t)(uintptr_t)si.si_addr); st32(a + 28, (uint32_t)si.si_value.sival_int);
+            st32(a + 32, (uint32_t)si.si_band);
+        }
+        set_result(c, 0, 0);
+        return;
+    }
+    case SYS_setsid: HOST(setsid()); return;
+    case SYS_setpgid: HOST(setpgid((pid_t)arg(0), (pid_t)arg(1))); return;
+    case SYS_getpgid: HOST(getpgid((pid_t)arg(0))); return;
+    case 310: HOST(getsid((pid_t)arg(0))); return;
+    case SYS_setuid: HOST(setuid((uid_t)arg(0))); return;
+    case SYS_setgid: HOST(setgid((gid_t)arg(0))); return;
+    case SYS_seteuid: HOST(seteuid((uid_t)arg(0))); return;
+    case SYS_setegid: HOST(setegid((gid_t)arg(0))); return;
+    case SYS_setreuid: HOST(setreuid((uid_t)arg(0), (uid_t)arg(1))); return;
+    case SYS_setregid: HOST(setregid((gid_t)arg(0), (gid_t)arg(1))); return;
+    case SYS_setgroups: {
+        gid_t g[64];
+        uint32_t k, cnt = arg(0);
+        if (cnt > 64) { set_result(c, 0, EINVAL); return; }
+        for (k = 0; k < cnt; k++) g[k] = ld32(arg(1) + 4 * k);
+        HOST(setgroups((int)cnt, g));
+        return;
+    }
+    case SYS_setlogin: HOST(setlogin((const char *)PTR_ARG(0))); return;
+    case 286: {                             /* gettid(uid *, gid *): identity of this thread */
+        uid_t u;
+        gid_t g;
+        if (syscall(286, &u, &g) < 0) { set_result(c, 0, errno); return; }
+        st32(arg(0), u); st32(arg(1), g);
+        set_result(c, 0, 0);
+        return;
+    }
+    case 285: HOST(syscall(285, arg(0), arg(1))); return;      /* settid(uid, gid) */
+    case SYS_getpriority: {                 /* -1 is a valid priority */
+        int r;
+        errno = 0;
+        r = getpriority((int)arg(0), (id_t)arg(1));
+        if (r == -1 && errno) set_result(c, 0, errno); else set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case SYS_setpriority: HOST(setpriority((int)arg(0), (id_t)arg(1), (int)arg(2))); return;
+    case 322: {                             /* iopolicysys(cmd, {scope, iotype, policy}) */
+        int p[3], k;
+        uint32_t a = arg(1);
+        for (k = 0; k < 3; k++) p[k] = (int)ld32(a + 4 * (uint32_t)k);
+        if (syscall(322, (int)arg(0), p) < 0) { set_result(c, 0, errno); return; }
+        for (k = 0; k < 3; k++) st32(a + 4 * (uint32_t)k, (uint32_t)p[k]);
+        set_result(c, 0, 0);
+        return;
+    }
+    case SYS_ptrace:                        /* PT_DENY_ATTACH (anti-debugging): accepted; tracing: not possible */
+        set_result(c, 0, arg(0) == 31 ? 0 : EPERM);
+        return;
+    case 169:                               /* csops(pid, ops, addr, size): status words in guest byte order */
+        if (arg(3) == 4) {
+            uint32_t v = 0;
+            if (syscall(169, (int)arg(0), (int)arg(1), &v, 4) < 0) { set_result(c, 0, errno); return; }
+            st32(arg(2), v);
+            set_result(c, 0, 0);
+            return;
+        }
+        HOST(syscall(169, (int)arg(0), (int)arg(1), PTR_ARG(2), arg(3)));
+        return;
+    case 180: set_result(c, 0, 0); return;  /* kdebug_trace */
+    case 44: set_result(c, 0, 0); return;   /* profil: no kernel profiling of translated code */
+    /* ---------- files ---------- */
+    case SYS_chown: HOST(chown((const char *)PTR_ARG(0), (uid_t)arg(1), (gid_t)arg(2))); return;
+    case SYS_fchown: HOST(fchown((int)arg(0), (uid_t)arg(1), (gid_t)arg(2))); return;
+    case 364: HOST(lchown((const char *)PTR_ARG(0), (uid_t)arg(1), (gid_t)arg(2))); return;
+    case SYS_chflags: HOST(chflags((const char *)PTR_ARG(0), arg(1))); return;
+    case SYS_fchflags: HOST(fchflags((int)arg(0), arg(1))); return;
+    case SYS_truncate: HOST(truncate((const char *)PTR_ARG(0), (off_t)arg64(1))); return;
+    case SYS_mknod: HOST(mknod((const char *)PTR_ARG(0), (mode_t)arg(1), (dev_t)arg(2))); return;
+    case SYS_mkfifo: HOST(mkfifo((const char *)PTR_ARG(0), (mode_t)arg(1))); return;
+    case SYS_revoke: HOST(revoke((const char *)PTR_ARG(0))); return;
+    case SYS_chroot: HOST(chroot((const char *)PTR_ARG(0))); return;
+    case SYS_sync: sync(); set_result(c, 0, 0); return;
+    case 223: HOST(syscall(223, PTR_ARG(0), PTR_ARG(1), arg(2))); return;      /* exchangedata(path, path, options) */
+    case 227: HOST(syscall(227, PTR_ARG(0), PTR_ARG(1), arg(2), arg(3))); return;   /* copyfile(from, to, mode, flags) */
+    case SYS_futimes: {
+        struct timeval t[2];
+        if (!arg(1)) { HOST(futimes((int)arg(0), 0)); return; }
+        ts_read(arg(1), &t[0]); ts_read(arg(1) + 8, &t[1]);
+        HOST(futimes((int)arg(0), t));
+        return;
+    }
+    case 221: {                             /* setattrlist(path, list, buffer, size, options) */
+        struct attrlist l;
+        uint32_t size = arg(3);
+        uint8_t *b = malloc(size ? size : 4);
+        int r, e;
+        if (!b) { set_result(c, 0, ENOMEM); return; }
+        attrlist_read(arg(1), &l);
+        memcpy(b, PTR_ARG(2), size);
+        attr_swap_fields((uint32_t)(uintptr_t)b, 0, size, &l, "setattrlist");
+        r = setattrlist((const char *)PTR_ARG(0), &l, b, size, (unsigned)arg(4));
+        e = errno;
+        free(b);
+        set_result(c, 0, r < 0 ? e : 0);
+        return;
+    }
+    case 348: HOST(syscall(348, PTR_ARG(0))); return;          /* __pthread_chdir: per thread, guest threads are host threads */
+    case 349: HOST(syscall(349, (int)arg(0))); return;         /* __pthread_fchdir */
+    case 337: {                             /* sendfile(fd, socket, offset (64), off_t *len, sf_hdtr *, flags) */
+        off_t len = arg(4) ? (off_t)ld64(arg(4)) : 0;
+        struct sf_hdtr h;
+        struct iovec hv[16], tv[16];
+        uint32_t ha = arg(5), k;
+        int r, e;
+        if (ha) {
+            h.hdr_cnt = (int)ld32(ha + 4); h.trl_cnt = (int)ld32(ha + 12);
+            if ((uint32_t)h.hdr_cnt > 16 || (uint32_t)h.trl_cnt > 16) { set_result(c, 0, EINVAL); return; }
+            for (k = 0; k < (uint32_t)h.hdr_cnt; k++) {
+                hv[k].iov_base = (void *)(uintptr_t)ld32(ld32(ha) + 8 * k); hv[k].iov_len = ld32(ld32(ha) + 8 * k + 4);
+            }
+            for (k = 0; k < (uint32_t)h.trl_cnt; k++) {
+                tv[k].iov_base = (void *)(uintptr_t)ld32(ld32(ha + 8) + 8 * k); tv[k].iov_len = ld32(ld32(ha + 8) + 8 * k + 4);
+            }
+            h.headers = h.hdr_cnt ? hv : 0;
+            h.trailers = h.trl_cnt ? tv : 0;
+        }
+        r = f_sendfile((int)arg(0), (int)arg(1), (off_t)arg64(2), &len, ha ? &h : 0, (int)arg(6));
+        e = errno;
+        if (arg(4)) st64(arg(4), (uint64_t)len);    /* also after a partial transfer (EAGAIN, EINTR) */
+        set_result(c, 0, r < 0 ? e : 0);
+        return;
+    }
+    /* *_extended: like the plain calls; ACLs (filesec) are not passed on */
+    case 277: {                             /* open_extended(path, flags, uid, gid, mode, filesec) */
+        int r = open(gpath(arg(0)), (int)arg(1), (int)arg(4));
+        if (r >= 0) jit_fd_off(r);
+        HOST(r);
+        return;
+    }
+    case 278: set_result(c, umask((mode_t)arg(0)), 0); return;                /* umask_extended(mask, filesec) */
+    case 279: case 280: case 281: {         /* stat_extended, lstat_extended, fstat_extended(x, stat *, filesec, size *) */
+        struct stat s;
+        int r = n == 279 ? stat(gpath(arg(0)), &s) : n == 280 ? lstat(gpath(arg(0)), &s) : fstat((int)arg(0), &s);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        stat_write(arg(1), &s);
+        if (arg(3)) st32(arg(3), 0);        /* no ACL reported */
+        set_result(c, 0, 0);
+        return;
+    }
+    case 282: case 283: {                   /* chmod_extended(path, uid, gid, mode, filesec), fchmod_extended(fd, ...) */
+        uint32_t uid = arg(1), gid = arg(2), mode = arg(3);
+        int r = 0;
+        if (mode != 0xffffffffu) r = n == 282 ? chmod((const char *)PTR_ARG(0), (mode_t)mode) : fchmod((int)arg(0), (mode_t)mode);
+        if (r == 0 && (uid != KAUTH_ID_NONE || gid != KAUTH_ID_NONE)) {
+            uid_t u = uid == KAUTH_ID_NONE ? (uid_t)-1 : uid;
+            gid_t g = gid == KAUTH_ID_NONE ? (gid_t)-1 : gid;
+            r = n == 282 ? chown((const char *)PTR_ARG(0), u, g) : fchown((int)arg(0), u, g);
+        }
+        HOST(r);
+        return;
+    }
+    case 291: HOST(mkfifo((const char *)PTR_ARG(0), (mode_t)arg(3))); return;    /* mkfifo_extended */
+    case 292: HOST(mkdir((const char *)PTR_ARG(0), (mode_t)arg(3))); return;     /* mkdir_extended */
+    /* ---------- memory ---------- */
+    case SYS_mlock: HOST(mlock(PTR_ARG(0), arg(1))); return;
+    case SYS_munlock: HOST(munlock(PTR_ARG(0), arg(1))); return;
+    case 324: HOST(mlockall((int)arg(0))); return;
+    case 325: HOST(munlockall()); return;
+    case SYS_minherit: HOST(minherit(PTR_ARG(0), arg(1), (int)arg(2))); return;
+    case SYS_mincore: HOST(mincore(PTR_ARG(0), arg(1), PTR_ARG(2))); return;
+    /* ---------- POSIX semaphores and shared memory: handles are plain numbers ---------- */
+    case 267: HOST(syscall(267, PTR_ARG(0))); return;          /* shm_unlink(name) */
+    case 268: HOST(syscall(268, PTR_ARG(0), (int)arg(1), (int)arg(2), (int)arg(3))); return;    /* sem_open */
+    case 269: HOST(syscall(269, (int)arg(0))); return;         /* sem_close */
+    case 270: HOST(syscall(270, PTR_ARG(0))); return;          /* sem_unlink */
+    case 271: HOST(f_syscall(271, (int)arg(0), 0, 0, 0, 0, 0)); return;   /* sem_wait (also _nocancel) */
+    case 272: HOST(syscall(272, (int)arg(0))); return;         /* sem_trywait */
+    case 273: HOST(syscall(273, (int)arg(0))); return;         /* sem_post */
+    case 274: case 275: case 276: set_result(c, 0, ENOSYS); return;   /* sem_getvalue, sem_init, sem_destroy: none in xnu */
+    /* ---------- kqueue ---------- */
+    case 362: HOST(kqueue()); return;
+    case 363: {                             /* kevent(kq, changes, n, events, n, timeout); struct kevent: ident @0,
+                                               filter (16) @4, flags (16) @6, fflags @8, data @12, udata @16 */
+        int nch = (int)arg(2), nev = (int)arg(4), r, e, k;
+        uint32_t ga = arg(1), gb = arg(3);
+        struct kevent chs[16], evs[16], *ch = chs, *ev = evs;
+        struct timespec ts;
+        if (nch < 0 || nev < 0 || nch > 65536 || nev > 65536) { set_result(c, 0, EINVAL); return; }
+        if (nch > 16 && !(ch = malloc((size_t)nch * sizeof *ch))) { set_result(c, 0, ENOMEM); return; }
+        if (nev > 16 && !(ev = malloc((size_t)nev * sizeof *ev))) { if (ch != chs) free(ch); set_result(c, 0, ENOMEM); return; }
+        for (k = 0; k < nch; k++) {
+            uint32_t a = ga + 20 * (uint32_t)k;
+            ch[k].ident = ld32(a); ch[k].filter = (int16_t)ld16(a + 4); ch[k].flags = ld16(a + 6);
+            ch[k].fflags = ld32(a + 8); ch[k].data = (intptr_t)(int32_t)ld32(a + 12); ch[k].udata = (void *)(uintptr_t)ld32(a + 16);
+        }
+        if (arg(5)) { ts.tv_sec = (time_t)(int32_t)ld32(arg(5)); ts.tv_nsec = (long)(int32_t)ld32(arg(5) + 4); }
+        r = f_kevent((int)arg(0), ch, nch, ev, nev, arg(5) ? &ts : 0);
+        e = errno;
+        for (k = 0; k < r; k++) {
+            uint32_t a = gb + 20 * (uint32_t)k;
+            st32(a, (uint32_t)ev[k].ident); st16(a + 4, (uint16_t)ev[k].filter); st16(a + 6, ev[k].flags);
+            st32(a + 8, ev[k].fflags); st32(a + 12, (uint32_t)ev[k].data); st32(a + 16, (uint32_t)(uintptr_t)ev[k].udata);
+        }
+        if (ch != chs) free(ch);
+        if (ev != evs) free(ev);
+        set_result(c, (uint32_t)(r < 0 ? 0 : r), r < 0 ? e : 0);
         return;
     }
     default: {

@@ -10,6 +10,10 @@ void sys_machine(Cpu *c);              /* int $0x82 */
 void sys_sysenter(Cpu *c);              /* sysenter: arguments from ecx+4, return to edx */
 void sys_stats(void);                /* ROSETTA_STATS: time per system call */
 
+/* at startup, before the guest runs: own path (for execve of Intel programs), signal state inherited from the
+   parent (blocked signals become the guest mask, ignored ones stay ignored) */
+void sys_init(void);
+
 /* signals to the guest: pending (from the host handler or kill to itself) and mask of the guest; the dispatcher
    calls sig_deliver when (g_sig_pending & ~g_sig_mask) != 0 */
 extern volatile uint32_t g_sig_pending;

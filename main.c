@@ -1,7 +1,8 @@
 /* main.c - rosetta: run Intel programs (i386) on PowerPC.
  *
- *   rosetta [-s] program [arguments ...]
- *     -s   trace: every executed instruction to stderr
+ *   rosetta [-s] [-0 name] program [arguments ...]
+ *     -s       trace: every executed instruction to stderr
+ *     -0 name  argv[0] of the program (execve of an Intel program passes the caller's argv[0] this way)
  *
  * Stack as with the kernel: (for dyld first the address of the Mach header), argc, argv..., 0, envp..., 0,
  * apple (program path), 0, then the strings.
@@ -322,16 +323,21 @@ static void profile_sigterm(int sig)
 
 int main(int argc, char **argv)
 {
-    const char *profil = getenv("ROSETTA_HPROFILE");
+    const char *profil = getenv("ROSETTA_HPROFILE"), *name = 0, *path;
     Image prog, dyld;
     int i = 1, r;
     while (i < argc && argv[i][0] == '-') {
         if (!strcmp(argv[i], "-s")) g_lane = 1;
+        else if (!strcmp(argv[i], "-0") && i + 1 < argc) name = argv[++i];
+        else if (!strcmp(argv[i], "--")) { i++; break; }
         else { fprintf(stderr, "rosetta: unknown option %s\n", argv[i]); return 2; }
         i++;
     }
-    if (i >= argc) { fprintf(stderr, "usage: rosetta [-s] program [arguments ...]\n"); return 2; }
+    if (i >= argc) { fprintf(stderr, "usage: rosetta [-s] [-0 name] program [arguments ...]\n"); return 2; }
+    path = argv[i];
+    if (name) argv[i] = (char *)name;        /* argv[0] of the guest; the file is still loaded from path */
     g_log = getenv("ROSETTA_LOG") != 0;
+    sys_init();
     {
         struct sigaction sa;
         memset(&sa, 0, sizeof sa);
@@ -342,26 +348,26 @@ int main(int argc, char **argv)
         sigaction(SIGILL, &sa, 0);
     }
     g_error_start = getenv("ROSETTA_STATS") ? jit_pagefault() : 0;
-    g_prog_path = argv[i];
+    g_prog_path = path;
     if (commpage_create()) return 1;
-    if (macho_load(argv[i], 0, &prog)) return 1;
+    if (macho_load(path, 0, &prog)) return 1;
     memset(&cpu, 0, sizeof cpu);
     flags_set(&cpu, F_IF);
     cpu.fpu_ctl = 0x037f;
     cpu.mxcsr = 0x1f80;
     if (prog.has_dyld) {
         if (macho_load(prog.dyld, DYLD_TARGET - 0x8fe00000u, &dyld)) return 1;
-        cpu.r[ESP] = stack_build(argc - i, argv + i, argv[i], prog.mh, 1);
+        cpu.r[ESP] = stack_build(argc - i, argv + i, path, prog.mh, 1);
         cpu.eip = dyld.entrypoint;
     } else {
-        cpu.r[ESP] = stack_build(argc - i, argv + i, argv[i], prog.mh, 0);
+        cpu.r[ESP] = stack_build(argc - i, argv + i, path, prog.mh, 0);
         cpu.eip = prog.entrypoint;
     }
     g_only_interp = getenv("ROSETTA_INTERP") != 0;
     g_profile = profil;
     g_error_load = getenv("ROSETTA_STATS") ? jit_pagefault() : 0;
     if (profil) { profile_start(); signal(SIGTERM, profile_sigterm); }
-    if (!g_only_interp) jit_prog(argv[i]);
+    if (!g_only_interp) jit_prog(path);
     thread_start(&cpu, g_only_interp);
     gettimeofday(&g_t0, 0);
     r = g_only_interp ? run(&cpu) : jit_run(&cpu);
