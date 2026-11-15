@@ -47,16 +47,24 @@ Startup time, translated against native, fastest of 7 runs with the translation 
 
 ## What runs
 
-- Command-line programs: the i386 parts of the universal binaries in Mac OS X (`ls`, `cat`, `wc`, `sort`, `grep`,
-  `awk`, `sed`, `find`, `bc`) produce byte-identical output to the native PowerPC versions. Intel `perl` runs with
-  libperl from the update.
-- C programs with libSystem, libm, pthreads, signals, sockets, `select`/`poll`.
+- Command-line programs: the i386 parts of the universal binaries in Mac OS X. `tests/cli_matrix.sh` runs every one
+  of them in `/bin` and `/usr/bin` plus about 120 real workloads (text tools, archives, compression, Perl, Python,
+  Ruby, Tcl, sqlite, openssl, plists) translated and natively and compares the output byte for byte; see
+  [Tests](#tests) for the current result.
+- C programs with libSystem, libm, pthreads, signals (handlers, masks, `sigwait`, exceptions such as division by zero
+  delivered to the program's handler), sockets, `select`/`poll`/`kqueue`, file locks, POSIX semaphores, terminals.
+- Processes: `fork`, `vfork`, `execve`, `posix_spawn`, `system`, `popen`. A program that runs on PowerPC is started
+  natively; an Intel-only program runs through rosetta again, with its own `argv[0]`, signal mask and ignored signals.
 - CoreFoundation, Objective-C and Foundation, taken from Apple's Intel frameworks (see below), including
   `NSThread` and `NSOperationQueue`.
-- Cocoa programs with windows, events and text: Calculator.app (Intel build from the 10.5.8 update) and Transmission
-  2.42. Text rendering goes through the system's PowerPC font server; font metrics, glyph outlines and paths are
-  identical to a native build (`tests/fonts.c`).
+- Cocoa programs with windows, events and text: Calculator.app (Intel build from the 10.5.8 update, computing with the
+  system's own engine) and Transmission 2.42. Text rendering goes through the system's PowerPC font server; font
+  metrics, glyph outlines and paths are identical to a native build (`tests/fonts.c`).
 - x87, SSE and SSE2 (scalar and packed double), including Apple's Intel vDSP/vForce code.
+
+Intel programs see an Intel Mac: CPUID, the commpage, `hw.cputype`, `hw.optional.*` and `host_info` describe an
+Intel Core Duo with SSE3, `arch` prints `i386`, `uname -m` prints `i386`. Programs that check the processor
+therefore take their Intel code paths, as on Apple's Rosetta, which showed PowerPC programs a PowerPC.
 
 ![Calculator.app, Intel build from the 10.5.8 update, translated](docs/calculator.png)
 
@@ -67,13 +75,18 @@ Startup time, translated against native, fastest of 7 runs with the translation 
   AltiVec for byte swapping and packed bitwise operations, native stubs for frequent libSystem string and math
   functions).
 - Translated code is stored in a translation cache under `~/Library/Caches/rosetta` and mapped back in on the next
-  start of the same program.
+  start of the same program. Besides at the end, it is written after 6 and 45 seconds of run time, so programs that
+  are closed by a signal or at logout keep their translations too.
 - System calls (BSD and Mach traps) are converted between the byte orders. Mach messages are converted header by
   header; MIG messages are converted by MIG itself (NDR record). Messages to the font server (ATS) are converted
   field by field from a layout table.
 - The i386 dyld, libSystem and frameworks run translated. They talk to the native PowerPC services: WindowServer,
   ATSServer, securityd, launchd, syslogd.
 - Threads run one at a time under a global lock; a watchdog thread interrupts long loops for signal delivery.
+- System structures that differ in byte order are converted where the guest reads them: `sysctl` results
+  (`kinfo_proc`, routing messages for `getifaddrs`, load average, swap usage), `kevent`, `flock`, `termios`,
+  `/var/run/utmpx`. Intel frameworks that treat the missing EFI device tree node as fatal get the device tree root
+  instead (AppKit otherwise hangs when a program starts its first `NSThread`).
 
 [DESIGN.md](DESIGN.md) describes the design, the measurements behind each decision and the problems found on the way.
 
@@ -179,9 +192,14 @@ error code.
 | `ROSETTA_THRESHOLD=N` | number of executions before a block is translated |
 | `ROSETTA_NO_CACHE=1` | do not read or write the translation cache |
 | `ROSETTA_CACHE_SHOW=1` | report why a cached translation is used or rejected (`=2`: every new block) |
+| `ROSETTA_NO_CHECKPOINT=1` | write the translation cache only at the end |
+| `ROSETTA_HOST_CPU=1` | show the guest the real PowerPC processor instead of the Intel one |
 | `ROSETTA_STATS=1` | translator counters and times at exit |
-| `ROSETTA_LOG=1` | log of system calls and Mach traps |
+| `ROSETTA_LOG=1` | log of system calls and Mach traps (`=2`: with time and thread) |
 | `ROSETTA_ATS_LOG=1` | every message to the font server, in the server's byte order |
+| `ROSETTA_HPROFILE=FILE` | sampling profile of the translator and the guest (`ROSETTA_HPROFILE_CPU=1`: processor time) |
+| `ROSETTA_STATE=1` | `kill -USR2` prints where every guest thread is (for programs that hang) |
+| `ROSETTA_CRASH_STDERR=1` | crash details on stderr instead of `~/Library/Logs/rosetta/PROGRAM-PID.txt` |
 | `ROSETTA_HALT=ADDR,...` | interpreter only; show registers and stack at these guest addresses |
 
 `ROSETTA_NO_*` switches turn off single optimizations; they are listed at the top of `jit.c`.
@@ -189,24 +207,35 @@ error code.
 ## Tests
 
 ```
-tests/run_tests.sh      # 33 comparisons against native builds, real Intel output or the interpreter
+tests/run_tests.sh      # 39 comparisons against native builds, real Intel output or the interpreter
 tests/measure_all.sh    # the benchmark loads above
+tests/cli_matrix.sh     # every universal command line program of the system, translated against native
 ```
 
 `run_tests.sh` compares each test program translated against the same source built for PowerPC (or against the
-interpreter, or against output recorded on an Intel Mac). The font test runs only when a login session exists.
+interpreter, or against output recorded on an Intel Mac). `tests/syscalls.c` alone covers processes, `kqueue`, file
+locks, semaphores, blocked signals, terminals and the converted `sysctl` structures. The font test runs only when a
+login session exists.
+
+`cli_matrix.sh` runs each command natively, translated, and natively again (output that changes between the native
+runs, such as a clock, is set aside) in an empty working directory, without arguments and with input from
+`/dev/null`; programs that could send mail, print, change settings or start services are never run.
 
 ## Limitations
 
 - i386 only; x86_64 code is not supported.
-- Synchronous faults of the guest (SIGSEGV, SIGBUS, SIGILL, SIGFPE) are not yet passed to the guest's signal handlers.
+- Memory faults (SIGSEGV, SIGBUS) are not passed to the guest's signal handlers; the program ends with the signal, as
+  without a handler. Division errors, `ud2` and `int3` do reach the handlers.
 - Threads do not run in parallel (global lock). The test machine has one CPU core.
 - Multiprocessor Macs (dual G4, dual and quad G5) are untested. The handshake between the watchdog thread and
   running translated code assumes a single CPU and uses no memory barriers; rare crashes or hangs are possible there.
-- `kqueue` is missing; libevent falls back to `poll`/`select`.
 - Accessibility (System Events, assistive devices) does not see the windows of translated programs.
-- Frameworks that the 10.5.8 update does not contain as i386 (QuickTime, QTKit, CoreVideo, the Calculate engine of
-  Calculator ...) are stubs; features that need them do not work. Calculator shows its window but does not compute.
+- Frameworks that the 10.5.8 update does not contain as i386 (QuickTime, QTKit, CoreVideo, Tcl, OpenDirectory ...)
+  are stubs; features that need them do not work. Calculator's engine is the exception: it runs as the native
+  PowerPC function.
+- Programs with windows start slowly: on the iBook G4, Calculator shows its window after 8 to 10 seconds (the native
+  PowerPC Calculator after 2 to 3), Transmission after 15 to 17 seconds. About a quarter of the processor time at
+  startup goes to translating and interpreting code that runs only a few times.
 - Font server: the reply to a file-reference request (FSRef) is not converted yet; a few rarely used message types
   are passed through unconverted and reported once.
 

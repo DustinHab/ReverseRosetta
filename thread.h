@@ -7,6 +7,7 @@
 extern int g_threads;                    /* running guest threads (1: no lock needed) */
 extern volatile int g_thread_waiting;    /* threads waiting for the lock */
 extern Cpu *g_thread_cur;                /* Cpu of the thread that holds the lock */
+extern Cpu *g_main_cpu;                  /* Cpu of the guest's main thread */
 
 void thread_start(Cpu *main_cpu, int only_interp);  /* the main thread holds the lock from the start */
 
@@ -34,6 +35,11 @@ int thread_wq_ops(Cpu *c, uint32_t kind, uint32_t ent, uint32_t prio);
 void thread_watchdog_start(void);
 int thread_watchdog_stop(void);          /* before execve; returns whether it was running */
 
+/* translation cache checkpoint at the first idle moment (jit.c sets the function, mach_msg.c the flag): the
+   watchdog runs it holding the thread lock while every guest thread waits */
+extern volatile int g_checkpoint_idle;
+extern void (*g_checkpoint_fn)(void);
+
 /* fork child: reset the lock and thread bookkeeping (only the calling thread survives); watchdog_again: start the
    watchdog again if it was running (not for a child that only execs) */
 void thread_after_fork(Cpu *c, int watchdog_again);
@@ -44,5 +50,7 @@ void thread_stats(void);
 /* main.c: end of the guest process (exit from a secondary thread): profile, translation cache, statistics, exit */
 void main_end(Cpu *c, int r);
 void main_profile_save(void);     /* ROSETTA_HPROFILE: before an end by signal */
+void main_crash_begin(void);      /* crash report: stderr into ~/Library/Logs/rosetta/PROGRAM-PID.txt ... */
+void main_crash_end(const char *what);  /* ... back, one line with the path */
 
 #endif

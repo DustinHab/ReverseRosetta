@@ -258,7 +258,8 @@ the host.
 Limit: a loop in translated code that neither makes a system call nor leaves the block does not pass the dispatcher -
 a signal then waits until it does. A fix without cost in hot code would be to redirect all chainings and backward
 jumps to exits in the host handler (needs a list of all patch sites).
-Synchronous faults (SIGSEGV/SIGBUS/SIGILL/SIGFPE in the guest) are not yet delivered to guest handlers.
+Synchronous faults (SIGSEGV/SIGBUS/SIGILL/SIGFPE in the guest) are not yet delivered to guest handlers (division
+errors, ud2 and int3 are since 2026-11-15, see "Robustness").
 
 **Stage 4: Intel frameworks** (from 2026-11-14, late morning). Source: Apple's Combo Update 10.5.8
 (support.apple.com/106460, updates.cdn-apple.com, 797 MB; package signed by "Software Update, Apple Inc." via Apple
@@ -704,4 +705,54 @@ Window, toolbar, status bars and welcome dialog draw completely. Operation: `tes
 output in /tmp/app_NAME.log), `app_stop.sh NAME`, `app_windows.sh NAME`. For the screenshot:
 `tests/proof_terminal.sh` opens a Terminal window with version, `file`, hardware, `machine` and the rosetta process
 (`proof_show.sh`), `capture_rect.sh` captures each window separately. Limits: accessibility (System Events) sees no
-windows of a program under rosetta; kqueue (362) is missing, libevent falls back to poll/select.
+windows of a program under rosetta; kqueue (362) is missing, libevent falls back to poll/select (kqueue since
+2026-11-15; it uncovered the AppKit EFI hang described under "Robustness").
+
+**Robustness** (2026-11-15, night). Starting point: of the 338 BSD calls of Leopard, 121 were handled. Now:
+- Processes. `fork`/`vfork` fork the host (its libc prepares malloc); the child resets the thread lock and the
+  watchdog (`thread_after_fork`). i386 convention: edx = 1 and eax = own pid in the child, edx = 0 and eax = child pid
+  in the parent. `execve` reads the file: PowerPC-capable (thin ppc, fat with ppc, scripts, anything else) goes to the
+  kernel; Intel-only (thin i386, fat without ppc) is started through rosetta again (`-0 argv0 -- path ...`). The
+  host signal mask becomes the guest mask before the exec, so the new program inherits it as natively; `sys_init`
+  turns it back into a guest mask and takes over ignored signals. `posix_spawn` (10.5 descriptor: attr flags at 0,
+  sigdefault 4, sigmask 8, pgroup 12; file actions of 1040 bytes: type, fd, oflag/newfd, mode, path at 14) forks, runs
+  the file actions, reports a failed exec through a close-on-exec pipe.
+- The Leopard kernel refuses `execve` with ENOTSUP while the process has a second thread. As soon as a program had a
+  signal handler, rosetta's watchdog thread was that thread (the gcc driver failed to start cc1). The watchdog now
+  waits on a condition variable instead of usleep and is stopped (joined) before every exec.
+- Signals. The guest mask exists only in rosetta; a SIG_DFL signal the guest blocked used to kill the process at once.
+  `sig_sync` installs the catcher for exactly those signals; the default action happens when the guest unblocks
+  them. `sigpending`, `__sigwait`, `__pthread_sigmask`. Waits with several threads use a wake-up pipe (written by the
+  host handler) instead of polling every millisecond; its descriptors live high and are protected from the guest's
+  `close`/`dup2`. Exceptions found by the interpreter (division error, ud2, int3, hlt) reach the guest handler
+  (`RUN_SIGNAL`: eip stays at the instruction, the dispatcher builds the frame); without a handler rosetta ends with
+  the signal itself, as do memory faults.
+- `kqueue`/`kevent` (struct kevent is 20 bytes on both sides, converted field by field), real `fcntl` locks (struct
+  flock), F_PREALLOCATE, F_RDADVISE, F_LOG2PHYS, tcsetattr, POSIX semaphores, chown/chflags/truncate/mkfifo/futimes,
+  setattrlist (the getattrlist field table: swapping is the same in both directions), sendfile, the `*_extended`
+  calls, `map_fd`, csops, iopolicysys. `__pthread_canceled` (333) had been handled as `__semwait_signal`.
+- sysctl structures: kinfo_proc (492 bytes; the own process reports the guest's name and arguments, also through
+  KERN_PROCARGS2), routing messages (NET_RT_IFLIST for getifaddrs: if_msghdr, ifa_msghdr, rt_msghdr, sockaddr_dl
+  index, sin6_scope_id), loadavg, xsw_usage, clockinfo. A size query (no buffer) passed no length pointer to the
+  kernel: the guest got its own (often uninitialized) value back; getifaddrs crashed in mailq and showmount.
+- The processor. CPUID and the commpage already described a Core Duo; hw.cputype/cpusubtype/cpufamily, hw.optional.*,
+  machdep.cpu.* (fake OIDs for sysctlbyname) and host_info(HOST_BASIC_INFO) now agree. full2tt6e had refused to run on
+  an "unsupported architecture"; `arch` prints i386 as on an Intel Mac.
+- `IODeviceTree:/efi`. AppKit, in `[NSApplication _taskNowMultiThreaded:]` (when the first NSThread starts), looks up
+  this node with io_registry_entry_from_path and, if it is missing, waits forever on a freshly initialized local
+  condition. Transmission hit it as soon as kqueue worked (UKKQueue starts an NSThread) and hung for minutes. The
+  request is now answered with the device tree root (path rewritten, MIG size and count adjusted).
+- Intel root redirection only for dyld when the system file has an i386 part itself: `file`, `nm`, `lipo` and copy
+  programs saw thin copies instead of the real universal files. Writes never go to the root.
+- Calculator: CalculatePerformExpression (private Calculate.framework, i386 only as a stub library) runs as the native
+  PowerPC function; native replacements now also cover named frameworks besides libSystem (`g_native_libs`).
+- `tests/cli_matrix.sh`: every universal program of /bin and /usr/bin without arguments plus ~120 workloads, native
+  before and after, translated in between. Pitfalls in the harness itself: `grep -v` adds a final newline, the
+  shell's `echo` interprets `\n`, a shell wrapper reorders the environment and sets `_`, Leopard has no pgrep/pkill
+  and `nohup` dies with the SSH session (perl setsid instead).
+- Translation cache checkpoints at 6 s and 45 s; programs with windows are usually closed by a signal, so their cache
+  was never written. A run writes again only with substantially new code.
+- Prefetch ring for floats and for loops with stores whose address registers match the stream (a store hits a
+  prefetched value only if dd - k*step overlaps it for k between the prefetch and the use). Measured on the G4
+  (`tools/probes/swap_load_cost.c`): lwbrx costs barely more than lwz; four word loads, four stores and two lfd per
+  two doubles take 20 cycles, lvx/vperm/stvx per double 16, one vector for two doubles 14.

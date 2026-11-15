@@ -26,6 +26,8 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 extern char **environ;
 
@@ -78,6 +80,7 @@ static uint32_t stack_build(int argc, char **argv, const char *path, uint32_t mh
 }
 
 static Cpu cpu __attribute__((aligned(16)));    /* main thread (secondary threads: thread.c) */
+static const char *g_prog_path;
 static int g_error_start, g_error_load;     /* page faults until main or until the guest is loaded (ROSETTA_STATS) */
 static struct timeval g_t0;
 static int g_only_interp;
@@ -91,6 +94,42 @@ static char *hex_put(char *p, const char *text, uint32_t v)
     while (*text) *p++ = *text++;
     for (i = 28; i >= 0; i -= 4) *p++ = "0123456789abcdef"[(v >> i) & 15];
     return p;
+}
+
+/* Crash report: the full state (guest registers, call chain, memory calls, host location) goes to
+   ~/Library/Logs/rosetta/PROGRAM-PID.txt while stderr points there; afterwards stderr gets one line with the path, as a
+   native program that crashes prints nothing of its own. ROSETTA_CRASH_STDERR=1: everything on stderr */
+static int g_crash_saved = -1;
+static char g_crash_path[1024];
+
+void main_crash_begin(void)
+{
+    const char *home = getenv("HOME"), *name;
+    int fd;
+    if (g_crash_saved >= 0 || getenv("ROSETTA_CRASH_STDERR") || !home || !*home || !g_prog_path) return;
+    name = strrchr(g_prog_path, '/') ? strrchr(g_prog_path, '/') + 1 : g_prog_path;
+    snprintf(g_crash_path, sizeof g_crash_path, "%s/Library/Logs/rosetta", home);
+    mkdir(g_crash_path, 0755);
+    snprintf(g_crash_path, sizeof g_crash_path, "%s/Library/Logs/rosetta/%s-%d.txt", home, name, (int)getpid());
+    if ((fd = open(g_crash_path, O_WRONLY | O_CREAT | O_TRUNC, 0644)) < 0) return;
+    fflush(stderr);
+    g_crash_saved = dup(2);
+    if (g_crash_saved < 0) { close(fd); return; }
+    dup2(fd, 2);
+    close(fd);
+}
+
+void main_crash_end(const char *what)
+{
+    char line[1400];
+    int n;
+    if (g_crash_saved < 0) return;
+    fflush(stderr);
+    dup2(g_crash_saved, 2);
+    close(g_crash_saved);
+    g_crash_saved = -1;
+    n = snprintf(line, sizeof line, "rosetta: %s; report in %s\n", what, g_crash_path);
+    if (n > 0) write(2, line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
 }
 
 /* end like a native process that did not handle an exception: terminated by the signal (the parent's wait sees
@@ -111,6 +150,7 @@ static void memfault(int sig, siginfo_t *info, void *k)
 {
     char t[64];
     if (jit_prefetch_error(k)) return;      /* prefetched past the end of an array: the value is never needed */
+    main_crash_begin();
     {   /* first without stdio: signal, address, srr0, lr */
         ucontext_t *u = (ucontext_t *)k;
         char b[128], *p = b;
@@ -171,7 +211,9 @@ static void memfault(int sig, siginfo_t *info, void *k)
         signal(SIGBUS, SIG_DFL);
         signal(SIGILL, SIG_DFL);
         state_show(c, t);
+        snprintf(t, sizeof t, "memory fault (signal %d) at address %p, eip %08x", sig, info->si_addr, c->eip);
     }
+    main_crash_end(t);
     end_by_signal(sig);
 }
 
@@ -181,7 +223,6 @@ static void memfault(int sig, siginfo_t *info, void *k)
 #define PROFILE_DEPTH 12
 static uint32_t *g_prof, *g_prof_eip;  /* per sample: host addresses; guest eip in Cpu (valid when interpreting) */
 static volatile int g_prof_n;
-static const char *g_prog_path;
 
 static void profile_sample(int sig, siginfo_t *info, void *k)
 {

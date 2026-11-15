@@ -860,8 +860,14 @@ int sys_signal(Cpu *c, int sig, int code, const char *reason)
         g_sig_info[sig].addr = c->eip;
         return 1;
     }
-    state_show(c, reason);
-    fprintf(stderr, "rosetta: signal %d to the program, terminated\n", sig);
+    {
+        char what[160];
+        main_crash_begin();
+        state_show(c, reason);
+        fprintf(stderr, "rosetta: signal %d to the program, terminated\n", sig);
+        snprintf(what, sizeof what, "%s at eip %08x, signal %d", reason, c->eip, sig);
+        main_crash_end(what);
+    }
     c->finished = 1;
     c->end_code = 128 + sig;
     g_end_signal = sig;

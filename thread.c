@@ -36,6 +36,7 @@
 int g_threads = 1;
 volatile int g_thread_waiting;
 Cpu *g_thread_cur;
+Cpu *g_main_cpu;
 
 static pthread_mutex_t g_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
@@ -53,6 +54,7 @@ void thread_start(Cpu *main_cpu, int only_interp)
     mach_timebase_info(&tb);
     g_slice = (uint64_t)SLICE_US * 1000 * tb.denom / tb.numer;
     g_thread_cur = main_cpu;
+    g_main_cpu = main_cpu;
     g_only_interp = only_interp;
     g_since = mach_absolute_time();
 }
@@ -149,6 +151,23 @@ static void watchdog_sleep(void)
     pthread_mutex_unlock(&g_wd_m);
 }
 
+void (*g_checkpoint_fn)(void);
+
+/* run fn holding the thread lock without being a guest thread; only if the lock is free now (every guest thread waits
+   in a system call), 0 otherwise */
+static int run_locked(void (*fn)(void))
+{
+    pthread_mutex_lock(&g_m);
+    if (g_taken) { pthread_mutex_unlock(&g_m); return 0; }
+    g_taken = 1;
+    pthread_mutex_unlock(&g_m);
+    fn();
+    pthread_mutex_lock(&g_m);
+    yield_l();
+    pthread_mutex_unlock(&g_m);
+    return 1;
+}
+
 static void *watchdog(void *arg)
 {
     unsigned prev = g_dispatcher_rounds;
@@ -159,6 +178,7 @@ static void *watchdog(void *arg)
         int who;
         watchdog_sleep();
         if (g_watchdog_quit) break;
+        if (g_checkpoint_idle && g_checkpoint_fn) run_locked(g_checkpoint_fn);
         v = g_dispatcher_rounds;
         who = g_thread_waiting || (g_sig_pending & ~g_sig_mask);
         if (who && v == prev && g_in_code && !g_patched) {
@@ -435,6 +455,7 @@ void thread_after_fork(Cpu *c, int watchdog_again)
     g_threads = 1;
     g_thread_waiting = 0;
     g_thread_cur = c;
+    g_main_cpu = c;                         /* the only thread of the child */
     g_nwq = g_wq_threads = g_wq_idle = 0;
     g_empty_since = 0;
     g_watchdog_on = 0;

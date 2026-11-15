@@ -7902,11 +7902,28 @@ static int dispatcher(Cpu *c);
    nothing while no thread is in translated code. ROSETTA_NO_CHECKPOINT=1 */
 static uint64_t g_run_t0, g_checkpoint_at[2];
 static int g_checkpoint_n = -1;
+volatile int g_checkpoint_idle;         /* mach_msg.c: the main thread waited long for a message (startup is over) */
+static int g_checkpoint_idle_done;
 static void jit_end_hot(void);
+
+/* first idle moment: the whole startup is translated. Called with the thread lock held, either at the dispatcher or
+   by the watchdog while every guest thread waits (thread.c, g_checkpoint_fn) */
+static void checkpoint_idle(void)
+{
+    if (!g_checkpoint_idle || g_checkpoint_idle_done) return;
+    g_checkpoint_idle = 0;
+    g_checkpoint_idle_done = 1;
+    if (getenv("ROSETTA_NO_CHECKPOINT") || !g_cache) return;
+    if (g_patched) unpatch();
+    cache_write();
+    jit_end_hot();
+    if (g_cache_show) fprintf(stderr, "rosetta: checkpoint at the first idle moment\n");
+}
 
 static void checkpoint_maybe(void)
 {
     uint64_t now = mach_absolute_time();
+    checkpoint_idle();
     if (g_checkpoint_n < 0) {
         mach_timebase_info_data_t tb;
         mach_timebase_info(&tb);
@@ -7982,6 +7999,7 @@ void jit_thread_unregister(Cpu *c)
 int jit_run(Cpu *c)
 {
     g_run_t0 = mach_absolute_time();
+    g_checkpoint_fn = checkpoint_idle;
     if (getenv("ROSETTA_THRESHOLD")) g_threshold = atoi(getenv("ROSETTA_THRESHOLD"));
     {
         int f0 = jit_pagefault();
@@ -7999,7 +8017,7 @@ static int dispatcher(Cpu *c)
     for (;;) {
         uint32_t *code, eip;
         g_dispatcher_rounds++;
-        if (!(g_dispatcher_rounds & 0x3fff) && g_checkpoint_n < 2) checkpoint_maybe();
+        if ((!(g_dispatcher_rounds & 0x3fff) && g_checkpoint_n < 2) || g_checkpoint_idle) checkpoint_maybe();
         if (g_patched) unpatch();       /* restore block starts (jit_interrupt) */
         if (g_state_wish) state_short(c);
         if (g_thread_waiting | c->yield) thread_yield(c);  /* other guest threads (thread.c) */

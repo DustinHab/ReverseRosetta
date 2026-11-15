@@ -445,6 +445,7 @@ static void host_info_reply(uint8_t *m, uint32_t n)
    instead of EFI: the query goes to the device tree root, which exists. Request (MIG, iokit 2809): NDR @24,
    pathOffset @32, pathCnt @36 (guest byte order, with the NUL), path from @40; size 40 + pathCnt rounded to 4. */
 #define IO_REGISTRY_ENTRY_FROM_PATH 2809
+extern volatile int g_checkpoint_idle;      /* jit.c: write the translation cache at the next dispatcher round */
 static const char g_efi_path[] = "IODeviceTree:/efi", g_dt_root[] = "IODeviceTree:/";
 
 static uint32_t efi_query(uint8_t *m, uint32_t size)
@@ -501,7 +502,17 @@ static mach_msg_return_t guest_mach_msg(Cpu *c, uint32_t msg, mach_msg_option_t 
            signal (profile clock, watchdog) retry here, after a completed send only receive */
         uint32_t saved_base = g_base;
         mach_msg_option_t o = option | MACH_SEND_INTERRUPT | MACH_RCV_INTERRUPT;
-        Cpu *fc = glock_release();               /* receiving can wait: let other threads run */
+        /* the main thread waits for events without a deadline for the first time: startup is over, the translation
+           cache gets a checkpoint while every guest thread waits (jit.c, thread.c) */
+        static int idle_seen;
+        Cpu *fc;
+        if (!idle_seen && c == g_main_cpu && (option & MACH_RCV_MSG) && !(option & MACH_SEND_MSG) &&
+            (!(option & MACH_RCV_TIMEOUT) || deadline >= 1000)) {
+            idle_seen = 1;
+            g_checkpoint_idle = 1;
+            thread_watchdog_start();
+        }
+        fc = glock_release();                    /* receiving can wait: let other threads run */
         for (;;) {
             r = mach_msg((mach_msg_header_t *)g_buffer, o, send_size, receive, name, deadline, message);
             if (r != MACH_SEND_INTERRUPTED && r != MACH_RCV_INTERRUPTED) break;
