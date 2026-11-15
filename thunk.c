@@ -10,6 +10,7 @@
  * the base name.
  */
 #include "thunk.h"
+#include "gl.h"
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -136,13 +137,14 @@ static const struct { const char *name; Stub fn; char kind; void *native; } g_li
 
 /* frameworks besides libSystem whose exported functions are replaced by name (their i386 version is a stub library
    or does less than the PowerPC one) */
-static const char *const g_native_libs[] = { "/Calculate.framework/", 0 };
+/* OpenGL: gl.c (the Intel OpenGL cannot reach the graphics chip of a PowerPC Mac) */
+static const char *const g_native_libs[] = { "/Calculate.framework/", "/OpenGL.framework/", 0 };
 #define LIST (sizeof g_list / sizeof g_list[0])
 
 /* ---------- tables ---------- */
 
 #define NAMES 256                               /* hash table of the names (index in g_list + 1) */
-#define ADDRS 1024                           /* entry address -> stub */
+#define ADDRS 4096                           /* entry address -> stub (libSystem, about 1000 of OpenGL) */
 #define IMAGES 128
 
 static unsigned char g_names[NAMES];
@@ -188,6 +190,12 @@ static Stub name_find(const char *s, size_t n)
 static Stub name_verify(const char *s)
 {
     size_t n = 0;
+    if ((s[0] == 'g' && s[1] == 'l') || (s[0] == 'C' && s[1] == 'G')) {     /* OpenGL (gl.c) */
+        Stub fn;
+        while (s[n] && s[n] != '$') n++;
+        if ((fn = gl_stub(s, n)) != 0) return fn;
+        n = 0;
+    }
     if (!g_first[(unsigned char)s[0]]) return 0;
     while (s[n] && s[n] != '$') if (++n > g_maxlen) return 0;
     return name_find(s, n);
@@ -195,14 +203,14 @@ static Stub name_verify(const char *s)
 
 static void addr_add(uint32_t a, Stub fn)
 {
-    uint32_t h = (a * 2654435761u) >> 22, i;
+    uint32_t h = (a * 2654435761u) >> 20, i;
     for (i = 0; i < ADDRS; i++, h = (h + 1) & (ADDRS - 1))
         if (!g_addr[h].fn || g_addr[h].addr == a) { g_addr[h].addr = a; g_addr[h].fn = fn; return; }
 }
 
 static Stub addr_find(uint32_t a)
 {
-    uint32_t h = (a * 2654435761u) >> 22, i;
+    uint32_t h = (a * 2654435761u) >> 20, i;
     for (i = 0; i < ADDRS && g_addr[h].fn; i++, h = (h + 1) & (ADDRS - 1))
         if (g_addr[h].addr == a) return g_addr[h].fn;
     return 0;
@@ -499,6 +507,8 @@ Stub thunk_find(uint32_t eip)
     vm_region_basic_info_data_t info;
     mach_msg_type_number_t n = VM_REGION_BASIC_INFO_COUNT;
     mach_port_t obj;
+    Stub gt = gl_tramp(eip);                    /* dispatch table of a guest OpenGL context */
+    if (gt) return gt;
     if (g_off < 0) g_off = getenv("ROSETTA_NO_STUB") != 0;
     if (g_off) return 0;
     if (!g_names_done) names_build();
@@ -543,7 +553,7 @@ const char *thunk_name(Stub fn)
 {
     unsigned i;
     for (i = 0; i < LIST; i++) if (g_list[i].fn == fn) return g_list[i].name;
-    return "?";
+    return gl_name(fn) ? gl_name(fn) : "?";
 }
 
 char thunk_kind(Stub fn, void **native)

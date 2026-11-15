@@ -39,6 +39,27 @@ Library code: decoding a 2560x1600 JPEG with ImageIO and drawing it into a bitma
 takes 1.47 s translated and 0.44 s native. ImageIO's decoder is SSE2 code; before packed SSE2 integer and float
 instructions were translated to AltiVec, it took 16.3 s.
 
+OpenGL (`tests/bench_gl.c`, `tests/gl_measure.sh`): 13 workloads drawn by the Radeon 9200 into a 256x256 pbuffer,
+milliseconds per frame, fastest of 5 rounds. Translated and native builds render identical images. Where the native
+build waits for the graphics chip, the translated one is limited by the processor; interleaved arrays are faster
+than native because rosetta converts them in cache-sized pieces, which the driver then copies from the cache.
+
+| Workload | Translated | Native | Speed vs. native |
+|---|---|---|---|
+| immediate mode, `glColor3f`/`glNormal3f`/`glVertex3f` | 9.08 ms | 7.27 ms | 80 % |
+| immediate mode, vectors (`glColor4ubv`, `glVertex3fv`) | 6.22 ms | 5.95 ms | 96 % |
+| immediate mode, textured | 7.47 ms | 6.54 ms | 87 % |
+| matrix and state changes | 10.54 ms | 10.30 ms | 98 % |
+| display lists | 12.94 ms | 12.96 ms | 100 % |
+| vertex arrays, `glDrawArrays` | 2.75 ms | 2.62 ms | 95 % |
+| `glDrawElements` (16-bit indices) | 9.33 ms | 9.17 ms | 98 % |
+| vertex buffer object | 1.97 ms | 1.95 ms | 99 % |
+| interleaved arrays (stride 28) | 2.77 ms | 3.03 ms | 109 % |
+| buffer object refilled every frame | 3.11 ms | 2.82 ms | 91 % |
+| texture upload 256x256 BGRA | 6.27 ms | 5.10 ms | 81 % |
+| `glReadPixels` 256x256 | 17.45 ms | 15.68 ms | 90 % |
+| `glGet` | 1.23 ms | 0.96 ms | 78 % |
+
 Startup time, translated against native, fastest of 7 runs with the translation cache filled:
 
 | Program | Translated | Native |
@@ -77,17 +98,23 @@ the native PowerPC build. At startup the translated Calculator uses 1.7 s of pro
   `NSThread` and `NSOperationQueue`.
 - Cocoa programs with windows, events and text. Of the Intel applications of the 10.5.8 update, Calculator (computing
   with the system's own engine), Terminal, Console, System Profiler, Dictionary, iCal, Address Book, Safari, Mail and
-  Keychain Access open their windows; Preview shows PDF documents. Transmission 2.42 downloads. Safari shows pages
+  Keychain Access open their windows; Preview shows PDF documents; Chess draws its board with OpenGL. Transmission 2.42 downloads. Safari shows pages
   over HTTP with CSS, JavaScript and images (HTTPS to current servers fails on 10.5 natively too). Text rendering goes through the system's
   PowerPC font server; font metrics, glyph outlines and paths are identical to a native build (`tests/fonts.c`).
 - x87, SSE and SSE2: scalar, packed double, packed integer and packed float (AltiVec), including Apple's Intel
   vDSP/vForce code and ImageIO's image decoders.
+- OpenGL with the graphics chip: the program's OpenGL calls go to the system's PowerPC OpenGL and its hardware
+  renderer (a Radeon 9200 on the test machine): immediate mode, vertex arrays, buffer objects, display lists,
+  textures, pixel transfers, GLU. Windows (NSOpenGLView, CGL) and pbuffers. Images rendered by
+  `tests/bench_gl.c` are identical to those of the native build.
 
 Intel programs see an Intel Mac: CPUID, the commpage, `hw.cputype`, `hw.optional.*` and `host_info` describe an
 Intel Core Duo with SSE3, `arch` prints `i386`, `uname -m` prints `i386`. Programs that check the processor
 therefore take their Intel code paths, as on Apple's Rosetta, which showed PowerPC programs a PowerPC.
 
 ![Calculator.app, Intel build from the 10.5.8 update, translated](docs/calculator.png)
+
+![Chess.app, Intel build from the 10.5.8 update, translated, drawing with OpenGL on the Radeon 9200](docs/chess.png)
 
 ## How it works
 
@@ -106,6 +133,12 @@ therefore take their Intel code paths, as on Apple's Rosetta, which showed Power
 - The i386 dyld, libSystem and frameworks run translated. They talk to the native PowerPC services: WindowServer,
   ATSServer, securityd, launchd, syslogd.
 - Threads run one at a time under a global lock; a watchdog thread interrupts long loops for signal delivery.
+- OpenGL: the Intel OpenGL framework is not loaded. Each of the 759 entries of the dispatch table (generated from
+  the SDK headers by `tools/gl_gen.py`) reads its arguments from the Intel stack and calls the host context's entry
+  directly. Vertex data is converted at the draw call, in pieces that stay in the processor cache while the driver
+  copies them; buffer objects keep a copy in Intel byte order and are converted per attribute layout; pixel data is
+  swapped by the driver's own byte swapping. The window's WindowServer connection is shared between the Intel and
+  the PowerPC CoreGraphics by redirecting the host's messages.
 - System structures that differ in byte order are converted where the guest reads them: `sysctl` results
   (`kinfo_proc`, routing messages for `getifaddrs`, load average, swap usage, `vfsconf`, `nfsstats`), `kevent`, `flock`, `termios`,
   `/var/run/utmpx`. Intel frameworks that treat the missing EFI device tree node as fatal get the device tree root
@@ -241,15 +274,16 @@ error code.
 ## Tests
 
 ```
-tests/run_tests.sh      # 45 comparisons against native builds, real Intel output or the interpreter
+tests/run_tests.sh      # 46 comparisons against native builds, real Intel output or the interpreter
 tests/measure_all.sh    # the benchmark loads above
+tests/gl_measure.sh     # the OpenGL workloads, translated and native side by side (login session)
 tests/cli_matrix.sh     # every universal command line program of the system, translated against native
 ```
 
 `run_tests.sh` compares each test program translated against the same source built for PowerPC (or against the
 interpreter, or against output recorded on an Intel Mac). `tests/syscalls.c` alone covers processes, `kqueue`, file
-locks, semaphores, blocked signals, terminals and the converted `sysctl` structures. The font test runs only when a
-login session exists.
+locks, semaphores, blocked signals, terminals and the converted `sysctl` structures. The font and OpenGL tests run
+only when a login session exists; the OpenGL test compares the images of every workload of `tests/bench_gl.c`.
 
 `cli_matrix.sh` runs each command natively, translated, and natively again (output that changes between the native
 runs, such as a clock, is set aside) in an empty working directory, without arguments and with input from
@@ -279,8 +313,8 @@ well.
 - Programs with windows start slowly the first two times (see the table under Performance). With the translation
   cache filled, Calculator still uses about 2.5 times the processor time of the native build at startup, most of it
   in translated guest code (dyld binding, the Objective-C runtime, CoreFoundation).
-- OpenGL does not work yet: the Intel OpenGL has only its software renderer, and no context comes up. 3D programs
-  (Chess) fail.
+- OpenGL: immediate mode with scalar arguments and glGet reach about 80 % of the native speed (the table under
+  Performance). Tested with NSOpenGLView windows and CGL pbuffers; AGL and GLUT programs are untested.
 - The keychain sees the process `rosetta`, not the program: a program that reads a password asks once per item, and
   "Always Allow" lets every translated program read it. After rosetta is rebuilt, the keychain asks again.
 - Programs that need a setuid helper in their bundle (Activity Monitor's pmTool) do not work: the copy in

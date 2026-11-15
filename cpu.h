@@ -89,6 +89,9 @@ typedef struct Cpu {
     /* memory faults to the guest's handler (main.c memfault): the way back to the dispatcher of this guest thread */
     void *fault_jmp;              /* jmp_buf of the running dispatcher or interpreter loop (0: none) */
     void *host_thread;            /* pthread that runs this guest thread */
+    /* OpenGL (gl.c): current context of this thread on the host and its object in guest memory */
+    void *gl_ctx;
+    uint32_t gl_proxy;
 } Cpu;
 
 /* ---------- guest memory ---------- */

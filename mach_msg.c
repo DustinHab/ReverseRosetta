@@ -12,6 +12,7 @@
 #include "sys.h"
 #include "thread.h"
 #include "jit.h"
+#include "gl.h"
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -634,6 +635,8 @@ static mach_msg_return_t guest_mach_msg_call(Cpu *c, uint32_t msg, mach_msg_opti
             return r;
         }
         if (ats_search && n >= 40 && (k->msgh_bits & MACH_MSGH_BITS_COMPLEX)) g_ats_port = *(uint32_t *)(g_buffer + 28);
+        if (k->msgh_id == 29901 && n >= 40 && (k->msgh_bits & MACH_MSGH_BITS_COMPLEX))
+            gl_ws_connection(*(uint32_t *)(g_buffer + 28), g_buffer, n);     /* WindowServer connection (gl.c) */
         if (basic_info) host_info_reply(g_buffer, n);
         if (ats_query) {
             ats_show("from", g_buffer, n, 0);

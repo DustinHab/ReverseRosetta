@@ -884,7 +884,7 @@ even when it had a handler (crash reporters, runtimes that recover from faults).
 - After that, 12 of 14 applications open their windows (Calculator, Transmission, Terminal, Console, System
   Profiler, Dictionary, iCal, Address Book, Safari, Mail, Keychain Access; Preview opens no window without a
   document and shows a PDF opened through its launcher). Safari shows pages over HTTP with CSS, JavaScript and
-  images, the URL given with `open -a`; HTTPS to current servers fails as it does natively on 10.5 (old TLS). Not running: Chess (OpenGL: the i386 OpenGL has only its software renderer, the
+  images, the URL given with `open -a`; HTTPS to current servers fails as it does natively on 10.5 (old TLS). Not running then: Chess (OpenGL, now solved, see below: the i386 OpenGL has only its software renderer, the
   context does not come up, gluBuild2DMipmaps divides by the unpack alignment 0; `tools/probes/gl_probe.c`: natively
   the Radeon 9200 and the software renderer, translated CGLQueryRendererInfo fails and CGLChoosePixelFormat gives
   10015 "invalid code module": the i386 CGL reads the header of the display's GL driver bundle, which exists only for
@@ -920,3 +920,60 @@ even when it had a handler (crash reporters, runtimes that recover from faults).
   the operand's bits. Also translated now: incb/decb (fe /0 /1, 1 million at the JPEG's Huffman decoding),
   `tests/incdec8.c` against the interpreter.
 - JPEG 2560x1600: 16.3 s -> 1.47 s (native 0.44 s), 71 million interpreted instructions -> 0.2 million.
+
+**OpenGL with the graphics chip** (2026-11-15, night). The i386 OpenGL of the Intel root cannot work: its CGL reads
+the header of the display's GL driver bundle, which exists only for PowerPC (10015 "invalid code module"), and its
+software renderer would be slow anyway. rosetta does not load the guest's OpenGL framework at all
+(`g_native_libs`): its exports are bound to rosetta's own entries, and the calls go to the host's OpenGL and the
+Radeon 9200.
+- `tools/gl_gen.py` reads the 10.5 SDK headers (CGLMacro.h, gliDispatch.h) and writes `gl_table.h`: the 759 entries
+  of a context's dispatch table with their exact prototypes, and for each a C function that reads the arguments from
+  the Intel stack (vectors with one AltiVec permute) and calls the host context's entry directly (`disp[n](rend,
+  ...)`): no lookup per call. Each entry exists twice: as the libGL export (current context from `Cpu.gl_ctx`) and as a
+  dispatch trampoline for CGL-macro users such as GLU (context as the first argument). About 60 entries are written by
+  hand (`gl.c`, `gl_arrays.h`): everything with arrays whose length comes from the state, pixels, buffer objects.
+- A guest context is a proxy object in guest memory: its `rend` is its own address, its dispatch table holds
+  addresses in a trampoline page that `thunk_find` recognizes. The current context goes into the guest's thread data
+  at `%gs:0xc0`, where the i386 libGL and GLU read it.
+- Windows: CGLSetSurface needs the window's WindowServer connection, but the host CoreGraphics in the rosetta process
+  has a connection of its own; the server refused its calls for the guest's window (1001, not the owner). rosetta
+  now rebinds the host CoreGraphics' `_mach_msg` (the lazy pointer; the real target from dlsym, the pointer itself
+  still pointed at the dyld binder) and sends messages for the host's connection port to the guest's connection
+  (learned from the guest's reply 29901); in the window owner reply 29372 the guest's connection id becomes the
+  host's.
+- Pixels: the host context has GL_UNPACK/PACK_SWAP_BYTES the other way round (on by default), glPixelStore of the
+  guest is inverted, glGet reports the guest's value. Packed 32-bit pixels are swapped by the driver as words; an
+  AltiVec path that swapped them itself made texture upload slower (83 % -> 73 %: one more copy) and is gone.
+- Vertex arrays (`tools/probes/gl_vertex_feed.c`, `gl_client_memory.c`, `gl_vertex_range.c`, native): the driver
+  copies client arrays itself in the draw call (1.3 ms for 18000 vertices), also from a vertex array range (1.5 ms)
+  and from a streaming buffer object (1.6 to 2.2 ms, frames slower than with client arrays). The first approach,
+  three streaming buffer objects in turn with the conversion written straight into the mapped buffer, reached 65 %
+  (vertex arrays) and 53 % (interleaved); converting into scratch memory and handing the driver client pointers
+  gave the same. Both are bound by memory bandwidth: 432 KB written by the conversion, read again by the driver,
+  while the chip reads the previous frame over AGP (the conversion runs at half speed while the chip draws).
+  Now glDrawArrays is cut into pieces of 12 KB of converted data in one scratch area that stays in the cache; the
+  driver reads it from there. Vertex arrays 66 % -> 89 %, interleaved (stride 28, converted as one block per piece)
+  54 % -> 112 %. Piece size for vertex arrays: 4 KB 2.76 ms, 8 to 16 KB 2.70 to 2.74, 32 KB 2.81, 64 KB 2.89,
+  128 KB 3.03, uncut 3.57 (native 2.46); smaller pieces mean more draw calls. Points, lines, triangles and quads are
+  cut at primitive boundaries, strips with an overlap of two vertices at an even offset (same triangles, same
+  orientation); fans, loops, line strips (stipple) and polygons are converted in one piece. The program's
+  GL_VERTEX_ARRAY_RANGE_APPLE stays off on the host (the driver would read Intel byte order).
+- Buffer objects keep a copy in Intel order; the host buffer is converted per attribute layout. A bug made the
+  refilled buffer cost 4.8 ms instead of 3.0 at random: the layout comparison was a memcmp over Spec structures whose
+  padding bytes were stack garbage, so the whole buffer was converted again at many draws. glBufferSubData inside one
+  packed attribute converts straight into the mapped host buffer (GL_APPLE_flush_buffer_range: only the range is
+  flushed; mapping waits for the chip as glBufferSubData does): 3.23 -> 3.03 ms (`tools/probes/gl_buffer_refill.c`:
+  natively glBufferSubData waits 1.2 ms for the chip). Reading the program's data once for the copy and the host
+  buffer was slower (3.1 ms): the copy used to run while the chip was still drawing, the fused pass only after the
+  wait.
+- Translator: floating-point constants of PIC code (`divss 0xc02(%ebx)`) in loops with calls went through the
+  AltiVec load path (9 instructions and a store-to-load stall) because constant prediction was off in blocks with
+  calls and treated a register as unknown in the whole block if anything wrote it (here the epilogue's `pop %ebx`
+  after the loop). Now only writes up to the last backward jump count from the start, others from where they are;
+  calls count as writing eax, ecx, edx (before they counted as writing only esp). Immediate mode 9.58 -> 9.15 ms.
+- `tests/bench_gl.c` (13 workloads, 256x256 pbuffer, image checksums) and `tests/gl_measure.sh`: translated and
+  native side by side; `tests/gl_check.sh` in `run_tests.sh` compares the images. What remains: immediate mode with
+  scalar arguments (natively bound by the chip, translated by the processor: the Intel code converts integers to
+  floats through memory as native code does, and every argument goes through the Intel stack, `stfs`/`lwz`/`stwbrx`
+  and back in the entry, where the native call passes it in an FPR), glGet (the driver writes the values and rosetta
+  reads them right back for the byte swap: a store-to-load stall per call).

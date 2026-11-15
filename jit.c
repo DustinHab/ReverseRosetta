@@ -144,6 +144,7 @@ static Cpu *g_fcpu[256];                /* Cpus of all threads (a flush resets t
 static int g_nfcpu;
 static uint32_t g_kaddr;                 /* memory operand of the current instruction is a constant at this address */
 static int g_no_const;                /* ROSETTA_NO_CONST: do not predict constants */
+static int g_const_calls = -1;        /* ROSETTA_CONST_CALLS=0: no constants in blocks with calls */
 static int pool_load(int f, char kind);
 static void cache_load(void);
 static void cpool_flush(void);
@@ -3012,22 +3013,35 @@ static int mask_fits(uint32_t a, const Insn *b)
    still holds. */
 static uint8_t const_predict(const Insn *b, const int *interp, const uint8_t *inner_target, int n, uint32_t *cval)
 {
-    uint8_t written = 0, watchdog = 0, wm[MAX_INSNS];
-    int symr[8], i, r;
+    uint8_t loop_w = 0, upto_w = 0, watchdog = 0, wm[MAX_INSNS];
+    int symr[8], i, r, tail = 0;
     int32_t symo[8];
     memset(cval, 0, (size_t)n * sizeof *cval);
     for (i = 0; i < n && (interp[i] || !fp_load_size(&b[i])); i++) ;
     if (i == n) return 0;                       /* no floating-point load: nothing to do (startup stays fast) */
     for (i = 0; i < n; i++) {                   /* write_mask is conservative for unknown instructions (all) */
-        wm[i] = write_mask(&b[i]);
-        written |= wm[i];
+        const Insn *x = &b[i];
+        wm[i] = write_mask(x);
+        /* a call returns with eax, ecx, edx changed (the callee keeps ebx, esi, edi, ebp: i386 calling convention) */
+        if (x->op == 0xe8 || x->op == 0x9a || (x->op == 0xff && (x->reg == 2 || x->reg == 3)))
+            wm[i] |= (uint8_t)(1u << EAX | 1u << ECX | 1u << EDX);
+        /* jump backwards (into a loop of the block, or of an inlined function): what is written up to here can flow
+           back */
+        if ((x->op == 0xeb || x->op == 0xe9 || (x->op >= 0x70 && x->op <= 0x7f) || (x->op >= 0xe0 && x->op <= 0xe3) ||
+             (x->op >= (OP_0F | 0x80) && x->op <= (OP_0F | 0x8f))) && x->eip + x->len + x->imm <= x->eip)
+            tail = i + 1;
+        if (x->op == 0xff && (x->reg == 4 || x->reg == 5)) tail = i + 1;     /* switch table: targets anywhere */
     }
-    /* register = value at entry of a register unchanged in the block + offset (symr < 0: unknown) */
-    for (r = 0; r < 8; r++) { symr[r] = (written >> r & 1) ? -1 : r; symo[r] = 0; }
+    for (i = 0; i < tail; i++) loop_w |= wm[i];
+    /* register = value at entry + offset (symr < 0: unknown). Until an instruction writes it, a register still has
+       its entry value; at a jump target inside the block the paths meet: unknown is what is written before it or in
+       a loop (up to the last backward jump; the code after it never flows back, an epilogue's pop does not count) */
+    for (r = 0; r < 8; r++) { symr[r] = (loop_w >> r & 1) ? -1 : r; symo[r] = 0; }
     for (i = 0; i < n; i++) {
         const Insn *x = &b[i];
         int sz = interp[i] ? 0 : fp_load_size(x);
-        if (inner_target[i]) for (r = 0; r < 8; r++) if (written >> r & 1) symr[r] = -1;
+        if (inner_target[i]) for (r = 0; r < 8; r++) if ((loop_w | upto_w) >> r & 1) symr[r] = -1;
+        upto_w |= wm[i];
         if (sz && !x->seg && x->base >= 0 && symr[x->base] >= 0 && (x->index < 0 || symr[x->index] >= 0)) {
             uint32_t a = g_cpu->r[symr[x->base]] + (uint32_t)symo[x->base] + x->disp;
             if (x->index >= 0) a += (g_cpu->r[symr[x->index]] + (uint32_t)symo[x->index]) << x->scale;
@@ -7091,8 +7105,11 @@ static uint32_t *translate_block(uint32_t eip)
         }
         for (i = 0; i < n; i++) if (inner[i] >= 0) inner_fl[inner[i]] |= target_needs[i] | afterwards[inner[i] - 1];
     }
-    /* predictions and prefetch require that the block knows its registers itself: not across calls */
-    if (!must_check && !g_no_const && g_cpu && !no_spec(eip) && !ncont && !nstub && !var && const_allowed(eip))
+    /* constants: also across calls (const_predict counts eax, ecx, edx as changed by them); prefetch requires that
+       the block knows its registers itself: not across calls. ROSETTA_CONST_CALLS=0: not across calls either */
+    if (g_const_calls < 0) g_const_calls = getenv("ROSETTA_CONST_CALLS") ? atoi(getenv("ROSETTA_CONST_CALLS")) : 1;
+    if (!must_check && !g_no_const && g_cpu && !no_spec(eip) && (g_const_calls || (!ncont && !nstub)) && !var &&
+        const_allowed(eip))
         watchdog = const_predict(b, interp, inner_target, n, cval);
     else memset(cval, 0, sizeof cval);
     g_vl_reg = 0;
@@ -7755,6 +7772,7 @@ static uint32_t *translate_block(uint32_t eip)
             uint32_t *w;
             if (zf) {
                 fprintf(zf, "b_%08x:\n", eip);
+                fprintf(zf, "; host %p\n", (void *)start);
                 for (i = 0; i < n; i++) fprintf(zf, "; %08x\n", b[i].eip);
                 for (w = start; w < p; w++) fprintf(zf, "\t.long 0x%08x\n", *w);
                 fclose(zf);

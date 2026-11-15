@@ -150,5 +150,10 @@ if [ -d $R/intel/root ]; then
         no*) echo "--      fonts: $e" ;;
         *) echo "FAILED  fonts: $e"; failed=1 ;;
     esac
+    e=$(sh ../tests/in_session.sh ../tests/gl_check.sh | head -1)
+    case "$e" in
+        ok*) echo "ok      OpenGL: same images as the PowerPC build (${e#ok gl (}" ;;
+        *) echo "FAILED  OpenGL: $e"; failed=1 ;;
+    esac
 fi
 exit $failed
