@@ -7678,22 +7678,25 @@ static void cache_write(void)
     if (close(fd) == 0 && ok) rename(tmp, g_cache_path); else unlink(tmp);
     free(b);
     free(t);
-    {   /* translation caches of earlier builds of this program never fit again: delete them (otherwise the folder grows with every build) */
-        char folder[1024], *isect, prefix[64], build[16];
+    {   /* translation caches and hot lists of other builds of rosetta never fit again, for any program: delete them
+           (otherwise the folder grows with every build); names: cache-PROGRAM-BUILD-ENV, hot-PROGRAM-BUILD */
+        char folder[1024], *isect, build[16];
         DIR *d;
         struct dirent *e;
         snprintf(folder, sizeof folder, "%s", g_cache_path);
         if (!(isect = strrchr(folder, '/'))) return;
         *isect = 0;
-        snprintf(prefix, sizeof prefix, "cache-%08x-", fnv(g_prog_full, 2166136261u));
-        snprintf(build, sizeof build, "%08x-", fnv(__DATE__ " " __TIME__, 2166136261u));
+        snprintf(build, sizeof build, "%08x", fnv(__DATE__ " " __TIME__, 2166136261u));
         if (!(d = opendir(folder))) return;
-        while ((e = readdir(d)) != 0)
-            if (!strncmp(e->d_name, prefix, strlen(prefix)) && strncmp(e->d_name + strlen(prefix), build, strlen(build))) {
+        while ((e = readdir(d)) != 0) {
+            const char *n = e->d_name;
+            int skip = !strncmp(n, "cache-", 6) ? 15 : !strncmp(n, "hot-", 4) ? 13 : 0;   /* start of BUILD */
+            if (skip && strlen(n) >= (size_t)skip + 8 && n[skip - 1] == '-' && strncmp(n + skip, build, 8)) {
                 char prev[1100];
-                snprintf(prev, sizeof prev, "%s/%s", folder, e->d_name);
+                snprintf(prev, sizeof prev, "%s/%s", folder, n);
                 unlink(prev);
             }
+        }
         closedir(d);
     }
 }
