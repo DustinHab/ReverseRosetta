@@ -66,6 +66,9 @@ t_t5s()   { ROSETTA_THRESHOLD=1 ROSETTA_FPAHEAD=1 ./rosetta ./bench_sse2 3; }
 t_t5o()   { ROSETTA_THRESHOLD=1 ROSETTA_NO_XFH=1 ./rosetta ./bench_sse2 3; }
 t_pdo()   { ROSETTA_THRESHOLD=1 ./rosetta ./pd_ops; }
 r_pdo()   { ROSETTA_INTERP=1 ./rosetta ./pd_ops; }
+# second run from the translation cache: the vperm patterns of the shuffles must come back with the code
+t_vec()   { rm -f /tmp/rr_vec_cache; for t in 1 10; do ROSETTA_CACHE_FILE=/tmp/rr_vec_cache ROSETTA_THRESHOLD=$t ./rosetta ./vec_ops; done; rm -f /tmp/rr_vec_cache; }
+r_vec()   { ROSETTA_INTERP=1 ./rosetta ./vec_ops; ROSETTA_INTERP=1 ./rosetta ./vec_ops; }
 t_vd()    { ./rosetta ./vdsp_d; }
 r_vd()    { ROSETTA_NO_CACHE=1 ROSETTA_THRESHOLD=2 ROSETTA_ONLY=0-0 ./rosetta ./vdsp_d; }    # interpreted, native math as above
 t_sys()   { sh ../tests/with_timeout.sh 60 ./rosetta ./syscalls; }
@@ -91,10 +94,14 @@ t_shf()   { ./rosetta ./shifts; ROSETTA_THRESHOLD=1 ./rosetta ./shifts; ROSETTA_
 r_shf()   { ./shifts.ppc; ./shifts.ppc; ./shifts.ppc; }
 t_cmpsb() { ROSETTA_THRESHOLD=1 ./rosetta ./cmpsb; }
 r_cmpsb() { ROSETTA_INTERP=1 ./rosetta ./cmpsb; }
+t_idb()   { ROSETTA_THRESHOLD=1 ./rosetta ./incdec8; }
+r_idb()   { ROSETTA_INTERP=1 ./rosetta ./incdec8; }
 same raw_arith t_raw r_raw
 same "64-bit shifts, shld/shrd with flags" t_shf r_shf
 same "cmpsb (translated against interpreter)" t_cmpsb r_cmpsb
+same "incb/decb with flags (against interpreter)" t_idb r_idb
 same "packed doubles with special values (against interpreter)" t_pdo r_pdo
+same "SSE2 integer and packed floats with AltiVec (against interpreter)" t_vec r_vec
 same "threads (mutex, condition, spinlock, pipe, join)" t_thr r_thr
 same "loops interruptible (signal, waiting thread)" t_intr r_intr
 same "Ctrl+C in a compute loop (SIGINT with handler)" t_ctrlc r_ctrlc

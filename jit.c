@@ -371,8 +371,8 @@ static void framecode_build(void)
     e(MFLR(0)); e(STW(0, 8, 1)); e(MFCR(0)); e(STW(0, 4, 1));
     e(STWU(1, -FRAME_SIZE, 1));
     e(STMW(13, FRAME_SIZE - 76, 1));
-    /* VRSAVE: the generated code uses v0..v3 (SSE); on a context switch the system saves only the declared registers */
-    e(MFSPR(0, SPR_VRSAVE)); e(STW(0, FRAME_SIZE - 80, 1)); e(ORIS(0, 0, 0xf000)); e(MTSPR(SPR_VRSAVE, 0));
+    /* VRSAVE: the generated code uses v0..v7 (SSE); on a context switch the system saves only the declared registers */
+    e(MFSPR(0, SPR_VRSAVE)); e(STW(0, FRAME_SIZE - 80, 1)); e(ORIS(0, 0, 0xff00)); e(MTSPR(SPR_VRSAVE, 0));
     for (i = 14; i <= 31; i++) e(STFD(i, FSAFE + 8 * (i - 14), 1));
     load_imm(12, (uint32_t)(uintptr_t)g_fconst);
     e(LFD(F_MAGIC, 0, 12)); e(LFD(F_2POW31, 8, 12));
@@ -942,17 +942,40 @@ static uint8_t cond_mask(int k)
     return m[(k >> 1) & 7];
 }
 
-/* SSE2 integer instructions the translator can do with AltiVec (no flags) */
+/* SSE instructions the translator does with AltiVec (gen_sse, no flags): SSE2 integer instructions on xmm registers
+   and packed floats except division and square root */
 static int sse_can(const Insn *b)
 {
-    switch (b->op) {
-    case OP_0F | 0x6f: case OP_0F | 0x7f:  /* movdqa (66), movdqu (f3) */
-        return (b->p66 && !b->rep) || (b->rep == 0xf3 && !b->p66);
-    case OP_0F | 0xd7:                      /* pmovmskb */
-        return b->p66 && !b->rep && !b->mem;
-    case OP_0F | 0x74: case OP_0F | 0x75: case OP_0F | 0x76:   /* pcmpeqb/w/d */
-    case OP_0F | 0xdb: case OP_0F | 0xdf: case OP_0F | 0xeb: case OP_0F | 0xef:   /* pand, pandn, por, pxor */
-        return b->p66 && !b->rep;
+    int o = b->op & 0xff, p = b->p66 && !b->rep, n = !b->p66 && !b->rep;
+    if (b->op < OP_0F || b->op > (OP_0F | 0xff)) return 0;
+    switch (o) {
+    case 0x6f: case 0x7f:                   /* movdqa (66), movdqu (f3) */
+        return p || (b->rep == 0xf3 && !b->p66);
+    case 0xd7: case 0xc5:                   /* pmovmskb, pextrw */
+        return p && !b->mem;
+    case 0xe7:                              /* movntdq */
+        return p && b->mem;
+    case 0x70:                              /* pshufd (66), pshufhw (f3), pshuflw (f2) */
+        return p || ((b->rep == 0xf2 || b->rep == 0xf3) && !b->p66);
+    case 0x5b:                              /* cvtdq2ps, cvtps2dq (66), cvttps2dq (f3) */
+        return n || p || (b->rep == 0xf3 && !b->p66);
+    case 0x10: case 0x11:                   /* movups */
+    case 0x14: case 0x15: case 0xc6:        /* unpcklps, unpckhps, shufps */
+    case 0x58: case 0x59: case 0x5c: case 0x5d: case 0x5f:      /* addps, mulps, subps, minps, maxps */
+        return n;
+    case 0x71: case 0x72:                   /* psrlw/d, psraw/d, psllw/d with a constant */
+        return p && !b->mem && (b->reg == 2 || b->reg == 4 || b->reg == 6);
+    case 0x73:                              /* psrlq, psrldq, psllq, pslldq with a constant */
+        return p && !b->mem && (b->reg == 2 || b->reg == 3 || b->reg == 6 || b->reg == 7);
+    case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: case 0x67:     /* unpack, pack, */
+    case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x6c: case 0x6d:                           /* pcmpgt */
+    case 0x6e: case 0x7e: case 0xc4:                                                            /* movd, pinsrw */
+    case 0x74: case 0x75: case 0x76:                                                            /* pcmpeq */
+    case 0xd5: case 0xd8: case 0xd9: case 0xda: case 0xdb: case 0xdc: case 0xdd: case 0xde: case 0xdf:
+    case 0xe0: case 0xe3: case 0xe4: case 0xe5: case 0xe8: case 0xe9: case 0xea: case 0xeb: case 0xec:
+    case 0xed: case 0xee: case 0xef: case 0xf5: case 0xf6: case 0xf8: case 0xf9: case 0xfa: case 0xfc:
+    case 0xfd: case 0xfe:                   /* add/sub (also saturating), mul, min/max, avg, sad, logic */
+        return p;
     }
     return 0;
 }
@@ -1079,6 +1102,10 @@ static int classify(const Insn *b, uint8_t *reads, uint8_t *writes, int *kind)
     case OP_0F | 0xbc: case OP_0F | 0xbd:
         if (sz != 4) return 0;
         *writes = TRAP;
+        return 1;
+    case 0xfe:                              /* incb, decb (CF stays) */
+        if (b->reg > 1 || b->lock) return 0;
+        *writes = TRAP & ~FCF;
         return 1;
     case 0xff:
         if (sz != 4) return 0;
@@ -1779,6 +1806,20 @@ static void gen_inc_dec(const Insn *b, int reg, int dec, int needs, int needs_cf
         if (needs) { e(MR(RE, 5)); flags_new(dec ? CC_DEC : CC_INC, 2); }
         return;
     }
+    if (b->op == 0xfe) {                    /* 8 bit (incb/decb): result zero-extended in r5 */
+        if (!b->mem) { e(ADDI(5, reg_val(b->rm, 1, 5), dec ? -1 : 1)); reg_set(b->rm, 1, 5); }
+        else {
+            ea_pair(b, 1, &ra, &rb);
+            e(LBZX(5, ra, rb));
+            e(ADDI(5, 5, dec ? -1 : 1));
+            e(STBX(5, ra, rb));
+            after_save(b, 1, ra, rb, -1);
+        }
+        e(RLWINM(5, 5, 0, 24, 31));
+        g_res = 5;
+        if (needs) { e(MR(RE, 5)); flags_new(dec ? CC_DEC : CC_INC, 1); }
+        return;
+    }
     if (reg >= 0) { vd = R(reg); q = reg_val(reg, 4, 0); }
     else {
         int c = slot_reg(b, 4);
@@ -2111,11 +2152,11 @@ static int fusion(const Insn *b, int k, Cond *r)
     else if (op == 0xa8 || op == 0xa9) { alu = 8; sz = op == 0xa8 ? 1 : b->opsz; dir = 3; }
     else if (op == 0xf6 && b->reg == 0) { alu = 8; sz = 1; }
     else if (op == 0xf7 && b->reg == 0) { alu = 8; sz = 4; }
-    else if ((op >= 0x40 && op <= 0x4f) || (op == 0xff && b->reg <= 1)) {
+    else if ((op >= 0x40 && op <= 0x4f) || ((op == 0xff || op == 0xfe) && b->reg <= 1)) {
         if (kk != 2 && kk != 4) return 0;
-        if (op == 0xff) gen_inc_dec(b, b->mem ? -1 : b->rm, b->reg, 0, 0);
+        if (op >= 0xfe) gen_inc_dec(b, b->mem ? -1 : b->rm, b->reg, 0, 0);
         else gen_inc_dec(b, op & 7, op >= 0x48, 0, 0);
-        *r = res_cond(g_res, op == 0xff ? 4 : b->opsz, k);   /* 16 bit: g_res zero-extended */
+        *r = res_cond(g_res, op == 0xff ? 4 : op == 0xfe ? 1 : b->opsz, k);   /* 8/16 bit: g_res zero-extended */
         return 1;
     } else return 0;
     if (alu == 2 || alu == 3) return 0;
@@ -2590,37 +2631,97 @@ static int ea_in(const Insn *b)
 
 static void xf_forget(int n);
 
+/* Cpu.xmm holds the raw Intel bytes (lane 0 at the lowest address). Instructions that only move whole lanes
+   (unpack, shuffle, byte shifts) and byte-wise ones work on that form directly. Arithmetic on 16- and 32-bit lanes and
+   on floats works on the reversed form (all 16 bytes reversed, one vperm): each lane is then in host byte order, only
+   the order of the lanes is reversed, which element-wise operations do not notice. */
+static const uint8_t g_vrev[16] __attribute__((aligned(16))) = { 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
+static const uint8_t g_vrev8[16] __attribute__((aligned(16))) = { 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8 };
+static const uint8_t g_vmulh[16] __attribute__((aligned(16))) = { 0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29 };
+static const uint8_t g_v2p31[16] __attribute__((aligned(16))) = { 0x4f, 0, 0, 0, 0x4f, 0, 0, 0, 0x4f, 0, 0, 0, 0x4f, 0, 0, 0 };
+
+/* vperm patterns of the shuffles (pshufd/hw/lw, shufps, punpck*qdq): built at translation time, each one once */
+#define VPOOL 2048
+static uint8_t g_vpool[VPOOL][16] __attribute__((aligned(16)));
+static int g_vpool_n;
+
+static void vconst(int v, const uint8_t *m)
+{
+    int k;
+    if (((uintptr_t)m & 15) == 0 && (m == g_vrev || m == g_vrev8 || m == g_vmulh || m == g_v2p31)) k = -1;
+    else {
+        for (k = 0; k < g_vpool_n && memcmp(g_vpool[k], m, 16); k++) ;
+        if (k == g_vpool_n) {
+            if (k == VPOOL) { fprintf(stderr, "rosetta: vector constant pool full\n"); abort(); }
+            memcpy(g_vpool[g_vpool_n++], m, 16);
+        }
+        m = g_vpool[k];
+    }
+    load_imm(12, (uint32_t)(uintptr_t)m);
+    e(LVX(v, 0, 12));
+}
+
+static void vx_load(int v, int n) { e(LI(0, xmm_off(n))); e(LVX(v, RCPU, 0)); }
+static void vx_store(int v, int n) { e(LI(0, xmm_off(n))); e(STVX(v, RCPU, 0)); }
+
+/* second operand (xmm or aligned m128) into v */
+static void vsrc_load(int v, const Insn *b)
+{
+    int ra, rb;
+    if (b->mem) { ea_pair(b, 1, &ra, &rb); e(LVX(v, ra, rb)); }
+    else vx_load(v, b->rm);
+}
+
+/* 64-bit lanes of xmm n shifted by a constant through r3/r4 (AltiVec has no 64-bit elements) */
+static void gen_shift_q(int n, int c, int left)
+{
+    int k;
+    for (k = 0; k < 2; k++) {
+        int o = xmm_off(n) + 8 * k;
+        e(LI(0, o)); e(LWBRX(3, RCPU, 0));              /* low word */
+        e(LI(0, o + 4)); e(LWBRX(4, RCPU, 0));          /* high word */
+        if (!left && c >= 32) { e(c > 32 ? SRWI(3, 4, c - 32) : MR(3, 4)); e(LI(4, 0)); }
+        else if (!left) { e(SRWI(3, 3, c)); e(SLWI(5, 4, 32 - c)); e(OR(3, 3, 5)); e(SRWI(4, 4, c)); }
+        else if (c >= 32) { e(SLWI(4, 3, c - 32)); e(LI(3, 0)); }
+        else { e(SLWI(4, 4, c)); e(SRWI(5, 3, 32 - c)); e(OR(4, 4, 5)); e(SLWI(3, 3, c)); }
+        e(LI(0, o)); e(STWBRX(3, RCPU, 0));
+        e(LI(0, o + 4)); e(STWBRX(4, RCPU, 0));
+    }
+}
+
 static void gen_sse(const Insn *b)
 {
-    int op = b->op & 0xff, d = xmm_off(b->reg), ra, rb, a, i;
-    xf_forget(b->reg);                   /* AltiVec works on Cpu.xmm */
-    if (!b->mem) xf_forget(b->rm);
+    int op = b->op & 0xff, d = xmm_off(b->reg), ra, rb, a, i, c = (int)(b->imm & 0xff);
+    int gpr_rm = !b->mem && (op == 0x6e || op == 0x7e || op == 0xc4);   /* rm is an integer register */
+    int digit = op == 0x71 || op == 0x72 || op == 0x73;                   /* reg is part of the opcode */
+    uint8_t m[16];
+    if (!digit) xf_forget(b->reg);       /* AltiVec works on Cpu.xmm */
+    if (!b->mem && !gpr_rm) xf_forget(b->rm);
     switch (op) {
-    case 0x6f:                              /* xmm <- xmm/m128 */
-        if (b->mem && b->rep) {             /* movdqu: raw bytes, without alignment */
+    case 0x6f: case 0x10:                   /* xmm <- xmm/m128 */
+        if (b->mem && (b->rep || op == 0x10)) {     /* movdqu, movups: raw bytes, without alignment */
             a = ea_in(b);
             for (i = 0; i < 4; i++) e(LWZ(3 + i, 4 * i, a));
             for (i = 0; i < 4; i++) e(STW(3 + i, d + 4 * i, RCPU));
             return;
         }
-        if (b->mem) { ea_pair(b, 1, &ra, &rb); e(LVX(0, ra, rb)); }
-        else { e(LI(0, xmm_off(b->rm))); e(LVX(0, RCPU, 0)); }
-        e(LI(0, d)); e(STVX(0, RCPU, 0));
+        vsrc_load(0, b);
+        vx_store(0, b->reg);
         return;
-    case 0x7f:                              /* xmm/m128 <- xmm */
-        if (b->mem && b->rep) {
+    case 0x7f: case 0x11: case 0xe7:        /* xmm/m128 <- xmm */
+        if (b->mem && (b->rep || op == 0x11)) {
             for (i = 0; i < 4; i++) e(LWZ(3 + i, d + 4 * i, RCPU));
             a = ea_in(b);
             for (i = 0; i < 4; i++) e(STW(3 + i, 4 * i, a));
             after_save(b, 16, 0, a, -1);
             return;
         }
-        e(LI(0, d)); e(LVX(0, RCPU, 0));
+        vx_load(0, b->reg);
         if (b->mem) { ea_pair(b, 1, &ra, &rb); e(STVX(0, ra, rb)); after_save(b, 16, ra, rb, -1); }
-        else { e(LI(0, xmm_off(b->rm))); e(STVX(0, RCPU, 0)); }
+        else vx_store(0, b->rm);
         return;
     case 0xd7:                              /* pmovmskb r32, xmm: top bit of each byte */
-        e(LI(0, xmm_off(b->rm))); e(LVX(0, RCPU, 0));
+        vx_load(0, b->rm);
         e(VSPLTISB(1, 0));
         e(VCMPGTSB(0, 1, 0));               /* 0xff where the byte is negative */
         load_imm(12, (uint32_t)(uintptr_t)g_weights); e(LVX(2, 0, 12));
@@ -2630,21 +2731,164 @@ static void gen_sse(const Insn *b)
         for (i = 0; i < 4; i++) e(LWZ(3 + i, OFF(sse_tmp) + 4 * i, RCPU));
         e(ADD(3, 3, 4)); e(ADD(5, 5, 6)); e(SLWI(5, 5, 8)); e(OR(R(b->reg), 3, 5));
         return;
+    case 0x6e:                              /* movd xmm, r/m32: the rest becomes 0 */
+        if (!b->mem) { e(LI(0, d)); e(STWBRX(R(b->rm), RCPU, 0)); }
+        else if ((i = slot_reg(b, 4)) >= 0) { e(LI(0, d)); e(STWBRX(i, RCPU, 0)); }
+        else { a = ea_in(b); e(LWZ(3, 0, a)); e(STW(3, d, RCPU)); }
+        e(LI(3, 0));
+        for (i = 4; i < 16; i += 4) e(STW(3, d + i, RCPU));
+        return;
+    case 0x7e:                              /* movd r/m32, xmm */
+        if (!b->mem) { e(LI(0, d)); e(LWBRX(R(b->rm), RCPU, 0)); return; }
+        e(LI(0, d)); e(LWBRX(3, RCPU, 0));
+        ea_pair(b, 1, &ra, &rb);
+        e(STWBRX(3, ra, rb));
+        after_save(b, 4, ra, rb, 3);
+        return;
+    case 0xc4:                              /* pinsrw xmm, r32/m16, imm */
+        d += 2 * (c & 7);
+        if (!b->mem) { e(LI(0, d)); e(STHBRX(R(b->rm), RCPU, 0)); }
+        else { a = ea_in(b); e(LHZ(3, 0, a)); e(STH(3, d, RCPU)); }
+        return;
+    case 0xc5:                              /* pextrw r32, xmm, imm */
+        e(LI(0, xmm_off(b->rm) + 2 * (c & 7))); e(LHBRX(R(b->reg), RCPU, 0));
+        return;
+    case 0x70:                              /* pshufd, pshuflw (f2), pshufhw (f3): one vperm on the raw bytes */
+        for (i = 0; i < 16; i++) m[i] = (uint8_t)i;
+        if (b->p66) for (i = 0; i < 16; i++) m[i] = (uint8_t)(4 * ((c >> (i / 4 * 2)) & 3) + i % 4);
+        else {
+            int base = b->rep == 0xf3 ? 8 : 0;
+            for (i = 0; i < 8; i++) m[base + i] = (uint8_t)(base + 2 * ((c >> (i / 2 * 2)) & 3) + i % 2);
+        }
+        vsrc_load(1, b);
+        vconst(2, m);
+        e(VPERM(0, 1, 1, 2));
+        vx_store(0, b->reg);
+        return;
+    case 0x71: case 0x72:                   /* shift 16/32-bit lanes by a constant: reg 2 srl, 4 sra, 6 sll */
+        i = op == 0x71 ? 15 : 31;
+        if (c > i && b->reg != 4) { e(VSPLTISB(0, 0)); vx_store(0, b->rm); return; }
+        if (c > i) c = i;
+        if (!c) return;
+        vx_load(0, b->rm);
+        vconst(7, g_vrev); e(VPERM(0, 0, 0, 7));
+        if (op == 0x71) {
+            e(VSPLTISH(1, c));
+            e(b->reg == 2 ? VSRH(0, 0, 1) : b->reg == 4 ? VSRAH(0, 0, 1) : VSLH(0, 0, 1));
+        } else {
+            e(VSPLTISW(1, c < 16 ? c : c - 32));    /* the shift uses the low 5 bits */
+            e(b->reg == 2 ? VSRW(0, 0, 1) : b->reg == 4 ? VSRAW(0, 0, 1) : VSLW(0, 0, 1));
+        }
+        e(VPERM(0, 0, 0, 7));
+        vx_store(0, b->rm);
+        return;
+    case 0x73:                              /* 2 psrlq, 6 psllq (bits), 3 psrldq, 7 pslldq (bytes) */
+        if (b->reg == 2 || b->reg == 6) {
+            if (c > 63) { e(VSPLTISB(0, 0)); vx_store(0, b->rm); return; }
+            if (c) gen_shift_q(b->rm, c, b->reg == 6);
+            return;
+        }
+        if (c > 15) { e(VSPLTISB(0, 0)); vx_store(0, b->rm); return; }
+        if (!c) return;
+        vx_load(0, b->rm);
+        e(VSPLTISB(1, 0));
+        e(b->reg == 3 ? VSLDOI(0, 0, 1, c) : VSLDOI(0, 1, 0, 16 - c));     /* raw byte i <- i + c, i - c */
+        vx_store(0, b->rm);
+        return;
+    case 0x5b:                              /* cvtdq2ps; cvtps2dq (66), cvttps2dq (f3): 0x80000000 if out of range */
+        vsrc_load(1, b);
+        vconst(7, g_vrev); e(VPERM(1, 1, 1, 7));
+        if (!b->p66 && !b->rep) e(VCFSX(0, 1, 0));
+        else {
+            if (b->p66) e(VRFIN(1, 1));     /* rounding of MXCSR (nearest, the default) */
+            e(VCTSXS(0, 1, 0));
+            vconst(2, g_v2p31);
+            e(VCMPGTFP(3, 2, 1));            /* in range: x < 2^31 (false for NaN; below -2^31 vctsxs saturates right) */
+            e(VSPLTISW(4, -1)); e(VSLW(4, 4, 4));
+            e(VSEL(0, 4, 0, 3));
+        }
+        e(VPERM(0, 0, 0, 7));
+        vx_store(0, b->reg);
+        return;
     }
     /* xmm op= xmm/m128 (memory must be aligned for SSE) */
-    e(LI(0, d)); e(LVX(0, RCPU, 0));
-    if (b->mem) { ea_pair(b, 1, &ra, &rb); e(LVX(1, ra, rb)); }
-    else { e(LI(0, xmm_off(b->rm))); e(LVX(1, RCPU, 0)); }
-    switch (op) {
+    vx_load(0, b->reg);
+    vsrc_load(1, b);
+    switch (op) {                           /* raw form: lanes stay together, byte-wise */
+    case 0x60: e(VMRGHB(0, 0, 1)); break;  /* punpckl*: lanes of the low halves alternately */
+    case 0x61: e(VMRGHH(0, 0, 1)); break;
+    case 0x62: case 0x14: e(VMRGHW(0, 0, 1)); break;
+    case 0x68: e(VMRGLB(0, 0, 1)); break;  /* punpckh* */
+    case 0x69: e(VMRGLH(0, 0, 1)); break;
+    case 0x6a: case 0x15: e(VMRGLW(0, 0, 1)); break;
+    case 0x6c: case 0x6d:                   /* punpcklqdq, punpckhqdq */
+        for (i = 0; i < 16; i++) m[i] = (uint8_t)((i < 8 ? 0 : 16) + (op == 0x6d ? 8 : 0) + i % 8);
+        vconst(2, m); e(VPERM(0, 0, 1, 2));
+        break;
+    case 0xc6:                              /* shufps: lanes 0, 1 from the destination, 2, 3 from the source */
+        for (i = 0; i < 16; i++) m[i] = (uint8_t)((i < 8 ? 0 : 16) + 4 * ((c >> (i / 4 * 2)) & 3) + i % 4);
+        vconst(2, m); e(VPERM(0, 0, 1, 2));
+        break;
+    case 0x64: e(VCMPGTSB(0, 0, 1)); break;
     case 0x74: e(VCMPEQUB(0, 0, 1)); break;
     case 0x75: e(VCMPEQUH(0, 0, 1)); break;
     case 0x76: e(VCMPEQUW(0, 0, 1)); break;
+    case 0xd8: e(VSUBUBS(0, 0, 1)); break;
+    case 0xda: e(VMINUB(0, 0, 1)); break;
     case 0xdb: e(VAND(0, 0, 1)); break;
+    case 0xdc: e(VADDUBS(0, 0, 1)); break;
+    case 0xde: e(VMAXUB(0, 0, 1)); break;
     case 0xdf: e(VANDC(0, 1, 0)); break;   /* ~d & s */
-    case 0xeb: e(PRE(0, 0, 1)); break;
+    case 0xe0: e(VAVGUB(0, 0, 1)); break;
+    case 0xe8: e(VSUBSBS(0, 0, 1)); break;
+    case 0xeb: e(VOR(0, 0, 1)); break;
+    case 0xec: e(VADDSBS(0, 0, 1)); break;
     case 0xef: e(VXOR(0, 0, 1)); break;
+    case 0xf8: e(VSUBUBM(0, 0, 1)); break;
+    case 0xfc: e(VADDUBM(0, 0, 1)); break;
+    case 0xf6:                              /* psadbw: per 64-bit lane the sum of |d - s| over its 8 bytes */
+        e(VSUBUBS(2, 0, 1)); e(VSUBUBS(3, 1, 0)); e(VOR(0, 2, 3));
+        e(VSPLTISB(1, 0));
+        e(VSUM4UBS(0, 0, 1)); e(VSUM2SWS(0, 0, 1));    /* sum as 64-bit host value per half */
+        vconst(2, g_vrev8); e(VPERM(0, 0, 0, 2));
+        break;
+    default:                                /* reversed form: lanes in host byte order */
+        vconst(7, g_vrev);
+        e(VPERM(0, 0, 0, 7)); e(VPERM(1, 1, 1, 7));
+        switch (op) {
+        case 0x63: e(VPKSHSS(0, 1, 0)); break;     /* packs: source first (it lands in the high half) */
+        case 0x67: e(VPKSHUS(0, 1, 0)); break;
+        case 0x6b: e(VPKSWSS(0, 1, 0)); break;
+        case 0x65: e(VCMPGTSH(0, 0, 1)); break;
+        case 0x66: e(VCMPGTSW(0, 0, 1)); break;
+        case 0xd5: e(VSPLTISB(2, 0)); e(VMLADDUHM(0, 0, 1, 2)); break;   /* pmullw */
+        case 0xe4: case 0xe5:               /* pmulhuw, pmulhw: high halves of the even and odd products */
+            e(op == 0xe5 ? VMULESH(2, 0, 1) : VMULEUH(2, 0, 1));
+            e(op == 0xe5 ? VMULOSH(3, 0, 1) : VMULOUH(3, 0, 1));
+            vconst(4, g_vmulh); e(VPERM(0, 2, 3, 4));
+            break;
+        case 0xf5: e(VSPLTISB(2, 0)); e(VMSUMSHM(0, 0, 1, 2)); break;    /* pmaddwd */
+        case 0xd9: e(VSUBUHS(0, 0, 1)); break;
+        case 0xdd: e(VADDUHS(0, 0, 1)); break;
+        case 0xe3: e(VAVGUH(0, 0, 1)); break;
+        case 0xe9: e(VSUBSHS(0, 0, 1)); break;
+        case 0xea: e(VMINSH(0, 0, 1)); break;
+        case 0xed: e(VADDSHS(0, 0, 1)); break;
+        case 0xee: e(VMAXSH(0, 0, 1)); break;
+        case 0xf9: e(VSUBUHM(0, 0, 1)); break;
+        case 0xfa: e(VSUBUWM(0, 0, 1)); break;
+        case 0xfd: e(VADDUHM(0, 0, 1)); break;
+        case 0xfe: e(VADDUWM(0, 0, 1)); break;
+        case 0x58: e(VADDFP(0, 0, 1)); break;
+        case 0x5c: e(VSUBFP(0, 0, 1)); break;
+        case 0x59: e(VSPLTISW(2, -1)); e(VSLW(2, 2, 2)); e(VMADDFP(0, 0, 1, 2)); break;  /* d * s + (-0): one rounding */
+        case 0x5d: e(VCMPGTFP(2, 1, 0)); e(VSEL(0, 1, 0, 2)); break;   /* minps: d < s ? d : s (NaN, +-0: s) */
+        case 0x5f: e(VCMPGTFP(2, 0, 1)); e(VSEL(0, 1, 0, 2)); break;   /* maxps: d > s ? d : s */
+        }
+        e(VPERM(0, 0, 0, 7));
+        break;
     }
-    e(LI(0, d)); e(STVX(0, RCPU, 0));
+    vx_store(0, b->reg);
 }
 
 /* ---------- Constants from read-only memory ----------
@@ -3010,7 +3254,8 @@ static int no_memwrite(const Insn *b)
     if (x87_can(b))
         return op == 0xd8 || op == 0xdc || ((op == 0xd9 || op == 0xdd || op == 0xdb || op == 0xdf) && b->reg == 0);
     if (op >= OP_0F && pd_can(b)) return o != 0x11 && o != 0x29 && o != 0x13 && o != 0x17 && o != 0xd6;
-    if (op >= OP_0F && !sse_can(b) && fp_can(b)) return o != 0x11 && o != 0x29;
+    if (op >= OP_0F && sse_can(b)) return o != 0x7f && o != 0x11 && o != 0xe7 && o != 0x7e;
+    if (op >= OP_0F && fp_can(b)) return o != 0x11 && o != 0x29;
     switch (op) {
     case 0x8a: case 0x8b: case 0x8d: case 0x84: case 0x85: case 0x69: case 0x6b: case OP_0F | 0xaf:
     case OP_0F | 0xb6: case OP_0F | 0xb7: case OP_0F | 0xbe: case OP_0F | 0xbf:
@@ -5161,6 +5406,9 @@ static void gen(const Insn *b, int needs, int needs_cf)
         e(ADDI(R(ESP), R(ESP), 4));
         return;
     }
+    case 0xfe:                              /* incb, decb */
+        gen_inc_dec(b, b->mem ? -1 : b->rm, b->reg, needs, needs_cf);
+        return;
     case 0xff:
         if (b->reg <= 1) { gen_inc_dec(b, b->mem ? -1 : b->rm, b->reg, needs, needs_cf); return; }
         /* push r/m */
@@ -5255,6 +5503,18 @@ static int mem_access(const Insn *b, int *sz, int *reads, int *writes)
         *sz = 16; *reads = 1;               /* arithmetic, movupd, unpck, shufpd, cmppd: read 16 bytes */
         return 1;
     }
+    if (op >= OP_0F && sse_can(b)) {
+        int o = op & 0xff;
+        if (!b->mem) return 0;
+        switch (o) {
+        case 0x6e: *sz = 4; *reads = 1; return 1;                   /* movd xmm, m32 */
+        case 0x7e: *sz = 4; *writes = 1; return 1;                  /* movd m32, xmm */
+        case 0xc4: *sz = 2; *reads = 1; return 1;                   /* pinsrw */
+        case 0x7f: case 0x11: case 0xe7: *sz = 16; *writes = 1; return 1;
+        }
+        *sz = 16; *reads = 1;
+        return 1;
+    }
     if (op >= OP_0F && (sse_can(b) || fp_can(b))) {
         int o = op & 0xff, d = b->rep == 0xf2 ? 8 : 4;
         if (!b->mem) return 0;
@@ -5291,6 +5551,7 @@ static int mem_access(const Insn *b, int *sz, int *reads, int *writes)
     case 0xc6: case 0xc7: *sz = op == 0xc6 ? 1 : b->opsz; *writes = 1; return 1;
     case 0xc1: case 0xd1: case 0xd3: *reads = 1; *writes = 1; return 1;
     case 0xff: *reads = 1; *writes = b->reg <= 1; return 1;
+    case 0xfe: *sz = 1; *reads = 1; *writes = 1; return 1;
     case 0x87: *reads = 1; *writes = 1; return 1;
     case 0x69: case 0x6b: case OP_0F | 0xaf: *reads = 1; return 1;
     case OP_0F | 0xb6: case OP_0F | 0xbe: *sz = 1; *reads = 1; return 1;
@@ -5319,8 +5580,12 @@ static uint8_t write_mask_calc(const Insn *b)
 #define MK(x) ((uint8_t)(1u << (x)))
     if (x87_can(b)) return 0;
     if (op >= OP_0F && pd_can(b)) return (op & 0xff) == 0x50 ? MK(b->reg) : 0;    /* movmskpd */
-    if (op >= OP_0F && (sse_can(b) || fp_can(b)))    /* only cvt*2si and pmovmskb write an integer register */
-        return ((op & 0xff) == 0x2c || (op & 0xff) == 0x2d || (op & 0xff) == 0xd7) ? MK(b->reg) : 0;
+    if (op >= OP_0F && sse_can(b)) {      /* pmovmskb, pextrw, movd r32 write an integer register */
+        if ((op & 0xff) == 0xd7 || (op & 0xff) == 0xc5) return MK(b->reg);
+        return (op & 0xff) == 0x7e && !m ? MK(b->rm) : 0;
+    }
+    if (op >= OP_0F && fp_can(b))          /* only cvt*2si write an integer register */
+        return ((op & 0xff) == 0x2c || (op & 0xff) == 0x2d) ? MK(b->reg) : 0;
     if (op < 0x40 && (op & 7) < 6) {
         int g = (op & 1) ? b->opsz : 1;
         if ((op >> 3) == 7) return 0;
@@ -5360,6 +5625,7 @@ static uint8_t write_mask_calc(const Insn *b)
         if (b->reg == 0 || b->reg == 1) return 0;
         if (b->reg == 2 || b->reg == 3) return m ? 0 : MK(BREG(b->rm, op == 0xf6 ? 1 : 4));
         return op == 0xf6 ? MK(EAX) : (uint8_t)(MK(EAX) | MK(EDX));
+    case 0xfe: return b->reg <= 1 && !m ? MK(BREG(b->rm, 1)) : (b->reg <= 1 ? 0 : 0xff);
     case 0xff:
         if (b->reg <= 1) return m ? 0 : MK(b->rm);
         if (b->reg == 2 || b->reg == 6) return MK(ESP);
@@ -7848,11 +8114,11 @@ static int u32_cmp(const void *a, const void *b)
  * (jit_mapping_expected), any other mapping over translated pages discards the blocks that rely on those pages
  * (invalidate_ranges; a library at another address than in the saved run costs only its own blocks).
  * ROSETTA_NO_CACHE=1 */
-#define CACHE_MAGIC 0x564f5237u
+#define CACHE_MAGIC 0x564f5238u
 #define CACHE_IMAGES 128
 typedef struct {
     uint32_t magic, cache, prolog, code, nmap, npages, ncpool, nvlpc, vlring, nvar, nimages, codeoffset, ntab, nhead, ndep;
-    uint32_t nmapping;
+    uint32_t nmapping, nvpool;
 } CacheHead;
 typedef struct { uint32_t start, end, size, mtime, ino, type; char path[232]; } CacheImage;
 static char g_cache_path[1024];
@@ -8010,7 +8276,7 @@ static void cache_write(void)
     }
     if (g_cache != (uint32_t *)(uintptr_t)CACHE_ADDR) return;
     b = malloc(sizeof *b * CACHE_IMAGES);
-    t = malloc(8 * ((size_t)g_nused + VAR_N * 2 + (1u << 15)) + 8 * (size_t)g_cpool_n + 4 * (size_t)VL_PCS + 8 * (size_t)TABLE +
+    t = malloc(8 * ((size_t)g_nused + VAR_N * 2 + (1u << 15)) + 8 * (size_t)g_cpool_n + 16 * (size_t)g_vpool_n + 4 * (size_t)VL_PCS + 8 * (size_t)TABLE +
                8 * (size_t)g_nhead + sizeof(BlockDep) * (size_t)g_ndep + sizeof(Mapping) * (size_t)g_nmapping);
     if (!b || !t) { free(b); free(t); return; }
     memset(&k, 0, sizeof k);
@@ -8052,6 +8318,7 @@ static void cache_write(void)
     k.code = (uint32_t)((uint8_t *)g_free - (uint8_t *)g_cache);   /* with the exit stubs */
     k.vlring = (uint32_t)g_vl_nring;
     k.ncpool = (uint32_t)g_cpool_n;
+    k.nvpool = (uint32_t)g_vpool_n;
     snprintf(tmp, sizeof tmp, "%s.%d", g_cache_path, (int)getpid());
     if ((fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644)) < 0) { free(foreign); free(stub); free(b); free(t); return; }
     /* map: eip, offset in the cache */
@@ -8078,6 +8345,8 @@ static void cache_write(void)
         s += 3 * k.nvar;
         memcpy(s, g_cpool, 8 * (size_t)k.ncpool);
         s += 2 * k.ncpool;
+        memcpy(s, g_vpool, 16 * (size_t)k.nvpool);      /* vperm patterns: the code loads them by address */
+        s += 4 * k.nvpool;
         for (i = 0; i < VL_PCS; i++) if (g_vl_pc[i]) s[k.nvlpc++] = g_vl_pc[i];
         s += k.nvlpc;
         /* jump table (targets of indirect jumps): otherwise every run fills it again through misses in the dispatcher */
@@ -8224,7 +8493,7 @@ static void cache_load(void)
         k.prolog != (uint32_t)((uint8_t *)g_cache_start - (uint8_t *)g_cache) || k.code < k.prolog ||
         k.code > CACHE_SIZE - (1u << 20) || k.nimages > CACHE_IMAGES || k.ncpool > CPOOL || k.nvar > VAR_N ||
         k.npages > (1u << 15) || k.nvlpc > VL_PCS || k.vlring > VL_RINGS || k.ntab > TABLE || k.nhead > (1u << 20) ||
-        k.ndep > (1u << 22) || k.nmapping > MAPPING_N)
+        k.ndep > (1u << 22) || k.nmapping > MAPPING_N || k.nvpool > VPOOL)
         goto way;
     if (read(fd, g_vimage, sizeof *g_vimage * k.nimages) != (ssize_t)(sizeof *g_vimage * k.nimages)) goto way;
     /* check program and dyld (rosetta loads it itself) now; the libraries only when dyld maps them
@@ -8240,7 +8509,7 @@ static void cache_load(void)
         }
     }
     reason = "read";
-    n = 2 * k.nmap + 2 * k.npages + 3 * k.nvar + 2 * k.ncpool + k.nvlpc + 2 * k.ntab + 2 * k.nhead + 5 * k.ndep + 6 * k.nmapping;
+    n = 2 * k.nmap + 2 * k.npages + 3 * k.nvar + 2 * k.ncpool + 4 * k.nvpool + k.nvlpc + 2 * k.ntab + 2 * k.nhead + 5 * k.ndep + 6 * k.nmapping;
     if (!(t = malloc(4 * (size_t)n + 4)) || read(fd, t, 4 * (size_t)n) != (ssize_t)(4 * (size_t)n) || (k.codeoffset & 4095) ||
         k.codeoffset < sizeof k + sizeof *g_vimage * k.nimages + 4 * (size_t)n) goto way;
     /* map the code instead of copying it: no zero pages, no copy, only touched pages cost. The kernel syncs the
@@ -8282,6 +8551,9 @@ static void cache_load(void)
         s += 3 * k.nvar;
         for (i = 0; i < k.ncpool; i++) { uint64_t v; memcpy(&v, s + 2 * i, 8); cpool(v); }
         s += 2 * k.ncpool;
+        memcpy(g_vpool, s, 16 * (size_t)k.nvpool);      /* same places as in the saved run */
+        g_vpool_n = (int)k.nvpool;
+        s += 4 * k.nvpool;
         for (i = 0; i < k.nvlpc; i++) vl_pc_add(s[i]);
         g_vl_nring = (int)k.vlring;
         s += k.nvlpc;
@@ -8675,6 +8947,8 @@ static int dispatcher(Cpu *c)
     }
     c->fault_jmp = (void *)jb;
     c->host_thread = (void *)pthread_self();
+    /* AltiVec in Java mode (VSCR.NJ = 0): denormal floats as in IEEE and SSE, Mac OS X starts threads with NJ = 1 */
+    __asm__ volatile(".long 0x1000038c\n\t.long 0x10000644");     /* vspltisw v0,0; mtvscr v0 */
     r = dispatch_loop(c);
     c->fault_jmp = prev;
     return r;

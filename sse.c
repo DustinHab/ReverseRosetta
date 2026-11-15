@@ -293,6 +293,10 @@ int sse_step(Cpu *c, const Insn *b)
         if (scalar) n = 1;
         for (i = 0; i < n; i++) {
             double x = dop ? xd(d, i) : xf(d, i), y = dop ? xd(&s, i) : xf(&s, i), r;
+            if (o == 0x5d || o == 0x5f) {   /* min/max select an operand: its bits unchanged (also a signaling NaN) */
+                if (!(o == 0x5d ? x < y : x > y)) { if (dop) xq_s(d, i, xq(&s, i)); else xw_s(d, i, xw(&s, i)); }
+                continue;
+            }
             switch (o) {
             case 0x51: r = sqrt(y); break;
             case 0x52: r = 1.0 / sqrt(y); break;
