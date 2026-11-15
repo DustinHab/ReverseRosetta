@@ -756,3 +756,46 @@ windows of a program under rosetta; kqueue (362) is missing, libevent falls back
   prefetched value only if dd - k*step overlaps it for k between the prefetch and the use). Measured on the G4
   (`tools/probes/swap_load_cost.c`): lwbrx costs barely more than lwz; four word loads, four stores and two lfd per
   two doubles take 20 cycles, lvx/vperm/stvx per double 16, one vector for two doubles 14.
+
+**Translation cache across library layouts** (2026-11-15). Programs with windows alternated between a cold start
+and a lost cache: in the second run, Calculator loaded 23497 blocks, but 26 mappings did not match the saved run, the
+first one flushed everything, the cache was deleted, and the third run was cold again (Transmission likewise with 43).
+The cause is the small libraries that are not prebound at a fixed address (stub libraries, frameworks inside the
+application): dyld places them wherever there is room, and that differs between a cold and a warm start.
+- Dependencies per block (`BlockDep`, `dep_note`): besides the global page bitmap, each block records the guest pages it
+  was translated from (its instructions, inlined callees, predicted constants) as up to three spans of pages; spans
+  within 64 KB merge, a fourth region widens the nearest span, beyond 16 MB the block counts as relying on everything.
+  The records follow the order of the code, so a binary search by code offset finds them; 20 bytes per block, also in
+  the cache file.
+- A mapping, munmap or mprotect over pages with code no longer flushes but queues the range (`jit_range_changed`,
+  `g_flush` 2); the dispatcher then discards exactly the blocks whose spans touch it (`invalidate_ranges`): the first
+  instruction of each becomes a jump to an exit stub with its eip, which chains to the new translation at its first
+  use (jumps already chained to the old block keep working), map and jump table forget it, variants get a tombstone
+  (probe chains stay intact; the watchdog skips them), the return rings start anew, the code pages of the range are
+  free again. Too many ranges at once (64) or no room for the stubs: flush as before. `ROSETTA_NO_PARTIAL=1`.
+- Checking a mapping per segment: the cache now stores every mapping of the run (address, file, offset in the file;
+  anonymous ones too), and a new mapping counts as expected only if the newest saved one at that place had the same
+  part of the same file there. The old check per image (same file somewhere in the old image range) let through a
+  framework that dyld had placed two pages further on: same file, but different code at every address. Segments do
+  not keep their file distance in memory (libSystem's `__DATA`), so the offset is compared per mapping, not per image.
+- A mapping is also not expected when code translated in this run relies on its pages (`g_newpages`): the program in
+  `tests/remap.c` maps file 2 over file 1 and file 1 back again, which matches the saved run, but the blocks there came
+  from file 2. The test also checks a caller in another file that inlined the replaced code: with the translation
+  cache of the run before, exactly that caller block is discarded (`ROSETTA_CACHE_SHOW=2` lists the discarded blocks).
+- Blocks outside the images were written with an exit of kind INVALID at their start; every jump into them then
+  translated the block again. Now it is a chainable exit stub like above. The cache is written again when more than
+  32 blocks from it had to be discarded, so the next run finds the new layout. `ROSETTA_CACHE_SHOW` and `ROSETTA_LOG`
+  had changed the key of the translation cache (strncmp with the wrong length): a measurement with them used a cache
+  of its own. `ROSETTA_CACHE_FILE` sets the file (for tests). Discarded blocks lead to a rewrite only beyond 32 +
+  1/64 of the cache, like new code: Calculator discards 161 blocks in every warm start (two allocations land on pages
+  of the saved run), translating them again costs ~25 ms, rewriting 16 MB right after the window appears more.
+- Every program has a translation cache of its own; after the test matrix the folder held 533 of them (200 MB).
+  Beyond `ROSETTA_CACHE_MAX_MB` (default 256) together, the caches used longest ago are deleted when one is written.
+- Result, window after start (first, second, from the third start with an empty cache): Calculator 9.3 / 8.8 /
+  2.8-3.3 s (the native PowerPC Calculator 2 to 3 s), Transmission 17.0 / 17.4 / 9.5-11.1 s. The second start
+  translates everything that the first one only interpreted (threshold 1 with a cache: 37600 blocks for Calculator),
+  from the third on almost nothing is translated (450 blocks) and only a few blocks are discarded (57 for an
+  allocation that lands on pages of the saved run). Loading Calculator's cache (60817 blocks, 14.6 MB code): 47 ms,
+  1494 page faults. Processor time profile of a warm Transmission start: translated guest code 36 %, interpreted 5 %,
+  system calls and host libraries 54 % (mach_msg 20 %, stat/open/close/mmap/getattrlist together about 15 %),
+  loading the cache 1.7 %, discarding 0.8 %, translating 0.5 %.

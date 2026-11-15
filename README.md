@@ -45,6 +45,14 @@ Startup time, translated against native, fastest of 7 runs with the translation 
 | Foundation test | 69 ms | 47 ms |
 | `/bin/ls -la /usr/lib` (i386 part of the universal binary) | 71 ms | 42 ms |
 
+Programs with windows, time until the window appears, starting with an empty translation cache. The second start
+translates everything the first one only interpreted; from the third start on almost nothing is translated:
+
+| Program | 1st start | 2nd start | from the 3rd start | Native PowerPC build |
+|---|---|---|---|---|
+| Calculator.app | 9.3 s | 8.8 s | 2.8 to 3.3 s | 2 to 3 s |
+| Transmission 2.42 | 17.0 s | 17.4 s | 9.5 to 11.1 s | (Intel only) |
+
 ## What runs
 
 - Command-line programs: the i386 parts of the universal binaries in Mac OS X. `tests/cli_matrix.sh` runs every one
@@ -75,8 +83,10 @@ therefore take their Intel code paths, as on Apple's Rosetta, which showed Power
   AltiVec for byte swapping and packed bitwise operations, native stubs for frequent libSystem string and math
   functions).
 - Translated code is stored in a translation cache under `~/Library/Caches/rosetta` and mapped back in on the next
-  start of the same program. Besides at the end, it is written after 6 and 45 seconds of run time, so programs that
-  are closed by a signal or at logout keep their translations too.
+  start of the same program. Besides at the end, it is written after 6 and 45 seconds of run time and at the first
+  idle moment, so programs that are closed by a signal or at logout keep their translations too. Each block records
+  the guest pages it was translated from; when a library lands at a different address than in the saved run, only
+  the blocks that rely on those pages are translated again.
 - System calls (BSD and Mach traps) are converted between the byte orders. Mach messages are converted header by
   header; MIG messages are converted by MIG itself (NDR record). Messages to the font server (ATS) are converted
   field by field from a layout table.
@@ -191,8 +201,10 @@ error code.
 | `ROSETTA_INTERP=1` | interpreter only, no translation |
 | `ROSETTA_THRESHOLD=N` | number of executions before a block is translated |
 | `ROSETTA_NO_CACHE=1` | do not read or write the translation cache |
-| `ROSETTA_CACHE_SHOW=1` | report why a cached translation is used or rejected (`=2`: every new block) |
+| `ROSETTA_CACHE_SHOW=1` | report why a cached translation is used or rejected (`=2`: every new and every discarded block) |
 | `ROSETTA_NO_CHECKPOINT=1` | write the translation cache only at the end |
+| `ROSETTA_CACHE_FILE=FILE` | use this file as the translation cache (tests) |
+| `ROSETTA_CACHE_MAX_MB=N` | translation caches of all programs together at most N MB (default 256; the ones used longest ago are deleted) |
 | `ROSETTA_HOST_CPU=1` | show the guest the real PowerPC processor instead of the Intel one |
 | `ROSETTA_STATS=1` | translator counters and times at exit |
 | `ROSETTA_LOG=1` | log of system calls and Mach traps (`=2`: with time and thread) |
@@ -207,7 +219,7 @@ error code.
 ## Tests
 
 ```
-tests/run_tests.sh      # 39 comparisons against native builds, real Intel output or the interpreter
+tests/run_tests.sh      # 41 comparisons against native builds, real Intel output or the interpreter
 tests/measure_all.sh    # the benchmark loads above
 tests/cli_matrix.sh     # every universal command line program of the system, translated against native
 ```
@@ -220,7 +232,7 @@ login session exists.
 `cli_matrix.sh` runs each command natively, translated, and natively again (output that changes between the native
 runs, such as a clock, is set aside) in an empty working directory, without arguments and with input from
 `/dev/null`; programs that could send mail, print, change settings or start services are never run. Current result
-on the iBook: 580 of 644 commands give byte-identical output and exit status, 15 change between native runs. Most of
+on the iBook: 590 of 644 commands give byte-identical output and exit status, 15 change between native runs. Most of
 the rest differ on purpose (they report the Intel processor: `arch`, `machine`, `uname`, compiler driver names),
 need Intel libraries that the update does not contain (AppleTalk, Tcl, OpenDirectory, Samba), or crash natively as
 well.
@@ -237,9 +249,9 @@ well.
 - Frameworks that the 10.5.8 update does not contain as i386 (QuickTime, QTKit, CoreVideo, Tcl, OpenDirectory ...)
   are stubs; features that need them do not work. Calculator's engine is the exception: it runs as the native
   PowerPC function.
-- Programs with windows start slowly: on the iBook G4, Calculator shows its window after 8 to 10 seconds (the native
-  PowerPC Calculator after 2 to 3), Transmission after 15 to 17 seconds. About a quarter of the processor time at
-  startup goes to translating and interpreting code that runs only a few times.
+- Programs with windows start slowly the first two times (see the table under Performance): Calculator after about
+  9 seconds, Transmission after about 17. With the translation cache filled, about half of the processor time at
+  startup goes to system calls and Mach messages, a third to the translated guest code.
 - Font server: the reply to a file-reference request (FSRef) is not converted yet; a few rarely used message types
   are passed through unconverted and reported once.
 

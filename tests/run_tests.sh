@@ -78,6 +78,10 @@ t_calc()  { ./rosetta ./calculate; }
 r_calc()  { ./calculate.ppc; }
 t_id()    { ./rosetta ./identity; }
 r_id()    { cat ../tests/identity.expected; }
+t_remap() { ./rosetta ./remap; ./rosetta ./remap; ROSETTA_THRESHOLD=1 ./rosetta ./remap; }   # second run: translation cache
+r_remap() { cat ../tests/remap.expected ../tests/remap.expected ../tests/remap.expected; }
+t_remapc() { rm -f /tmp/rr_remap_cache; for n in 1 2 1 2; do ROSETTA_CACHE_FILE=/tmp/rr_remap_cache ./rosetta ./remap $n; done; rm -f /tmp/rr_remap_cache; }
+r_remapc() { for n in 1 2 1 2; do echo "file $n: 10$n (sum 10${n}000)"; done; }
 t_cmpsb() { ROSETTA_THRESHOLD=1 ./rosetta ./cmpsb; }
 r_cmpsb() { ROSETTA_INTERP=1 ./rosetta ./cmpsb; }
 same raw_arith t_raw r_raw
@@ -101,6 +105,8 @@ same "exceptions to the program's handlers (SIGFPE, SIGILL, SIGTRAP)" t_flt r_fl
 same "exceptions, interpreter only" t_flti r_flt
 same "exceptions, translated at once" t_fltj r_flt
 same "processor identity (Intel Core Duo, SSE3)" t_id r_id
+same "code replaced by remapping and writing (with translation cache)" t_remap r_remap
+same "translation cache: another file at the address of inlined code" t_remapc r_remapc
 same "signal without handler terminates" t_sige r_sige
 same "sed (Intel)" t_sed r_sed
 same fpcompare t_fpc r_fpc

@@ -24,7 +24,7 @@ void jit_blocks_sort(void);              /* profile: block table by host address
 void jit_prog(const char *path);            /* prior knowledge: program (key of the hot block list) */
 void jit_end(void);                            /* prior knowledge: write the hot block list */
 uint32_t jit_guest_eip(uint32_t host);           /* guest eip of the block for a host address (0: none) */
-int jit_mapping_expected(uint32_t a, uint32_t len, int fd);   /* translation cache: mmap places a known library at its address */
+int jit_mapping_expected(uint32_t a, uint32_t len, int fd, uint32_t off);   /* translation cache: mmap places a known library at its address */
 void jit_fd_off(int fd);                        /* descriptor closed/replaced (fstat cache) */
 
 /* threads (thread.c) */

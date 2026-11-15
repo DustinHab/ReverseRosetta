@@ -199,6 +199,7 @@ static int g_no_precompute;           /* ROSETTA_NO_PRECOMPUTE: predict the call
 static int g_no_xhost;                /* ROSETTA_NO_XHOST: xmm always in Intel format at block boundaries */
 static int g_no_fw_stack;            /* ROSETTA_NO_FW_STACK: floating-point forwarding compares only address forms */
 static uint32_t g_codepages[1u << 15]; /* bitmap of the 4 KB guest pages with translated code */
+static uint32_t g_newpages[1u << 15];  /* the same for the blocks translated in this run (not from the translation cache) */
 #define NEED_N 2048                      /* remembered flag liveness per jump target (need) */
 static uint32_t g_need_eip[NEED_N];
 static uint8_t g_need_w[NEED_N];
@@ -508,7 +509,8 @@ int jit_interrupt(void)
             uint32_t h = g_inuse[i];
             if (g_map[h].code && g_map[h].eip && g_map[h].eip != 0xffffffffu) block_starts_halt(g_map[h].code, g_map[h].eip, 0);
         }
-        for (i = 0; i < VAR_N; i++) if (g_var[i].code) block_starts_halt(g_var[i].code, g_var[i].loc, 0);
+        for (i = 0; i < VAR_N; i++)
+            if (g_var[i].code && g_var[i].loc != 0xffffffffu) block_starts_halt(g_var[i].code, g_var[i].loc, 0);
         for (i = 0; i < (uint32_t)g_nhead; i++)
             block_starts_halt(g_head[i].head, 0, B_((uint32_t)(uintptr_t)g_head[i].exit_ptr - (uint32_t)(uintptr_t)g_head[i].head));
         g_patched = 1;
@@ -541,6 +543,25 @@ static uint32_t interrupt_eip(uint32_t host)
 
 static void profile_harvest(void);
 
+/* Like g_codepages, but per block: the pages it was translated from as up to DEP_SPANS spans. A remapped range then
+   discards only the blocks that rely on it instead of the whole cache: a library that dyld places elsewhere than
+   in the run that wrote the translation cache costs only its own blocks (and those that inlined code from it).
+   Records follow the order of the code (g_free only grows between flushes), so a binary search by offset finds them */
+#define DEP_SPANS 3
+#define DEP_ALL 0xffffffffu             /* spans merged beyond 16 MB: the block counts as relying on every page */
+typedef struct {
+    uint32_t eip, code;                 /* code: byte offset in the cache; bit 0 discarded, bit 1 marked (invalidation) */
+    uint32_t span[DEP_SPANS];           /* first page << 12 | pages - 1; 0 unused */
+} BlockDep;
+typedef char dep_five_words[sizeof(BlockDep) == 20 ? 1 : -1];     /* 5 words each in the translation cache file */
+static BlockDep *g_dep;
+static uint32_t g_ndep, g_dep_max;
+static int g_dep_lost;                  /* a record could not be stored: remapping flushes everything again */
+#define INVAL_N 64
+static struct { uint32_t a, len; } g_inval[INVAL_N];     /* remapped ranges waiting for the dispatcher (g_flush 2) */
+static int g_ninval, g_no_partial;
+static unsigned long g_st_inval_ranges, g_st_inval_blocks, g_st_inval_loaded;
+
 static void flush(void)
 {
     uint32_t i;
@@ -570,8 +591,12 @@ static void flush(void)
         memset(g_need_eip, 0, sizeof g_need_eip);
         memset(g_el_eip, 0, sizeof g_el_eip);
         memset(g_codepages, 0, sizeof g_codepages);
+        memset(g_newpages, 0, sizeof g_newpages);
     }
     g_once_flushed = 1;
+    g_ndep = 0;                         /* records of the discarded blocks */
+    g_dep_lost = 0;
+    g_ninval = 0;                       /* waiting ranges are covered */
     /* Return stack: its host addresses point into discarded code. Back to the start of the ring: before it lies the
        sentinel entry that matches no ret (old returns then go through the table). All threads: the
        others wait for the lock, outside the translated code */
@@ -584,22 +609,87 @@ static void flush(void)
 }
 
 /* guest pages that were translated from (code, predicted constants): only a change to them discards the cache */
-static void page_note(uint32_t a) { g_codepages[a >> 17] |= 1u << ((a >> 12) & 31); }
+static void page_note(uint32_t a)
+{
+    g_codepages[a >> 17] |= 1u << ((a >> 12) & 31);
+    g_newpages[a >> 17] |= 1u << ((a >> 12) & 31);
+}
 
-static int pages_hit(uint32_t a, uint32_t len)
+/* add the page of a to the spans: into a span within 64 KB, else a new span, else the nearest one grows */
+static void dep_note(uint32_t *sp, uint32_t a)
+{
+    uint32_t pg = a >> 12, i, best = 0, bestd = 0xffffffffu, lo, hi;
+    if (sp[0] == DEP_ALL) return;
+    for (i = 0; i < DEP_SPANS && sp[i]; i++) {
+        lo = sp[i] >> 12;
+        hi = lo + (sp[i] & 4095);
+        if (pg >= lo && pg <= hi) return;
+        if ((pg < lo ? lo - pg : pg - hi) < bestd) { bestd = pg < lo ? lo - pg : pg - hi; best = i; }
+    }
+    if (i < DEP_SPANS && bestd > 16) { sp[i] = pg << 12; return; }
+    lo = sp[best] >> 12;
+    hi = lo + (sp[best] & 4095);
+    if (pg < lo) lo = pg; else hi = pg;
+    if (hi - lo > 4095) { sp[0] = DEP_ALL; for (i = 1; i < DEP_SPANS; i++) sp[i] = 0; return; }
+    sp[best] = lo << 12 | (hi - lo);
+}
+
+static void dep_add(uint32_t eip, const uint32_t *code, const uint32_t *sp)
+{
+    int i;
+    if (g_ndep >= g_dep_max) {
+        uint32_t n = g_dep_max ? 2 * g_dep_max : 4096;
+        void *z = realloc(g_dep, (size_t)n * sizeof *g_dep);
+        if (!z) { g_dep_lost = 1; return; }
+        g_dep = z;
+        g_dep_max = n;
+    }
+    g_dep[g_ndep].eip = eip;
+    g_dep[g_ndep].code = (uint32_t)((const uint8_t *)code - (const uint8_t *)g_cache);
+    for (i = 0; i < DEP_SPANS; i++) g_dep[g_ndep].span[i] = sp[i];
+    g_ndep++;
+}
+
+/* record of the block starting at code, or 0 */
+static BlockDep *dep_find(const uint32_t *code)
+{
+    uint32_t off = (uint32_t)((const uint8_t *)code - (const uint8_t *)g_cache), lo = 0, hi = g_ndep;
+    while (lo < hi) {
+        uint32_t m = (lo + hi) / 2;
+        if ((g_dep[m].code & ~3u) < off) lo = m + 1; else hi = m;
+    }
+    return lo < g_ndep && (g_dep[lo].code & ~3u) == off ? &g_dep[lo] : 0;
+}
+
+/* the block relies on a page in p0..p1 */
+static int dep_hits(const BlockDep *d, uint32_t p0, uint32_t p1)
+{
+    int i;
+    if (d->span[0] == DEP_ALL) return 1;
+    for (i = 0; i < DEP_SPANS && d->span[i]; i++) {
+        uint32_t lo = d->span[i] >> 12, hi = lo + (d->span[i] & 4095);
+        if (lo <= p1 && hi >= p0) return 1;
+    }
+    return 0;
+}
+
+static int pages_hit_in(const uint32_t *pages, uint32_t a, uint32_t len)
 {
     uint32_t s, e2;
     if (!len) return 0;
     s = a >> 12;
     e2 = (uint32_t)(((uint64_t)a + len - 1) >> 12);
     for (; s <= e2; s++) {
-        if (!(s & 31) && s + 31 <= e2 && !g_codepages[s >> 5]) { s += 31; continue; }     /* whole word empty */
-        if (g_codepages[s >> 5] >> (s & 31) & 1) return 1;
+        if (!(s & 31) && s + 31 <= e2 && !pages[s >> 5]) { s += 31; continue; }     /* whole word empty */
+        if (pages[s >> 5] >> (s & 31) & 1) return 1;
     }
     return 0;
 }
 
+static int pages_hit(uint32_t a, uint32_t len) { return pages_hit_in(g_codepages, a, len); }
+
 static int g_cache_show;
+static void jit_range_changed(uint32_t a, uint32_t len, const char *why);
 
 /* guest remapped [a, a + len) or changed its protection */
 void jit_flush_schedule(uint32_t a, uint32_t len)
@@ -607,10 +697,22 @@ void jit_flush_schedule(uint32_t a, uint32_t len)
     g_ranges_old = 1;                 /* always rebuild the region cache of page protections */
     memset(g_need_eip, 0, sizeof g_need_eip);     /* remembered results depended on page protection */
     memset(g_el_eip, 0, sizeof g_el_eip);
-    if (g_no_pageexact || pages_hit(a, len)) {
-        g_flush = 1;
-        if (g_cache_show) fprintf(stderr, "rosetta: flush: mapping/protection %08x+%x (eip %08x)\n", a, len, g_cpu ? g_cpu->eip : 0);
-    } else g_st_flush_saved++;
+    if (g_no_pageexact || pages_hit(a, len)) jit_range_changed(a, len, "mapping/protection");
+    else g_st_flush_saved++;
+}
+
+/* translated code relies on [a, a + len): discard the blocks concerned at the next round of the dispatcher (only
+   they, unless ROSETTA_NO_PARTIAL, page exactness is off or too many ranges are waiting: then everything) */
+static void jit_range_changed(uint32_t a, uint32_t len, const char *why)
+{
+    if (g_flush != 1 && !g_no_pageexact && !g_no_partial && !g_dep_lost && g_ninval < INVAL_N) {
+        g_inval[g_ninval].a = a;
+        g_inval[g_ninval].len = len;
+        g_ninval++;
+        g_flush = 2;
+    } else g_flush = 1;
+    if (g_cache_show) fprintf(stderr, "rosetta: %s: %s %08x+%x (eip %08x)\n", g_flush == 1 ? "flush" : "invalidate", why, a, len,
+                              g_cpu ? g_cpu->eip : 0);
 }
 
 /* Return ring (one per thread): aligned to its size, preceded by the sentinel entry (matches no
@@ -671,6 +773,7 @@ static int jit_create(void)
     g_no_fw_stack = getenv("ROSETTA_NO_FW_STACK") != 0;
     if (getenv("ROSETTA_SETCC_CR")) g_no_setcc_cr = !atoi(getenv("ROSETTA_SETCC_CR"));
     g_no_pageexact = getenv("ROSETTA_NO_PAGEEXACT") != 0;
+    g_no_partial = getenv("ROSETTA_NO_PARTIAL") != 0;
     g_cmpsb_on = !getenv("ROSETTA_NO_CMPSB");
     if (getenv("ROSETTA_PAUSE")) g_no_pause = !atoi(getenv("ROSETTA_PAUSE"));
     g_no_exact_sz = getenv("ROSETTA_NO_EXACT_SZ") != 0;
@@ -6247,6 +6350,11 @@ static uint32_t *stub_block(uint32_t eip, Stub fn)
     sys_icache_invalidate(start, (size_t)((uint8_t *)p - (uint8_t *)start));
     map_add(eip, start);
     page_note(eip);
+    {
+        uint32_t sp[DEP_SPANS] = { 0 };
+        dep_note(sp, eip);
+        dep_add(eip, start, sp);
+    }
     g_st_stubs++;
     if (g_vt_on) fprintf(stderr, "rosetta: stub %s at %08x\n", thunk_name(fn), eip);
     return start;
@@ -7218,10 +7326,16 @@ static uint32_t *translate_block(uint32_t eip)
     sys_icache_invalidate(start, (size_t)((uint8_t *)p - (uint8_t *)start));
     if (!var) map_add(eip, start);     /* variants are in g_var */
     else g_st_variants++;
-    for (i = 0; i < n; i++) {               /* pages this block comes from (code, predicted constants) */
-        page_note(b[i].eip);
-        if (b[i].len) page_note(b[i].eip + b[i].len - 1);
-        if (cval[i]) { page_note(cval[i]); page_note(cval[i] + 15); }
+    {
+        uint32_t sp[DEP_SPANS] = { 0 };
+        dep_note(sp, eip);
+        for (i = 0; i < n; i++) {           /* pages this block comes from (code, predicted constants) */
+            page_note(b[i].eip);
+            dep_note(sp, b[i].eip);
+            if (b[i].len) { page_note(b[i].eip + b[i].len - 1); dep_note(sp, b[i].eip + b[i].len - 1); }
+            if (cval[i]) { page_note(cval[i]); page_note(cval[i] + 15); dep_note(sp, cval[i]); dep_note(sp, cval[i] + 15); }
+        }
+        dep_add(eip, start, sp);
     }
     g_st_blocks++;
     g_st_insns += (unsigned long)n;
@@ -7308,6 +7422,70 @@ static void redirect(uint32_t *prev, uint32_t *fresh)
 {
     *prev = B_((uint32_t)(uintptr_t)fresh - (uint32_t)(uintptr_t)prev);
     sys_icache_invalidate(prev, 4);
+}
+
+/* Remapped ranges (g_flush 2; thread lock held, no thread in translated code): discard the blocks that rely on
+   them. Each one's start jumps to an exit stub that chains to the new translation at its first use, so jumps
+   already chained to the old block keep working. Map, jump table and variants forget them, the code pages of the
+   ranges are free again, and the return rings start anew (their host addresses can point into discarded blocks).
+   Too little space for the exit stubs: flush everything */
+static void invalidate_ranges(void)
+{
+    uint32_t p0[INVAL_N], p1[INVAL_N], i, n = 0, loaded = 0, *keep = p, *stubs;
+    uint32_t off_loaded = (uint32_t)((uint8_t *)g_free_loaded - (uint8_t *)g_cache);
+    int r, wb = g_sl_wb_now;
+    if (g_dep_lost) { flush(); return; }
+    for (r = 0; r < g_ninval; r++) {
+        p0[r] = g_inval[r].a >> 12;
+        p1[r] = (uint32_t)(((uint64_t)g_inval[r].a + (g_inval[r].len ? g_inval[r].len : 1) - 1) >> 12);
+    }
+    for (i = 0; i < g_ndep; i++) {
+        BlockDep *d = &g_dep[i];
+        if (d->code & 1) continue;
+        for (r = 0; r < g_ninval && !dep_hits(d, p0[r], p1[r]); r++) ;
+        if (r < g_ninval) { d->code |= 2; n++; }
+    }
+    if ((uint32_t)(g_cache_end - g_free) < 4 * n + 8192) { flush(); return; }
+    g_sl_wb_now = 0;
+    p = stubs = g_free;
+    for (i = 0; i < g_ndep; i++) {
+        BlockDep *d = &g_dep[i];
+        uint32_t *code;
+        if (!(d->code & 2)) continue;
+        d->code = (d->code & ~3u) | 1;
+        code = g_cache + (d->code >> 2);
+        if (d->code < off_loaded) loaded++;
+        if (g_cache_show > 1) fprintf(stderr, "rosetta: discarded %08x%s\n", d->eip, d->code < off_loaded ? " (translation cache)" : "");
+        if (map_find(d->eip) == code) map_remove(d->eip);
+        *code = B_((uint32_t)(uintptr_t)p - (uint32_t)(uintptr_t)code);
+        sys_icache_invalidate(code, 4);
+        stubby(d->eip, 0);
+    }
+    sys_icache_invalidate(stubs, (size_t)((uint8_t *)p - (uint8_t *)stubs));
+    g_free = p;
+    p = keep;
+    g_sl_wb_now = wb;
+    if (n) {
+        for (i = 0; i < VAR_N; i++) {     /* variants: tombstone (the probe chains stay intact) */
+            BlockDep *d;
+            if (!g_var[i].code || g_var[i].loc == 0xffffffffu) continue;
+            if ((d = dep_find(g_var[i].code)) != 0 && (d->code & 1)) g_var[i].loc = g_var[i].target = 0xffffffffu;
+        }
+        for (i = 0; i < (uint32_t)g_nfcpu; i++) g_fcpu[i]->shadow = g_fcpu[i]->shadow_base;
+    }
+    for (r = 0; r < g_ninval; r++) {      /* nothing relies on these pages any more */
+        uint32_t pg;
+        for (pg = p0[r]; pg <= p1[r]; pg++) {
+            g_codepages[pg >> 5] &= ~(1u << (pg & 31));
+            g_newpages[pg >> 5] &= ~(1u << (pg & 31));
+        }
+    }
+    g_st_inval_ranges += (unsigned long)g_ninval;
+    g_st_inval_blocks += n;
+    g_st_inval_loaded += loaded;
+    if (g_cache_show) fprintf(stderr, "rosetta: %u blocks discarded (%u from the translation cache) for %d ranges\n", n, loaded, g_ninval);
+    g_ninval = 0;
+    g_flush = 0;
 }
 
 /* frequency of interpreted instructions (ROSETTA_STATS): shows what the translator should still learn */
@@ -7473,16 +7651,20 @@ static int u32_cmp(const void *a, const void *b)
  * because all addresses are fixed: code cache at CACHE_ADDR, rosetta itself without PIC, guest libraries rebased
  * (intel_rebase.sh), dyld and program fixed. Key: program, build of rosetta, ROSETTA_* environment and addresses of
  * the host library (native math functions). It is loaded only if every guest library of the saved run is unchanged
- * as a file (size, modification time); if dyld maps it at the expected place, nothing is flushed
- * (jit_mapping_expected), any other mapping over translated pages flushes as always. ROSETTA_NO_CACHE=1 */
-#define CACHE_MAGIC 0x564f5236u
+ * as a file (size, modification time); if dyld maps it at the expected place, nothing is discarded
+ * (jit_mapping_expected), any other mapping over translated pages discards the blocks that rely on those pages
+ * (invalidate_ranges; a library at another address than in the saved run costs only its own blocks).
+ * ROSETTA_NO_CACHE=1 */
+#define CACHE_MAGIC 0x564f5237u
 #define CACHE_IMAGES 128
 typedef struct {
-    uint32_t magic, cache, prolog, code, nmap, npages, ncpool, nvlpc, vlring, nvar, nimages, codeoffset, ntab, nhead;
+    uint32_t magic, cache, prolog, code, nmap, npages, ncpool, nvlpc, vlring, nvar, nimages, codeoffset, ntab, nhead, ndep;
+    uint32_t nmapping;
 } CacheHead;
 typedef struct { uint32_t start, end, size, mtime, ino, type; char path[232]; } CacheImage;
 static char g_cache_path[1024];
 static uint32_t g_written_live;         /* live blocks in the cache file written by this run (checkpoint) */
+static unsigned long g_inval_written;   /* g_st_inval_blocks at that write */
 static CacheImage g_vimage[CACHE_IMAGES];
 static int g_nvimage, g_cache_loaded;
 static unsigned long g_st_cache, g_st_expected;
@@ -7496,16 +7678,20 @@ static uint32_t env_scatter(void)
     char **u;
     uint32_t h = (uint32_t)(uintptr_t)&memmove * 3u ^ (uint32_t)(uintptr_t)&sin * 5u ^ (uint32_t)(uintptr_t)&strlen * 7u;
     for (u = environ; *u; u++)              /* order does not matter; profile, log, image list do not change the code */
-        if (!strncmp(*u, "ROSETTA_", 8) && strncmp(*u, "ROSETTA_HPROFILE", 15) && strncmp(*u, "ROSETTA_LOG", 17) &&
-            strncmp(*u, "ROSETTA_IMAGES", 14) && strncmp(*u, "ROSETTA_CACHE_SHOW", 21))
+        if (!strncmp(*u, "ROSETTA_", 8) && strncmp(*u, "ROSETTA_HPROFILE", 16) && strncmp(*u, "ROSETTA_LOG", 11) &&
+            strncmp(*u, "ROSETTA_IMAGES", 14) && strncmp(*u, "ROSETTA_CACHE_SHOW", 18) && strncmp(*u, "ROSETTA_CACHE_FILE", 18) &&
+            strncmp(*u, "ROSETTA_CACHE_MAX_MB", 20))
             h += fnv(*u, 2166136261u);
     return h;
 }
 
+/* ~/Library/Caches/rosetta/cache-PROGRAM-BUILD-ENVIRONMENT, or ROSETTA_CACHE_FILE (tests) */
 static void cache_path(void)
 {
-    const char *home = getenv("HOME");
-    if (g_cache_path[0] || !home || !g_prog_full[0] || getenv("ROSETTA_NO_CACHE")) return;
+    const char *home = getenv("HOME"), *file = getenv("ROSETTA_CACHE_FILE");
+    if (g_cache_path[0] || getenv("ROSETTA_NO_CACHE")) return;
+    if (file && *file) { snprintf(g_cache_path, sizeof g_cache_path, "%s", file); return; }
+    if (!home || !g_prog_full[0]) return;
     snprintf(g_cache_path, sizeof g_cache_path, "%s/Library/Caches/rosetta/cache-%08x-%08x-%08x", home,
              fnv(g_prog_full, 2166136261u), fnv(__DATE__ " " __TIME__, 2166136261u), env_scatter());
 }
@@ -7513,9 +7699,13 @@ static void cache_path(void)
 /* Files the guest mapped with MAP_FIXED (jit_mapping_expected): which file is where. The install name of an
    image is no use for this (libperl is called /System/Library/Perl/lib/5.8/libperl.dylib, the file loaded is
    .../5.8.8/darwin-thread-multi-2level/CORE/libperl.dylib) */
-#define MAPPING_N 1024
-static struct { uint32_t start, end, ino, size, mtime; } g_mapping[MAPPING_N];
+#define MAPPING_N 4096
+typedef struct { uint32_t start, end, ino, size, mtime, off; } Mapping;    /* ino 0: anonymous */
+typedef char mapping_six_words[sizeof(Mapping) == 24 ? 1 : -1];
+static Mapping g_mapping[MAPPING_N];
 static int g_nmapping;
+static Mapping g_vmapping[MAPPING_N];  /* those of the run that wrote the translation cache (oldest first) */
+static int g_nvmapping;
 static int g_fs_fd = -1;                /* fstat of the descriptor checked last (sys.c forgets it on close etc.) */
 static struct stat g_fs;
 
@@ -7561,7 +7751,8 @@ static int cache_images(CacheImage *b, int max)
                     ok = 1;
                 }
             } else {                            /* libraries: the way dyld mapped the file (newest first) */
-                for (j = g_nmapping - 1; j >= 0 && ((uint32_t)a < g_mapping[j].start || (uint32_t)a >= g_mapping[j].end); j--) ;
+                for (j = g_nmapping - 1;
+                     j >= 0 && ((uint32_t)a < g_mapping[j].start || (uint32_t)a >= g_mapping[j].end || !g_mapping[j].ino); j--) ;
                 if (j >= 0) {
                     b[nb].size = g_mapping[j].size; b[nb].mtime = g_mapping[j].mtime; b[nb].ino = g_mapping[j].ino;
                     ok = 1;
@@ -7589,6 +7780,8 @@ static int in_images(uint32_t eip, const CacheImage *b, uint32_t n)
     return 0;
 }
 
+static void cache_tidy(void);
+
 static void cache_write(void)
 {
     CacheHead k;
@@ -7599,6 +7792,8 @@ static void cache_write(void)
     uint32_t **stub = 0;
     int fd, ok = 1;
     cache_path();
+    if (g_flush == 2) invalidate_ranges();     /* (the dispatcher normally has done this already) */
+    if (g_flush == 1) return;                  /* everything is about to be discarded */
     if (g_cache_show && g_cache_path[0] && g_st_flushes) fprintf(stderr, "rosetta: translation cache not written (%lu flushes)\n", g_st_flushes);
     /* loaded and flushed anyway: does not fit this program (file changed, guest changes code pages). Delete it,
        otherwise it is loaded, discarded and never replaced at every start; the next run creates it anew */
@@ -7613,14 +7808,17 @@ static void cache_write(void)
         if (g_written_live > before) before = g_written_live;   /* a checkpoint of this run */
         /* only when there is substantial new code: programs with threads interleave differently each time and bring a
            few new blocks in every run; translating those is faster than rewriting and loading the whole
-           translation cache (MB) */
-        if (before && live < before + 32 + before / 64) return;
+           translation cache (MB). Or when remapped ranges discarded as many blocks of the translation cache (a library
+           at another address): the next run would discard them again. A few discarded blocks in every run (an
+           allocation that lands on pages of the saved run) are cheaper to translate again than to rewrite */
+        if (before && live < before + 32 + before / 64 && g_st_inval_loaded < g_inval_written + 32 + before / 64) return;
         g_written_live = live;
+        g_inval_written = g_st_inval_loaded;
     }
     if (g_cache != (uint32_t *)(uintptr_t)CACHE_ADDR) return;
     b = malloc(sizeof *b * CACHE_IMAGES);
     t = malloc(8 * ((size_t)g_nused + VAR_N * 2 + (1u << 15)) + 8 * (size_t)g_cpool_n + 4 * (size_t)VL_PCS + 8 * (size_t)TABLE +
-               8 * (size_t)g_nhead);
+               8 * (size_t)g_nhead + sizeof(BlockDep) * (size_t)g_ndep + sizeof(Mapping) * (size_t)g_nmapping);
     if (!b || !t) { free(b); free(t); return; }
     memset(&k, 0, sizeof k);
     k.magic = CACHE_MAGIC;
@@ -7630,15 +7828,17 @@ static void cache_write(void)
     k.nimages = (uint32_t)cache_images(b, CACHE_IMAGES);
     /* only code from files (and the commpage) goes into the map: what came from anonymous memory (trampolines that a
        framework generates at run time) may differ or be missing next time. Such blocks stay in the code region, but
-       in the written copy their first instruction jumps to an exit stub (KIND_INVALID with their eip): chained jumps
-       into them reach the dispatcher, which translates what is there then */
+       in the written copy their first instruction jumps to an exit stub with their eip, which chains to whatever
+       is translated there next time. The same for a block without a dependency record (it could not be discarded
+       selectively) */
     nforeign = 0;
     foreign = calloc((size_t)g_nused + 1, 1);
     if (!foreign) { free(b); free(t); return; }
     for (i = 0; i < g_nused; i++) {
         uint32_t eip = g_map[g_inuse[i]].eip;
-        if (!g_map[g_inuse[i]].code || !eip || eip == 0xffffffffu || eip - COMMPAGE_BASE < COMMPAGE_SIZE) continue;
-        if (!in_images(eip, b, k.nimages)) { foreign[i] = 1; nforeign++; }
+        BlockDep *d;
+        if (!g_map[g_inuse[i]].code || !eip || eip == 0xffffffffu) continue;
+        if (!(d = dep_find(g_map[g_inuse[i]].code)) || (d->code & 1) || !in_images(eip, b, k.nimages)) { foreign[i] = 1; nforeign++; }
     }
     if (nforeign) {
         uint32_t *keep = p;
@@ -7649,7 +7849,7 @@ static void cache_write(void)
         g_sl_wb_now = 0;
         p = g_free;
         for (i = 0, n = 0; i < g_nused; i++)
-            if (foreign[i]) { stub[n++] = p; exit_kind(g_map[g_inuse[i]].eip, KIND_INVALID); }
+            if (foreign[i]) { stub[n++] = p; stubby(g_map[g_inuse[i]].eip, 0); }
         sys_icache_invalidate(g_free, (size_t)((uint8_t *)p - (uint8_t *)g_free));
         g_free = p;
         p = keep;
@@ -7673,10 +7873,15 @@ static void cache_write(void)
         uint32_t *s = t + 2 * k.nmap;
         for (i = 0; i < (1u << 15); i++) if (g_codepages[i]) { s[2 * k.npages] = i; s[2 * k.npages + 1] = g_codepages[i]; k.npages++; }
         s += 2 * k.npages;
-        for (i = 0; i < VAR_N; i++)
-            if (g_var[i].code && in_images(g_var[i].loc, b, k.nimages) && in_images(g_var[i].target, b, k.nimages)) {
+        for (i = 0; i < VAR_N; i++) {
+            BlockDep *d;
+            if (g_var[i].code && in_images(g_var[i].loc, b, k.nimages) && in_images(g_var[i].target, b, k.nimages) &&
+                (d = dep_find(g_var[i].code)) != 0 && !(d->code & 1)) {
+                d->code |= 2;               /* its record goes into the file */
                 s[3 * k.nvar] = g_var[i].loc; s[3 * k.nvar + 1] = g_var[i].target;
-                                 s[3 * k.nvar + 2] = (uint32_t)((uint8_t *)g_var[i].code - (uint8_t *)g_cache); k.nvar++; }
+                s[3 * k.nvar + 2] = (uint32_t)((uint8_t *)g_var[i].code - (uint8_t *)g_cache); k.nvar++;
+            }
+        }
         s += 3 * k.nvar;
         memcpy(s, g_cpool, 8 * (size_t)k.ncpool);
         s += 2 * k.ncpool;
@@ -7697,6 +7902,20 @@ static void cache_write(void)
         }
         k.nhead = (uint32_t)g_nhead;
         s += 2 * k.nhead;
+        /* dependency records of the blocks in the map and of the variants (marked above), in the order of the code */
+        for (i = 0; i < g_nused; i++)
+            if (g_map[g_inuse[i]].code && g_map[g_inuse[i]].eip && g_map[g_inuse[i]].eip != 0xffffffffu && !foreign[i])
+                dep_find(g_map[g_inuse[i]].code)->code |= 2;
+        for (i = 0; i < g_ndep; i++)
+            if (g_dep[i].code & 2) {
+                g_dep[i].code &= ~2u;
+                memcpy(s + 5 * k.ndep, &g_dep[i], sizeof g_dep[i]);
+                k.ndep++;
+            }
+        s += 5 * k.ndep;
+        k.nmapping = (uint32_t)g_nmapping;      /* the mappings of this run (jit_mapping_expected next time) */
+        memcpy(s, g_mapping, sizeof *g_mapping * k.nmapping);
+        s += 6 * k.nmapping;
         {   /* code from a page boundary of the file (mmap on load) */
             size_t front = sizeof k + sizeof *b * k.nimages + 4 * (size_t)(s - t);
             static const char null[4096];
@@ -7725,27 +7944,70 @@ static void cache_write(void)
     free(stub);
     free(b);
     free(t);
-    {   /* translation caches and hot lists of other builds of rosetta never fit again, for any program: delete them
-           (otherwise the folder grows with every build); names: cache-PROGRAM-BUILD-ENV, hot-PROGRAM-BUILD */
-        char folder[1024], *isect, build[16];
-        DIR *d;
-        struct dirent *e;
-        snprintf(folder, sizeof folder, "%s", g_cache_path);
-        if (!(isect = strrchr(folder, '/'))) return;
-        *isect = 0;
-        snprintf(build, sizeof build, "%08x", fnv(__DATE__ " " __TIME__, 2166136261u));
-        if (!(d = opendir(folder))) return;
-        while ((e = readdir(d)) != 0) {
-            const char *n = e->d_name;
-            int skip = !strncmp(n, "cache-", 6) ? 15 : !strncmp(n, "hot-", 4) ? 13 : 0;   /* start of BUILD */
-            if (skip && strlen(n) >= (size_t)skip + 8 && n[skip - 1] == '-' && strncmp(n + skip, build, 8)) {
-                char prev[1100];
-                snprintf(prev, sizeof prev, "%s/%s", folder, n);
-                unlink(prev);
-            }
+    cache_tidy();
+}
+
+/* Translation caches and hot lists of other builds of rosetta never fit again, for any program: delete them
+   (otherwise the folder grows with every build); names: cache-PROGRAM-BUILD-ENV, hot-PROGRAM-BUILD. Every program
+   has a translation cache of its own (a command line program some 100 KB, one with windows 15 to 25 MB): beyond
+   ROSETTA_CACHE_MAX_MB together (default 256) the ones used longest ago go */
+typedef struct { uint32_t used, size; char name[64]; } CacheFile;
+
+static int used_earlier(const void *x, const void *y)
+{
+    const CacheFile *a = x, *b = y;
+    return a->used < b->used ? -1 : a->used > b->used;
+}
+
+static void cache_tidy(void)
+{
+    char folder[1024], path[1100], *isect, build[16];
+    const char *own, *m = getenv("ROSETTA_CACHE_MAX_MB");
+    uint64_t total = 0, max = (uint64_t)(m && atoi(m) >= 0 ? atoi(m) : 256) << 20;
+    CacheFile *f = 0;
+    int nf = 0, maxf = 0, i;
+    DIR *d;
+    struct dirent *e;
+    snprintf(folder, sizeof folder, "%s", g_cache_path);
+    if (getenv("ROSETTA_CACHE_FILE") || !(isect = strrchr(folder, '/'))) return;
+    *isect = 0;
+    own = g_cache_path + (isect + 1 - folder);     /* name of this program's translation cache */
+    snprintf(build, sizeof build, "%08x", fnv(__DATE__ " " __TIME__, 2166136261u));
+    if (!(d = opendir(folder))) return;
+    while ((e = readdir(d)) != 0) {
+        const char *n = e->d_name;
+        int skip = !strncmp(n, "cache-", 6) ? 15 : !strncmp(n, "hot-", 4) ? 13 : 0;   /* start of BUILD */
+        struct stat st;
+        if (!skip || strlen(n) < (size_t)skip + 8 || n[skip - 1] != '-') continue;
+        snprintf(path, sizeof path, "%s/%s", folder, n);
+        if (strncmp(n + skip, build, 8)) { unlink(path); continue; }
+        if (skip != 15 || strlen(n) >= sizeof f->name || !strcmp(n, own) || stat(path, &st)) continue;
+        if (nf == maxf) {
+            void *z = realloc(f, (size_t)(maxf = maxf ? 2 * maxf : 256) * sizeof *f);
+            if (!z) break;
+            f = z;
         }
-        closedir(d);
+        f[nf].used = (uint32_t)(st.st_atime > st.st_mtime ? st.st_atime : st.st_mtime);
+        f[nf].size = (uint32_t)st.st_size;
+        snprintf(f[nf].name, sizeof f[nf].name, "%s", n);
+        total += st.st_size;
+        nf++;
     }
+    closedir(d);
+    {
+        struct stat st;
+        if (stat(g_cache_path, &st) == 0) total += st.st_size;     /* the own one always stays */
+    }
+    if (total > max && nf) {
+        qsort(f, (size_t)nf, sizeof *f, used_earlier);
+        for (i = 0; i < nf && total > max; i++) {
+            snprintf(path, sizeof path, "%s/%s", folder, f[i].name);
+            if (unlink(path) == 0) total -= f[i].size;
+        }
+        if (g_cache_show) fprintf(stderr, "rosetta: %d translation caches used longest ago deleted (together over %u MB)\n",
+                                  i, (unsigned)(max >> 20));
+    }
+    free(f);
 }
 
 /* at startup (after jit_create, before the first block): read the translation cache if it fits this run */
@@ -7768,7 +8030,8 @@ static void cache_load(void)
     if (read(fd, &k, sizeof k) != (ssize_t)sizeof k || k.magic != CACHE_MAGIC || k.cache != CACHE_ADDR ||
         k.prolog != (uint32_t)((uint8_t *)g_cache_start - (uint8_t *)g_cache) || k.code < k.prolog ||
         k.code > CACHE_SIZE - (1u << 20) || k.nimages > CACHE_IMAGES || k.ncpool > CPOOL || k.nvar > VAR_N ||
-        k.npages > (1u << 15) || k.nvlpc > VL_PCS || k.vlring > VL_RINGS || k.ntab > TABLE || k.nhead > (1u << 20))
+        k.npages > (1u << 15) || k.nvlpc > VL_PCS || k.vlring > VL_RINGS || k.ntab > TABLE || k.nhead > (1u << 20) ||
+        k.ndep > (1u << 22) || k.nmapping > MAPPING_N)
         goto way;
     if (read(fd, g_vimage, sizeof *g_vimage * k.nimages) != (ssize_t)(sizeof *g_vimage * k.nimages)) goto way;
     /* check program and dyld (rosetta loads it itself) now; the libraries only when dyld maps them
@@ -7784,7 +8047,7 @@ static void cache_load(void)
         }
     }
     reason = "read";
-    n = 2 * k.nmap + 2 * k.npages + 3 * k.nvar + 2 * k.ncpool + k.nvlpc + 2 * k.ntab + 2 * k.nhead;
+    n = 2 * k.nmap + 2 * k.npages + 3 * k.nvar + 2 * k.ncpool + k.nvlpc + 2 * k.ntab + 2 * k.nhead + 5 * k.ndep + 6 * k.nmapping;
     if (!(t = malloc(4 * (size_t)n + 4)) || read(fd, t, 4 * (size_t)n) != (ssize_t)(4 * (size_t)n) || (k.codeoffset & 4095) ||
         k.codeoffset < sizeof k + sizeof *g_vimage * k.nimages + 4 * (size_t)n) goto way;
     /* map the code instead of copying it: no zero pages, no copy, only touched pages cost. The kernel syncs the
@@ -7822,6 +8085,22 @@ static void cache_load(void)
         for (i = 0; i < k.nhead; i++)
             if (s[2 * i] >= k.prolog && s[2 * i] < k.code && s[2 * i + 1] >= k.prolog && s[2 * i + 1] < k.code)
                 head_note(g_cache + s[2 * i] / 4, g_cache + s[2 * i + 1] / 4);
+        s += 2 * k.nhead;
+        /* dependency records: ascending offsets inside the code, otherwise remapping flushes everything as before */
+        if (k.ndep > g_dep_max) {
+            void *z = realloc(g_dep, (size_t)k.ndep * sizeof *g_dep);
+            if (z) { g_dep = z; g_dep_max = k.ndep; }
+        }
+        if (k.ndep <= g_dep_max) {
+            memcpy(g_dep, s, (size_t)k.ndep * sizeof *g_dep);
+            g_ndep = k.ndep;
+            for (i = 0; i < k.ndep; i++)
+                if ((g_dep[i].code & 3) || g_dep[i].code < k.prolog || g_dep[i].code >= k.code ||
+                    (i && g_dep[i].code <= g_dep[i - 1].code)) { g_dep_lost = 1; break; }
+        } else g_dep_lost = 1;
+        s += 5 * k.ndep;
+        memcpy(g_vmapping, s, sizeof *g_vmapping * k.nmapping);
+        g_nvmapping = (int)k.nmapping;
     }
     free(t);
     g_cache_loaded = 1;
@@ -7829,6 +8108,12 @@ static void cache_load(void)
     g_cache_time = mach_absolute_time() - t0;
     g_cache_error = jit_pagefault() - f0;
     g_free_loaded = g_free;
+    if (g_cache_show) {
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        fprintf(stderr, "rosetta: translation cache loaded: %u blocks, %u KB code, %.1f ms, %d page faults\n", k.nmap,
+                (k.code - k.prolog) >> 10, (double)g_cache_time * tb.numer / tb.denom / 1e6, g_cache_error);
+    }
     /* with a translation cache, translating costs only once: translate cold code right away, it goes into the next translation cache */
     if (!getenv("ROSETTA_THRESHOLD"))
         g_threshold = getenv("ROSETTA_CACHE_THRESHOLD") ? atoi(getenv("ROSETTA_CACHE_THRESHOLD")) : 1;
@@ -7844,37 +8129,49 @@ way:
    close/dup2/open */
 void jit_fd_off(int fd) { if (fd == g_fs_fd) g_fs_fd = -1; }
 
-/* sys.c, mmap with MAP_FIXED and a file: if dyld maps a guest library of the translation cache at its place and
-   the file is unchanged (size, modification time, inode number), the code from the translation cache stays
-   valid. Otherwise 0: mapping over pages with translated code flushes as always, before code from them runs */
-int jit_mapping_expected(uint32_t a, uint32_t len, int fd)
+/* sys.c, mmap with MAP_FIXED (fd -1: anonymous): if dyld maps a file exactly as in the run that wrote the
+   translation cache (same file unchanged in size, modification time and inode number, the same part of it at this
+   address), the code from the translation cache stays valid. Otherwise 0: the blocks that rely on these pages are
+   discarded before code from them runs. Every mapping is recorded for the next translation cache */
+int jit_mapping_expected(uint32_t a, uint32_t len, int fd, uint32_t off)
 {
     int j;
-    if (fd < 0 || !g_cache_path[0]) return 0;
-    if (fd != g_fs_fd) {
-        if (fstat(fd, &g_fs)) return 0;
-        g_fs_fd = fd;
-    }
-    if (g_nmapping < MAPPING_N) {                   /* for writing the translation cache: which file is here */
-        g_mapping[g_nmapping].start = a; g_mapping[g_nmapping].end = a + len; g_mapping[g_nmapping].ino = (uint32_t)g_fs.st_ino;
-        g_mapping[g_nmapping].size = (uint32_t)g_fs.st_size; g_mapping[g_nmapping].mtime = (uint32_t)g_fs.st_mtime;
-        g_nmapping++;
-    }
-    if (!g_cache_loaded) return 0;
-    for (j = 0; j < g_nvimage; j++)
-        if (a >= g_vimage[j].start && a + len <= g_vimage[j].end) {
-            if ((uint32_t)g_fs.st_ino != g_vimage[j].ino || (uint32_t)g_fs.st_size != g_vimage[j].size ||
-                (uint32_t)g_fs.st_mtime != g_vimage[j].mtime) {
-                if (g_cache_show)
-                    fprintf(stderr, "rosetta: mapping %08x+%x: file differs from the translation cache (%s: inode %u/%u, size %u/%u, time %u/%u)\n",
-                            a, len, g_vimage[j].path, (unsigned)g_fs.st_ino, g_vimage[j].ino, (unsigned)g_fs.st_size,
-                            g_vimage[j].size, (unsigned)g_fs.st_mtime, g_vimage[j].mtime);
-                return 0;
-            }
-            g_st_expected++;
-            return 1;
+    Mapping m;
+    if (!g_cache_path[0]) return 0;
+    memset(&m, 0, sizeof m);
+    m.start = a;
+    m.end = a + len;
+    if (fd >= 0) {
+        if (fd != g_fs_fd) {
+            if (fstat(fd, &g_fs)) return 0;
+            g_fs_fd = fd;
         }
-    if (g_cache_show > 1) fprintf(stderr, "rosetta: mapping %08x+%x in no image of the translation cache\n", a, len);
+        m.ino = (uint32_t)g_fs.st_ino ? (uint32_t)g_fs.st_ino : 1;
+        m.size = (uint32_t)g_fs.st_size;
+        m.mtime = (uint32_t)g_fs.st_mtime;
+        m.off = off;
+    }
+    if (g_nmapping < MAPPING_N) g_mapping[g_nmapping++] = m;
+    if (!g_cache_loaded || !m.ino) return 0;
+    /* code translated in this run relies on these pages: it came from what was mapped here before, not from the
+       mapping of the saved run (a file mapped over another one and back again) */
+    if (pages_hit_in(g_newpages, a, len)) return 0;
+    /* the newest mapping of the saved run that covers the range: was the same part of the same file there? */
+    for (j = g_nvmapping - 1; j >= 0 && (a < g_vmapping[j].start || m.end > g_vmapping[j].end); j--) ;
+    if (j >= 0 && g_vmapping[j].ino == m.ino && g_vmapping[j].size == m.size && g_vmapping[j].mtime == m.mtime &&
+        off - g_vmapping[j].off == a - g_vmapping[j].start) {
+        g_st_expected++;
+        return 1;
+    }
+    if (g_cache_show) {
+        const char *name = "?";
+        int i;
+        for (i = 0; i < g_nvimage; i++) if (a >= g_vimage[i].start && a < g_vimage[i].end) name = g_vimage[i].path;
+        if (j < 0) fprintf(stderr, "rosetta: mapping %08x+%x: none like it in the translation cache (%s)\n", a, len, name);
+        else fprintf(stderr, "rosetta: mapping %08x+%x: file differs from the translation cache (%s: inode %u/%u, size %u/%u, "
+                     "offset %x/%x)\n", a, len, name, m.ino, g_vmapping[j].ino, m.size, g_vmapping[j].size, off,
+                     g_vmapping[j].off + (a - g_vmapping[j].start));
+    }
     return 0;
 }
 
@@ -7882,10 +8179,7 @@ int jit_mapping_expected(uint32_t a, uint32_t len, int fd)
    holding code of the old run (a library that dyld has not mapped yet this time); then flush */
 void jit_new_mapped(uint32_t a, uint32_t len)
 {
-    if (g_cache_loaded && pages_hit(a, len)) {
-        g_flush = 1;
-        if (g_cache_show) fprintf(stderr, "rosetta: flush: new mapping %08x+%x\n", a, len);
-    }
+    if (g_cache_loaded && pages_hit(a, len)) jit_range_changed(a, len, "new mapping");
 }
 
 /* at the end of the run: write the previous list and the blocks translated now (merged) if something new was added */
@@ -7967,7 +8261,14 @@ static void checkpoint_idle(void)
     if (g_patched) unpatch();
     cache_write();
     jit_end_hot();
-    if (g_cache_show) fprintf(stderr, "rosetta: checkpoint at the first idle moment\n");
+    if (g_cache_show) {
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        fprintf(stderr, "rosetta: checkpoint at the first idle moment (%.1f s): %lu blocks from the translation cache, "
+                "%lu translated, %lu flushes, %lu discarded for %lu ranges (%lu from the cache), %lu instructions interpreted cold\n",
+                (double)(mach_absolute_time() - g_run_t0) * tb.numer / tb.denom / 1e9, g_st_cache, g_st_blocks, g_st_flushes,
+                g_st_inval_blocks, g_st_inval_ranges, g_st_inval_loaded, g_st_cold_insn);
+    }
 }
 
 static void checkpoint_maybe(void)
@@ -8071,7 +8372,7 @@ static int dispatcher(Cpu *c)
         if (g_patched) unpatch();       /* restore block starts (jit_interrupt) */
         if (g_state_wish) state_short(c);
         if (g_thread_waiting | c->yield) thread_yield(c);  /* other guest threads (thread.c) */
-        if (g_flush) flush();
+        if (g_flush) { if (g_flush == 2) invalidate_ranges(); else flush(); }
         if (g_sig_pending & ~g_sig_mask) {   /* signal to the guest: build the stack frame, continue in the trampoline */
             sig_deliver(c);
             if (c->finished) return RUN_END;

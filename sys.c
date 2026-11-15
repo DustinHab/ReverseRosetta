@@ -1484,7 +1484,8 @@ void sys_bsd(Cpu *c, int sysenter)
         if (r == MAP_FAILED) { set_result(c, 0, errno); return; }
         /* Code at this address may have changed; not when dyld places a library from the translation cache at its
            address (jit_mapping_expected) */
-        if (flags & MAP_FIXED) jit_flush_schedule(a, jit_mapping_expected(a, len, (int)arg(4)) ? 0 : len);
+        if (flags & MAP_FIXED)
+            jit_flush_schedule(a, jit_mapping_expected(a, len, (flags & MAP_ANON) ? -1 : (int)arg(4), (uint32_t)arg64(5)) ? 0 : len);
         else jit_new_mapped((uint32_t)(uintptr_t)r, len);
         set_result(c, (uint32_t)(uintptr_t)r, 0);
         return;
