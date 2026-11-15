@@ -1,0 +1,12 @@
+NXGetLocalArchInfo: i486 (type 7, subtype 4)
+hw.cputype: 7
+hw.cpusubtype: 4
+hw.optional.sse: 1
+hw.optional.sse2: 1
+hw.optional.sse3: 1
+hw.optional.supplementalsse3: 0
+hw.optional.x86_64: 0
+hw.optional.altivec: No such file or directory
+machdep.cpu.vendor: GenuineIntel
+hw.byteorder: 1234
+hw.machine: i386

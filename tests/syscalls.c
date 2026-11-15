@@ -87,6 +87,8 @@ static void t_fork(void)
     printf("vfork: exit %d\n", wait_code(p));
 }
 
+static void on_hup(int sig) { (void)sig; }
+
 static void t_exec(void)
 {
     pid_t p;
@@ -100,6 +102,16 @@ static void t_exec(void)
         _exit(99);
     }
     printf("execve native: exit %d\n", wait_code(p));
+    signal(SIGHUP, on_hup);                  /* a handler: rosetta's watchdog thread runs, execve must still work */
+    p = fork();
+    if (p == 0) {
+        char *a[] = { "echo", "exec with a signal handler", 0 };
+        execve("/bin/echo", a, environ);
+        printf("execve with handler: %s\n", strerror(errno));
+        _exit(99);
+    }
+    printf("execve with handler: exit %d\n", wait_code(p));
+    signal(SIGHUP, SIG_DFL);
     /* translated (this program again): argv[0], signal mask and ignored signals reach the new program */
     sigemptyset(&m);
     sigaddset(&m, SIGUSR2);
@@ -434,6 +446,39 @@ static void t_signals(void)
     }
 }
 
+static void *waiter(void *arg)
+{
+    sigset_t m;
+    int sig = 0;
+    (void)arg;
+    sigemptyset(&m);
+    sigaddset(&m, SIGUSR2);
+    sigwait(&m, &sig);
+    printf("thread: sigwait returned %s\n", sig == SIGUSR2 ? "usr2" : "other");
+    return 0;
+}
+
+static void t_thread_signals(void)
+{
+    pthread_t t;
+    sigset_t m, old;
+    struct rusage r0, r1;
+    long used;
+    sigemptyset(&m);
+    sigaddset(&m, SIGUSR2);
+    pthread_sigmask(SIG_BLOCK, &m, &old);
+    pthread_create(&t, 0, waiter, 0);
+    getrusage(RUSAGE_SELF, &r0);
+    usleep(300000);                          /* the waiting thread must not use the processor meanwhile */
+    getrusage(RUSAGE_SELF, &r1);
+    used = (r1.ru_utime.tv_sec - r0.ru_utime.tv_sec + r1.ru_stime.tv_sec - r0.ru_stime.tv_sec) * 1000000L +
+           r1.ru_utime.tv_usec - r0.ru_utime.tv_usec + r1.ru_stime.tv_usec - r0.ru_stime.tv_usec;
+    kill(getpid(), SIGUSR2);
+    pthread_join(t, 0);
+    pthread_sigmask(SIG_SETMASK, &old, 0);
+    printf("threads: waiting used little time %d\n", used < 60000);
+}
+
 static void t_process(void)
 {
     pid_t p = fork();
@@ -566,6 +611,7 @@ int main(int argc, char **argv)
     t_signals();
     t_tty();
     t_sysctl();
+    t_thread_signals();
     t_process();
     return 0;
 }

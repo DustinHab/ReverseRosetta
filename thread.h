@@ -32,9 +32,11 @@ int thread_wq_ops(Cpu *c, uint32_t kind, uint32_t ent, uint32_t prio);
 /* watchdog: stops a thread that is stuck in a loop of translated code while another thread or a signal is
    waiting (starts with the first thread or signal handler) */
 void thread_watchdog_start(void);
+int thread_watchdog_stop(void);          /* before execve; returns whether it was running */
 
-/* fork child: reset the lock and thread bookkeeping (only the calling thread survives) */
-void thread_after_fork(Cpu *c);
+/* fork child: reset the lock and thread bookkeeping (only the calling thread survives); watchdog_again: start the
+   watchdog again if it was running (not for a child that only execs) */
+void thread_after_fork(Cpu *c, int watchdog_again);
 
 /* statistics (ROSETTA_STATS) */
 void thread_stats(void);

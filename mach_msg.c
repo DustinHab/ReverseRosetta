@@ -424,6 +424,21 @@ static void ats_show(const char *was, const uint8_t *m, uint32_t n, int guest)
     }
 }
 
+/* host_info(HOST_BASIC_INFO) (NXGetLocalArchInfo, arch, machine): the guest sees the Intel processor that CPUID
+   reports (see sys.c, g_identity). Reply in host byte order: RetCode @32, count @36, host_basic_info from @40 with
+   cpu_type @52, cpu_subtype @56. */
+#define HOST_INFO_ID 200
+extern int g_host_cpu;
+
+static void host_info_reply(uint8_t *m, uint32_t n)
+{
+    if (g_host_cpu < 0) g_host_cpu = getenv("ROSETTA_HOST_CPU") != 0;
+    if (g_host_cpu || n < 60 || ((mach_msg_header_t *)m)->msgh_id != HOST_INFO_ID + 100) return;
+    if (*(uint32_t *)(m + 32) != KERN_SUCCESS || *(uint32_t *)(m + 36) < 5) return;
+    *(uint32_t *)(m + 52) = CPU_TYPE_X86;
+    *(uint32_t *)(m + 56) = 4;              /* CPU_SUBTYPE_486, as Intel Macs report it ("machine": i486) */
+}
+
 /* buffer per thread (Cpu.msg): during mach_msg the thread lock is free, another thread can send */
 static mach_msg_return_t guest_mach_msg(Cpu *c, uint32_t msg, mach_msg_option_t option, uint32_t send_size, uint32_t receive,
                                        mach_port_t name, mach_msg_timeout_t deadline, mach_port_t message)
@@ -432,7 +447,7 @@ static mach_msg_return_t guest_mach_msg(Cpu *c, uint32_t msg, mach_msg_option_t 
     mach_msg_return_t r;
     uint8_t *g_buffer;
     size_t g_buffer_size;
-    int ats_search = 0, ats_query = 0;
+    int ats_search = 0, ats_query = 0, basic_info = 0;
     uint32_t ats_type = 0;
     AtsCopy ats_copy = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     if (need > c->msg_size) {
@@ -453,6 +468,8 @@ static mach_msg_return_t guest_mach_msg(Cpu *c, uint32_t msg, mach_msg_option_t 
         }
         ats_search = send_size >= 160 && ((mach_msg_header_t *)g_buffer)->msgh_id == BS_LOOK_UP &&
                     !strncmp((const char *)(g_buffer + 32), ATS_SERVICE, 128);
+        basic_info = send_size >= 40 && ((mach_msg_header_t *)g_buffer)->msgh_id == HOST_INFO_ID &&
+                     swap32(*(uint32_t *)(g_buffer + 32)) == HOST_BASIC_INFO;    /* flavor, still in guest order */
     }
     {
         /* Wait interruptibly: otherwise the libSystem wrapper of the host silently restarts an interrupted send/receive,
@@ -488,6 +505,7 @@ static mach_msg_return_t guest_mach_msg(Cpu *c, uint32_t msg, mach_msg_option_t 
             return r;
         }
         if (ats_search && n >= 40 && (k->msgh_bits & MACH_MSGH_BITS_COMPLEX)) g_ats_port = *(uint32_t *)(g_buffer + 28);
+        if (basic_info) host_info_reply(g_buffer, n);
         if (ats_query) {
             ats_show("from", g_buffer, n, 0);
             if (n <= receive) ats_reply(g_buffer, n, ats_type, &ats_copy);

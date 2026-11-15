@@ -74,6 +74,8 @@ t_flt()   { sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
 r_flt()   { cat ../tests/faults.expected; }
 t_flti()  { ROSETTA_INTERP=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
 t_fltj()  { ROSETTA_THRESHOLD=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
+t_id()    { ./rosetta ./identity; }
+r_id()    { cat ../tests/identity.expected; }
 t_cmpsb() { ROSETTA_THRESHOLD=1 ./rosetta ./cmpsb; }
 r_cmpsb() { ROSETTA_INTERP=1 ./rosetta ./cmpsb; }
 same raw_arith t_raw r_raw
@@ -95,6 +97,7 @@ same "processes, kqueue, locks, semaphores, files, blocked signals, pty" t_sys r
 same "exceptions to the program's handlers (SIGFPE, SIGILL, SIGTRAP)" t_flt r_flt
 same "exceptions, interpreter only" t_flti r_flt
 same "exceptions, translated at once" t_fltj r_flt
+same "processor identity (Intel Core Duo, SSE3)" t_id r_id
 same "signal without handler terminates" t_sige r_sige
 same "sed (Intel)" t_sed r_sed
 same fpcompare t_fpc r_fpc

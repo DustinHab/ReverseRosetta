@@ -16,7 +16,7 @@ if [ "$1" = tests ] && [ -d "$Q/tests" ]; then
     case "$n" in
       raw*) gcc-4.2 -arch i386 -O1 -static -nostdlib -e _start -o "$B/$n" "$t" ;;
       cmpsb) gcc-4.2 -arch i386 -O2 -o "$B/$n" "$t" ;;           # i386 assembly: compared against the interpreter
-      faults) gcc-4.2 -arch i386 -O1 -o "$B/$n" "$t" ;;          # i386 exceptions: compared against tests/faults.expected
+      faults|identity) gcc-4.2 -arch i386 -O1 -o "$B/$n" "$t" ;; # i386 only: compared against tests/$n.expected
       pd_ops) gcc-4.2 -arch i386 -O2 -msse2 -o "$B/$n" "$t" ;;   # SSE2 intrinsics: compared against the interpreter
       vdsp_d) V=$S/System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A
               gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" $V/libvDSP.dylib $V/libvMisc.dylib ;;   # Intel vecLib

@@ -51,7 +51,13 @@ static uint32_t stack_build(int argc, char **argv, const char *path, uint32_t mh
     argvp = calloc((size_t)argc + 1, 4);
     envp = calloc(nenv + 1, 4);
     apple = chain_put(&top, path);
-    for (i = 0; i < nenv; i++) envp[i] = chain_put(&top, environ[i]);
+    for (i = 0; i < nenv; i++) {
+        /* "_" (the shell's last command) names rosetta: for the guest it is the program, as natively */
+        const char *s = environ[i], *b = strrchr(s, '/');
+        char fixed[1100];
+        if (!strncmp(s, "_=", 2) && !strcmp(b ? b + 1 : s + 2, "rosetta")) { snprintf(fixed, sizeof fixed, "_=%s", path); s = fixed; }
+        envp[i] = chain_put(&top, s);
+    }
     for (i = 0; i < (uint32_t)argc; i++) argvp[i] = chain_put(&top, argv[i]);
     top &= ~15u;
     n = (with_mh ? 1 : 0) + 1 + (uint32_t)argc + 1 + nenv + 1 + 2;

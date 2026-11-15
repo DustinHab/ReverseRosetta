@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 
@@ -129,17 +130,35 @@ void thread_yield(Cpu *c)
  * translated code and it has not been in the dispatcher since the last round (twice in a row), it is stopped
  * (jit_interrupt): at the next block start it enters the dispatcher, which lets others go first or delivers. */
 static int g_watchdog_on;
+static volatile int g_watchdog_quit;
+static pthread_t g_watchdog_thread;
+static pthread_mutex_t g_wd_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_wd_cv = PTHREAD_COND_INITIALIZER;     /* stop wakes it at once */
 static unsigned long g_st_watchdog;
+
+static void watchdog_sleep(void)
+{
+    struct timeval now;
+    struct timespec until;
+    gettimeofday(&now, 0);
+    until.tv_sec = now.tv_sec;
+    until.tv_nsec = (now.tv_usec + 4000) * 1000L;
+    if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&g_wd_m);
+    if (!g_watchdog_quit) pthread_cond_timedwait(&g_wd_cv, &g_wd_m, &until);
+    pthread_mutex_unlock(&g_wd_m);
+}
 
 static void *watchdog(void *arg)
 {
     unsigned prev = g_dispatcher_rounds;
     int jam = 0;
     (void)arg;
-    for (;;) {
+    while (!g_watchdog_quit) {
         unsigned v;
         int who;
-        usleep(4000);
+        watchdog_sleep();
+        if (g_watchdog_quit) break;
         v = g_dispatcher_rounds;
         who = g_thread_waiting || (g_sig_pending & ~g_sig_mask);
         if (who && v == prev && g_in_code && !g_patched) {
@@ -152,14 +171,23 @@ static void *watchdog(void *arg)
 
 void thread_watchdog_start(void)
 {
-    pthread_t t;
-    pthread_attr_t at;
     if (g_watchdog_on || g_only_interp || getenv("ROSETTA_NO_WATCHDOG")) return;
-    g_watchdog_on = 1;
-    pthread_attr_init(&at);
-    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-    pthread_create(&t, &at, watchdog, 0);
-    pthread_attr_destroy(&at);
+    g_watchdog_quit = 0;
+    if (pthread_create(&g_watchdog_thread, 0, watchdog, 0) == 0) g_watchdog_on = 1;
+}
+
+/* the kernel refuses execve (ENOTSUP) while the process has other threads: stop the watchdog first (it ends
+   within one round); returns whether it was running */
+int thread_watchdog_stop(void)
+{
+    if (!g_watchdog_on) return 0;
+    pthread_mutex_lock(&g_wd_m);
+    g_watchdog_quit = 1;
+    pthread_cond_signal(&g_wd_cv);
+    pthread_mutex_unlock(&g_wd_m);
+    pthread_join(g_watchdog_thread, 0);
+    g_watchdog_on = 0;
+    return 1;
 }
 
 int thread_register(uint32_t start, uint32_t wqstart, uint32_t pthsize)
@@ -395,12 +423,14 @@ int thread_wq_ops(Cpu *c, uint32_t kind, uint32_t ent, uint32_t prio)
 
 /* child after fork: only the calling thread exists, and it holds the lock. The mutex may have been held by another
    thread at the moment of the fork, so it is created anew; the watchdog thread did not survive either. */
-void thread_after_fork(Cpu *c)
+void thread_after_fork(Cpu *c, int watchdog_again)
 {
-    int watchdog_was_on = g_watchdog_on;
+    int watchdog_was_on = g_watchdog_on && watchdog_again;
     pthread_mutex_init(&g_m, 0);
     pthread_cond_init(&g_cv, 0);
     pthread_cond_init(&g_wq_cv, 0);
+    pthread_mutex_init(&g_wd_m, 0);
+    pthread_cond_init(&g_wd_cv, 0);
     g_taken = 1;
     g_threads = 1;
     g_thread_waiting = 0;

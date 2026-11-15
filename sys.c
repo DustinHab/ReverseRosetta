@@ -526,6 +526,37 @@ static int sysctl_struct_swap(const int *name, uint32_t n, uint32_t a, uint32_t 
     return 0;
 }
 
+/* The processor the guest sees: the Intel Core Duo that CPUID and the commpage describe (Apple's Rosetta likewise
+   showed PowerPC programs a PowerPC). Values by name (sysctlbyname gets fake OIDs for them); names that only a
+   PowerPC has are hidden. ROSETTA_HOST_CPU=1 shows the real processor. host_info: mach_msg.c. */
+#define OID_IDENTITY 0x7e57100u
+static const struct { const char *name; char kind; uint32_t value; const char *text; } g_identity[] = {
+    { "hw.cputype", 'i', 7, 0 }, { "hw.cpusubtype", 'i', 4, 0 }, { "hw.cpufamily", 'i', 0x73d67300u, 0 },
+    { "hw.cpu64bit_capable", 'i', 0, 0 }, { "hw.optional.floatingpoint", 'i', 1, 0 }, { "hw.optional.mmx", 'i', 1, 0 },
+    { "hw.optional.sse", 'i', 1, 0 }, { "hw.optional.sse2", 'i', 1, 0 }, { "hw.optional.sse3", 'i', 1, 0 },
+    { "hw.optional.supplementalsse3", 'i', 0, 0 }, { "hw.optional.sse4_1", 'i', 0, 0 }, { "hw.optional.sse4_2", 'i', 0, 0 },
+    { "hw.optional.x86_64", 'i', 0, 0 },
+    { "hw.optional.altivec", 'x', 0, 0 }, { "hw.optional.64bitops", 'x', 0, 0 }, { "hw.optional.graphicsops", 'x', 0, 0 },
+    { "hw.optional.stfiwx", 'x', 0, 0 }, { "hw.optional.dcba", 'x', 0, 0 }, { "hw.optional.datastreams", 'x', 0, 0 },
+    { "machdep.cpu.vendor", 's', 0, "GenuineIntel" },
+    { "machdep.cpu.brand_string", 's', 0, "Intel(R) Core(TM) Duo CPU (ReverseRosetta on PowerPC)" },
+    { "machdep.cpu.family", 'i', 6, 0 }, { "machdep.cpu.model", 'i', 14, 0 }, { "machdep.cpu.stepping", 'i', 8, 0 },
+    { "machdep.cpu.features", 's', 0, "FPU VME DE PSE TSC MSR PAE MCE CX8 APIC SEP MTRR PGE MCA CMOV PAT CLFSH MMX FXSR SSE SSE2 SSE3" },
+};
+#define IDENTITY_N (sizeof g_identity / sizeof g_identity[0])
+int g_host_cpu = -1;                        /* ROSETTA_HOST_CPU: the guest sees the PowerPC */
+
+static int identity_find(const char *s, uint32_t len)
+{
+    uint32_t k;
+    if (g_host_cpu < 0) g_host_cpu = getenv("ROSETTA_HOST_CPU") != 0;
+    if (g_host_cpu) return -1;
+    while (len && !s[len - 1]) len--;        /* with or without the NUL */
+    for (k = 0; k < IDENTITY_N; k++)
+        if (strlen(g_identity[k].name) == len && !strncmp(g_identity[k].name, s, len)) return (int)k;
+    return -1;
+}
+
 static void sys_sysctl(Cpu *c)
 {
     uint32_t gname = arg(0), n = arg(1), prev = arg(2), oldlen = arg(3), fresh = arg(4), newlen = arg(5), i;
@@ -551,11 +582,35 @@ static void sys_sysctl(Cpu *c)
             set_result(c, 0, 0);
             return;
         }
+        if (fresh && newlen) {
+            int k = identity_find((const char *)(uintptr_t)fresh, newlen);
+            if (k >= 0) {
+                if (g_identity[k].kind == 'x') { set_result(c, 0, ENOENT); return; }
+                if (l < 8 || !prev) { set_result(c, 0, ENOMEM); return; }
+                st32(prev, 0); st32(prev + 4, OID_IDENTITY + (uint32_t)k);
+                st32(oldlen, 8);
+                set_result(c, 0, 0);
+                return;
+            }
+        }
         r = sysctl(name, n, (void *)(uintptr_t)prev, prev ? &l : 0, (void *)(uintptr_t)fresh, newlen);
         if (r < 0) { set_result(c, 0, errno); return; }
         for (i = 0; prev && i + 4 <= l; i += 4) st32(prev + i, *(uint32_t *)(uintptr_t)(prev + i));
         if (oldlen) st32(oldlen, (uint32_t)l);
         set_result(c, 0, 0);
+        return;
+    }
+    if (n == 2 && name[0] == 0 && (uint32_t)name[1] - OID_IDENTITY < IDENTITY_N) {
+        uint32_t k = (uint32_t)name[1] - OID_IDENTITY;
+        if (g_identity[k].kind == 's') {
+            uint32_t len = (uint32_t)strlen(g_identity[k].text) + 1;
+            if (prev) { if (l < len) { set_result(c, 0, ENOMEM); return; } memcpy((void *)(uintptr_t)prev, g_identity[k].text, len); }
+            if (oldlen) st32(oldlen, len);
+        } else {
+            if (prev) { if (l < 4) { set_result(c, 0, ENOMEM); return; } st32(prev, g_identity[k].value); }
+            if (oldlen) st32(oldlen, 4);
+        }
+        set_result(c, 0, fresh ? EPERM : 0);
         return;
     }
     if (n == 2 && name[0] == 0 && (uint32_t)name[1] == OID_PROC_NATIVE) {
@@ -665,6 +720,32 @@ static struct { int code, pid, uid, status; uint32_t addr, val; } g_sig_info[32]
 #define SIG_BIT(s) (1u << ((s) - 1))           /* like sigmask(): signal n = bit n-1 (also g_sig_pending) */
 #define SIG_NEVER (SIG_BIT(SIGKILL) | SIG_BIT(SIGSTOP))
 
+/* wakes threads waiting in sigsuspend/sigwait while other guest threads exist (created by the first such wait;
+   writing to it is async-signal-safe, the read end is non-blocking and drained by the waiter) */
+static int g_sig_pipe[2] = { -1, -1 };
+
+static void sig_wake(void)
+{
+    if (g_sig_pipe[1] >= 0) { int e = errno; (void)write(g_sig_pipe[1], "", 1); errno = e; }
+}
+
+/* descriptors of the translator itself: closing them is a no-op for the guest, and before the guest takes their
+   number with dup2 they move to another one */
+static int sys_own_fd(int fd) { return fd >= 0 && (fd == g_sig_pipe[0] || fd == g_sig_pipe[1]); }
+
+static void sys_own_fd_move(int fd)
+{
+    int k;
+    for (k = 0; k < 2; k++)
+        if (fd >= 0 && g_sig_pipe[k] == fd) {
+            int moved = fcntl(fd, F_DUPFD, getdtablesize() > 64 ? getdtablesize() - 32 : 3);
+            if (moved < 0) continue;
+            fcntl(moved, F_SETFD, FD_CLOEXEC);
+            fcntl(moved, F_SETFL, O_NONBLOCK);
+            g_sig_pipe[k] = moved;           /* the old number is closed by the guest's dup2 */
+        }
+}
+
 static void sig_host(int sig, siginfo_t *si, void *k)
 {
     (void)k;
@@ -675,6 +756,7 @@ static void sig_host(int sig, siginfo_t *si, void *k)
         g_sig_info[sig].val = (uint32_t)si->si_value.sival_int;
     }
     __sync_fetch_and_or(&g_sig_pending, SIG_BIT(sig));
+    sig_wake();
 }
 
 /* signals the translator needs itself (fault catcher, sampling profile) or that nobody catches */
@@ -731,6 +813,7 @@ static void sig_schedule(int sig, int code)
     g_sig_info[sig].code = code; g_sig_info[sig].pid = getpid(); g_sig_info[sig].uid = (int)getuid();
     g_sig_info[sig].status = 0; g_sig_info[sig].addr = 0; g_sig_info[sig].val = 0;
     __sync_fetch_and_or(&g_sig_pending, SIG_BIT(sig));
+    sig_wake();
 }
 
 /* SIG_DFL: ignore, stop or terminate the host with the same signal (exit status to the shell as with native) */
@@ -866,8 +949,30 @@ static void sig_back(Cpu *c, uint32_t uctx)
 static void sig_wait_for(uint32_t bits)
 {
     sigset_t all, before;
-    if (g_threads > 1) {                     /* the host delivers the signal to any thread: check instead of sleeping */
-        while (!(g_sig_pending & bits)) f_short_wait();
+    if (g_threads > 1) {
+        /* the host delivers the signal to any thread: wait on the wake-up pipe (lock free) instead of sigsuspend */
+        if (g_sig_pipe[0] < 0) {
+            int p[2], k;
+            if (pipe(p) == 0) {
+                for (k = 0; k < 2; k++) {
+                    int high = fcntl(p[k], F_DUPFD, getdtablesize() > 64 ? getdtablesize() - 32 : 3);   /* out of the */
+                    if (high >= 0) { close(p[k]); p[k] = high; }                                       /* guest's way */
+                    fcntl(p[k], F_SETFL, O_NONBLOCK);
+                    fcntl(p[k], F_SETFD, FD_CLOEXEC);
+                }
+                g_sig_pipe[0] = p[0];
+                g_sig_pipe[1] = p[1];
+            }
+        }
+        while (!(g_sig_pending & bits)) {
+            char drain[64];
+            struct pollfd pf;
+            if (g_sig_pipe[0] < 0) { f_short_wait(); continue; }
+            pf.fd = g_sig_pipe[0]; pf.events = POLLIN; pf.revents = 0;
+            if (g_sig_pending & bits) break;
+            f_poll(&pf, 1, 500);             /* the timeout only guards against a lost wake-up */
+            while (read(g_sig_pipe[0], drain, sizeof drain) > 0) ;
+        }
         return;
     }
     sigfillset(&all);
@@ -937,7 +1042,7 @@ static int proc_exec(const char *path, uint32_t gargv, uint32_t genv, uint32_t m
     uint32_t na = 0, ne = 0, i, k = 0;
     char **av, **ev;
     sigset_t m, before;
-    int sig, e, intel = exec_intel(path);
+    int sig, e, watchdog, intel = exec_intel(path);
     if (intel && !g_self[0]) return EBADARCH;
     while (gargv && ld32(gargv + 4 * na)) na++;
     while (genv && ld32(genv + 4 * ne)) ne++;
@@ -959,10 +1064,18 @@ static int proc_exec(const char *path, uint32_t gargv, uint32_t genv, uint32_t m
     sigemptyset(&m);
     for (sig = 1; sig < 32; sig++) if ((mask & SIG_BIT(sig)) && !sig_own(sig)) sigaddset(&m, sig);
     fflush(0);
+    watchdog = thread_watchdog_stop();       /* the kernel refuses execve while other threads exist */
     sigprocmask(SIG_SETMASK, &m, &before);
     execve(intel ? g_self : path, av, ev);
     e = errno;
     sigprocmask(SIG_SETMASK, &before, 0);
+    if (watchdog) thread_watchdog_start();
+    if (g_log) {
+        fprintf(stderr, "[execve] %s%s, %u arguments, %u environment: %s\n", intel ? "through rosetta: " : "", path, na, ne,
+                strerror(e));
+        for (i = 0; av[i]; i++) fprintf(stderr, "[execve]   argv[%u] %s\n", i, av[i]);
+        for (i = 0; ev[i]; i++) fprintf(stderr, "[execve]   env %s\n", ev[i]);
+    }
     free(av);
     free(ev);
     return e;
@@ -974,8 +1087,12 @@ static pid_t proc_fork(Cpu *c)
     fflush(0);
     p = fork();
     if (p == 0) {
-        thread_after_fork(c);
+        thread_after_fork(c, 1);
         g_sig_pending = 0;                   /* a new process has no pending signals */
+        if (g_sig_pipe[0] >= 0) {            /* the wake-up pipe belongs to the parent */
+            close(g_sig_pipe[0]); close(g_sig_pipe[1]);
+            g_sig_pipe[0] = g_sig_pipe[1] = -1;
+        }
     }
     return p;
 }
@@ -1066,6 +1183,7 @@ static int proc_spawn(uint32_t pidp, const char *path, uint32_t desc, uint32_t g
     if (p < 0) { e = errno; close(pfd[0]); close(pfd[1]); return e; }
     if (p == 0) {                            /* child: no guest code runs here */
         int w = pfd[1];
+        thread_after_fork(g_thread_cur, 0);  /* only this thread exists (proc_exec must not join the watchdog) */
         close(pfd[0]);
         e = spawn_setup(attr, acts, &mask, &w);
         if (!e) e = proc_exec(path, gargv, genv, mask);
@@ -1264,7 +1382,11 @@ void sys_bsd(Cpu *c, int sysenter)
         HOST(r);
         return;
     }
-    case SYS_close: jit_fd_off((int)arg(0)); HOST(close((int)arg(0))); return;
+    case SYS_close:
+        if (sys_own_fd((int)arg(0))) { set_result(c, 0, 0); return; }   /* the translator's: the guest never had it */
+        jit_fd_off((int)arg(0));
+        HOST(close((int)arg(0)));
+        return;
     case SYS_unlink: HOST(unlink((const char *)PTR_ARG(0))); return;
     case SYS_chdir: HOST(chdir((const char *)PTR_ARG(0))); return;
     case SYS_fchdir: HOST(fchdir((int)arg(0))); return;
@@ -1278,7 +1400,12 @@ void sys_bsd(Cpu *c, int sysenter)
     case SYS_getpgrp: set_result(c, (uint32_t)getpgrp(), 0); return;
     case SYS_access: HOST(access(gpath(arg(0)), (int)arg(1))); return;
     case SYS_dup: HOST(dup((int)arg(0))); return;
-    case SYS_dup2: jit_fd_off((int)arg(1)); HOST(dup2((int)arg(0), (int)arg(1))); return;
+    case SYS_dup2:
+        if (sys_own_fd((int)arg(0))) { set_result(c, 0, EBADF); return; }
+        sys_own_fd_move((int)arg(1));       /* the guest wants this number: the translator's descriptor moves away */
+        jit_fd_off((int)arg(1));
+        HOST(dup2((int)arg(0), (int)arg(1)));
+        return;
     case SYS_umask: set_result(c, umask((mode_t)arg(0)), 0); return;
     case SYS_getdtablesize: set_result(c, (uint32_t)getdtablesize(), 0); return;
     case SYS_readlink: HOST(readlink(gpath(arg(0)), PTR_ARG(1), arg(2))); return;
@@ -2073,6 +2200,9 @@ void sys_bsd(Cpu *c, int sysenter)
         return;
     case 165:                               /* quotactl: as on a volume without quotas */
         set_result(c, 0, ENOTSUP);
+        return;
+    case 167: case 159:                     /* mount, unmount: only root may (file system arguments are not converted) */
+        set_result(c, 0, geteuid() ? EPERM : ENOTSUP);
         return;
     case 44: set_result(c, 0, 0); return;   /* profil: no kernel profiling of translated code */
     /* ---------- files ---------- */
