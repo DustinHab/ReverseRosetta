@@ -4,7 +4,8 @@
  * xadd with a slot, writes through a pointer, 16- and 8-bit writes into a 32-bit slot, and a call that changes its
  * argument slot. Chains of read-modify-writes computed in the slot's copy register (with carry, compare, shift by cl,
  * shld across inner jumps), and a pointer reloaded from the frame for every byte while the pointer slot changes
- * through a pointer. Stores that a later instruction overwrites (left out) while the copy registers run out.
+ * through a pointer. Stores that a later instruction overwrites (left out) while the copy registers run out. 8- and
+ * 16-bit reads inside remembered slots.
  * Translated (ROSETTA_THRESHOLD=1) against the interpreter (ROSETTA_INTERP=1). */
 #include <stdio.h>
 
@@ -17,6 +18,7 @@ unsigned int fw_call(unsigned int n, unsigned int v);
 unsigned int fw_inplace(unsigned int n, unsigned int v);
 unsigned int fw_reload(unsigned int n, unsigned int v);
 unsigned int fw_dead(unsigned int n, unsigned int v);
+unsigned int fw_narrow(unsigned int n, unsigned int v);
 
 /* frame: ebp-4 ebx, esp = ebp - 32 (so [esp+24] is [ebp-8], [esp+20] is [ebp-12]) */
 #define PROLOGUE "pushl %ebp\n\tmovl %esp, %ebp\n\tpushl %ebx\n\tsubl $28, %esp\n\t" \
@@ -220,7 +222,50 @@ __asm__(
     "xorl -12(%ebp), %eax\n\t"
     "addl -16(%ebp), %eax\n\t"
     "xorl -24(%ebp), %eax\n\t"
-    "addl %edx, %eax\n" EPILOGUE);
+    "addl %edx, %eax\n" EPILOGUE
+
+    /* 8- and 16-bit reads inside remembered 32-bit slots (AES: shrl $0x10,-0x24(%ebp); movzbl -0x24(%ebp),%eax): every
+       byte and half, zero- and sign-extended, from a guest register, a copy register and a constant; a byte write in
+       between makes the slot unknown */
+    ".globl _fw_narrow\n_fw_narrow:\n\t" PROLOGUE
+    "1:\tmovl %edx, -8(%ebp)\n\t"
+    "movzbl -8(%ebp), %ebx\n\t"
+    "addl %ebx, %eax\n\t"
+    "movzbl -7(%ebp), %ebx\n\t"
+    "xorl %ebx, %eax\n\t"
+    "movsbl -6(%ebp), %ebx\n\t"
+    "addl %ebx, %eax\n\t"
+    "movsbl -5(%ebp), %ebx\n\t"
+    "xorl %ebx, %eax\n\t"
+    "shrl $16, -8(%ebp)\n\t"
+    "movzbl -8(%ebp), %ebx\n\t"
+    "addl %ebx, %eax\n\t"
+    "movzwl -8(%ebp), %ebx\n\t"
+    "xorl %ebx, %eax\n\t"
+    "movswl -6(%ebp), %ebx\n\t"
+    "addl %ebx, %eax\n\t"
+    "movl %eax, -12(%ebp)\n\t"
+    "roll $9, -12(%ebp)\n\t"
+    "movb -10(%ebp), %bl\n\t"
+    "movb -11(%ebp), %bh\n\t"
+    "addl %ebx, %eax\n\t"
+    "movzwl -10(%ebp), %ebx\n\t"
+    "xorl %ebx, %eax\n\t"
+    "movl $0x89abcdef, -16(%ebp)\n\t"
+    "movzbl -15(%ebp), %ebx\n\t"
+    "addl %ebx, %eax\n\t"
+    "movswl -14(%ebp), %ebx\n\t"
+    "xorl %ebx, %eax\n\t"
+    "movb %al, -15(%ebp)\n\t"
+    "movzwl -16(%ebp), %ebx\n\t"
+    "addl %ebx, %eax\n\t"
+    "cmpb -9(%ebp), %al\n\t"
+    "adcl $0, %eax\n\t"
+    "addb -12(%ebp), %al\n\t"
+    "roll $5, %eax\n\t"
+    "addl $0x9e3779b9, %edx\n\t"
+    "decl %ecx\n\t"
+    "jnz 1b\n" EPILOGUE);
 
 /* the same in C: locals that live in memory */
 static unsigned int c_locals(unsigned int n, unsigned int v)
@@ -244,9 +289,9 @@ int main(void)
     unsigned int k;
     for (k = 0; k < sizeof v / sizeof v[0]; k++)
         printf("%08x: alias %08x rmw %08x xchg %08x pointer %08x partial %08x call %08x c %08x inplace %08x "
-               "reload %08x dead %08x\n", v[k],
+               "reload %08x dead %08x narrow %08x\n", v[k],
                fw_alias(1000, v[k]), fw_rmw(1000, v[k]), fw_xchg(1000, v[k]), fw_pointer(1000, v[k]),
                fw_partial(1000, v[k]), fw_call(1000, v[k]), c_locals(1000, v[k]), fw_inplace(1000, v[k]),
-               fw_reload(1000, v[k]), fw_dead(1000, v[k]));
+               fw_reload(1000, v[k]), fw_dead(1000, v[k]), fw_narrow(1000, v[k]));
     return 0;
 }

@@ -167,6 +167,10 @@ static int g_no_sw;                   /* ROSETTA_NO_SW: no forwarding through th
 static int g_no_sw2;                  /* ROSETTA_NO_SW2: only mov, only esp-known slots (forwarding as before 16.11.) */
 static int g_no_inplace;              /* ROSETTA_NO_INPLACE: stack slot copies only through r3/r4 (as before 17.11.) */
 static int g_no_loadcopy;             /* ROSETTA_NO_LOADCOPY: a loaded slot is forgotten when its register changes */
+static int g_loadcopy_dist = 16;      /* ROSETTA_LOADCOPY_DIST: ... unless it is read again within this many instructions
+                                         (aes over 40 MB: 4-8 2.96 s, 12 2.90, 16 2.85, 24 3.00, unlimited 3.13;
+                                         sha1 the same from 4 on) */
+static int g_no_narrowfw;             /* ROSETTA_NO_NARROWFW: 8/16-bit reads of a remembered slot go through memory */
 static int g_sw_skip, g_sw_skipped;   /* dead store: leave out the next 32-bit store (save_p) / it was left out */
 static int g_no_dead;                 /* without ROSETTA_DEAD=1 every store to a stack slot is done at once: leaving
                                          out dead ones removes instructions but gains nothing on the G4 (stores run
@@ -786,6 +790,8 @@ static int jit_create(void)
     g_no_sw2 = getenv("ROSETTA_NO_SW2") != 0;
     g_no_inplace = getenv("ROSETTA_NO_INPLACE") != 0;
     g_no_loadcopy = getenv("ROSETTA_NO_LOADCOPY") != 0;
+    if (getenv("ROSETTA_LOADCOPY_DIST")) g_loadcopy_dist = atoi(getenv("ROSETTA_LOADCOPY_DIST"));
+    g_no_narrowfw = getenv("ROSETTA_NO_NARROWFW") != 0;
     g_no_dead = !getenv("ROSETTA_DEAD");   /* off: no measurable gain (sha1 1.10 s against 1.11 s, realworld equal) */
     g_dead_log = getenv("ROSETTA_DEAD_LOG") != 0;
     if (getenv("ROSETTA_DEAD_WINDOW")) sscanf(getenv("ROSETTA_DEAD_WINDOW"), "%d,%d", &g_dead_window, &g_dead_writes);
@@ -1438,11 +1444,14 @@ static int rmw_val(const Insn *b, int ra, int rb)
     return 3;
 }
 
+static int sw_load_narrow(const Insn *b, int sz, int t);
+
 static void load_m(int t, const Insn *b, int sz)
 {
     int ra, rb, c = slot_reg(b, sz);
     if (c >= 0) { if (c != t) e(MR(t, c)); return; }
     if (sz == 4 && sw_load(b, t)) return;   /* stack slot written or read in the block */
+    if (sz < 4 && sw_load_narrow(b, sz, t)) return;     /* a byte or half of such a slot */
     if (sz == 1 && byte_direct(b)) { e(LBZ(t, (int32_t)b->disp, R(b->base))); return; }
     ea_pair(b, 1, &ra, &rb);
     load_p(t, ra, rb, sz);
@@ -1832,7 +1841,11 @@ static AluOp alu_operands(const Insn *b, int sz, int dir, int writes)
             if (o.vd != 3) o.w = o.vd;
         } else if (sz == 4 && sw_fwd_ok(b)) {                    /* cmp/test of a forwarded slot: no address */
             if ((o.vd = sw_copy_of(b, 0)) <= 0) { sw_load(b, 3); o.vd = 3; }
-        } else { ea_pair(b, 1, &o.ra, &o.rb); if (sz != 4 || !sw_load(b, 3)) load_p(3, o.ra, o.rb, sz); o.vd = 3; }
+        } else {
+            ea_pair(b, 1, &o.ra, &o.rb);
+            if (sz == 4 ? !sw_load(b, 3) : !sw_load_narrow(b, sz, 3)) load_p(3, o.ra, o.rb, sz);
+            o.vd = 3;
+        }
     }
     return o;
 }
@@ -3982,12 +3995,13 @@ static void sw_guest_save(int32_t off, int r)
     if (!sw_host(off, R(r))) sw_guest(off, r);
 }
 
-/* is [ebp+d] read again in the block before it is overwritten or ebp changes (from the current instruction on)? */
-static int sw_read_later(int32_t d)
+/* is [ebp+d] read again in the block before it is overwritten or ebp changes (from the current instruction on, within
+   n instructions)? */
+static int sw_read_within(int32_t d, int n)
 {
     int j;
     if (!g_sw_blk) return 1;
-    for (j = g_sw_i; j < g_sw_n; j++) {
+    for (j = g_sw_i; j < g_sw_n && j - g_sw_i < n; j++) {
         const Insn *y = &g_sw_blk[j];
         if (y->mem && y->base == EBP && y->index < 0 && !y->seg && (int32_t)y->disp == d)
             return !((y->op == 0x89 || y->op == 0xc7) && y->opsz == 4);     /* a plain store overwrites it unread */
@@ -3996,8 +4010,10 @@ static int sw_read_later(int32_t d)
     return 0;
 }
 
+static int sw_read_later(int32_t d) { return sw_read_within(d, 1 << 30); }
+
 static int slot_reg(const Insn *b, int sz);
-static int g_sw_no_note;                /* the caller remembers the stored value itself (mov m,imm: a constant) */
+static int g_sw_no_note;               /* the caller remembers the stored value itself (mov m,imm: a constant) */
 
 /* after a 32-bit store of host register val to the memory operand of b: a stack slot holds val. A guest register
    that this instruction does not change is remembered as such; otherwise (a temporary, or xchg/xadd change it
@@ -4188,6 +4204,26 @@ static int sw_copy_of(const Insn *b, int own)
     return h;
 }
 
+/* 8- or 16-bit read inside a remembered 32-bit stack slot (AES: shrl $0x10,0xdc(%ebp); movzbl 0xdc(%ebp),%eax - the
+   G4 would wait for the store): the bytes from the slot's value (little endian: byte k is bits 8k..8k+7),
+   zero-extended into t */
+static int sw_load_narrow(const Insn *b, int sz, int t)
+{
+    int32_t off;
+    int k, sh;
+    if (g_no_sw || g_no_sw2 || g_no_narrowfw || !sw_slot(b, &off) || slot_reg(b, 4) >= 0) return 0;
+    for (k = 0; k < SW_N; k++) {
+        const SwEntry *s = &g_sw[k];
+        if (!s->valid || off < s->off || off + sz > s->off + 4) continue;   /* (name spaces are SW_NSB apart) */
+        sh = 8 * (off - s->off);
+        if (s->kind == 'k') load_imm(t, (s->val >> sh) & (sz == 1 ? 0xffu : 0xffffu));
+        else e(RLWINM(t, s->kind == 'g' ? R(s->reg) : s->reg, (32 - sh) & 31, sz == 1 ? 24 : 16, 31));
+        g_st_sw++;
+        return 1;
+    }
+    return 0;
+}
+
 /* value of slot k into host register t */
 static void sw_fetch(int k, int t)
 {
@@ -4237,7 +4273,7 @@ static void sw_pre_insn(const Insn *b, int interp, int verf)
                     int keep = g_sw[k].dirty ||
                                (g_sw[k].store ? g_sw[k].off < SW_NSB / 2 || sw_read_later(g_sw[k].off - SW_NSB)
                                               : !g_no_loadcopy && g_sw[k].off >= SW_NSB / 2 &&
-                                                sw_read_later(g_sw[k].off - SW_NSB));
+                                                sw_read_within(g_sw[k].off - SW_NSB, g_loadcopy_dist));
                     int h = keep && !interp ? sw_host_reg() : 0;
                     if (h) { e(MR(h, R(g_sw[k].reg))); g_sw[k].kind = 'w'; g_sw[k].reg = (int8_t)h; }
                     else { sw_flush1(&g_sw[k]); g_sw[k].valid = 0; }

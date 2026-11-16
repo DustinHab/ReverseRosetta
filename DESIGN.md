@@ -535,10 +535,16 @@ page). Running measurement series: `tests/measure_all.sh`.
   instead of through `mr` into r3/r4, and need no address then. The SHA-1 loop of openssl: 6490 PowerPC instructions
   for its 28 blocks before, 5959 after.
 - *Load copies* (`ROSETTA_NO_LOADCOPY`): a slot loaded into a guest register is remembered as that register; when the
-  register changes, the value moves to a copy register if the block reads the slot again. gcc reloads pointers from
-  the frame for every byte (`movl -0x1fc(%ebp),%eax; movzbl 1(%eax),%eax`, again). Both together: openssl sha1 over
-  40 MB 1.24 s against 1.10 s (native 0.43 s), md5 over 40 MB -3 %, bzip2 -9 -1 %, the rest of the realworld table
-  unchanged.
+  register changes, the value moves to a copy register if the block reads the slot again within 16 instructions
+  (`ROSETTA_LOADCOPY_DIST`). gcc reloads pointers from the frame for every byte (`movl -0x1fc(%ebp),%eax; movzbl
+  1(%eax),%eax`, again). Without the distance limit AES (eight hot slots, four copy registers) lost: the copies pushed
+  each other out before they were used (3.13 s against 2.99 s without load copies). Both together: openssl sha1 over
+  40 MB 1.24 s against 1.10 s (native 0.43 s), md5 over 40 MB -3 %, bzip2 -9 -1 %.
+- *Narrow reads of remembered slots* (`ROSETTA_NO_NARROWFW`): movzbl/movzwl/movsx/8-bit ALU operands inside a 32-bit
+  slot that the table knows take the bytes from its register (`rlwinm`; byte k of the little-endian value is bits
+  8k..8k+7). AES as gcc compiles it shifts a slot in memory and reads its low byte right after (`shrl
+  $0x10,0xdc(%ebp); movzbl 0xdc(%ebp),%eax`): `stwbrx` then `lbz` of the same word stalls the G4. aes-128-cbc over
+  40 MB: 3.15 s before both, 2.85 s now (native 1.11 s).
 - *Dead stores* (`ROSETTA_DEAD=1`, off): a store to `[ebp+d]` that a later instruction of the block overwrites entirely
   is left out, the entry is marked dirty and written after all (`li r0,d; stwbrx`) if it has to leave the table first.
   A strict lookahead (`sw_killer`: no exit, merge point, interpreter, call, div or memory access other than other
