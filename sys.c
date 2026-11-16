@@ -25,6 +25,7 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/mman.h>
+#include <sys/ipc.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -2626,6 +2627,43 @@ static void sys_bsd_call(Cpu *c, int sysenter)
     case 325: HOST(munlockall()); return;
     case SYS_minherit: HOST(minherit(PTR_ARG(0), arg(1), (int)arg(2))); return;
     case SYS_mincore: HOST(mincore(PTR_ARG(0), arg(1), PTR_ARG(2))); return;
+    /* ---------- System V shared memory (SheepShaver, X11's MIT-SHM) ---------- */
+    case 265: HOST(syscall(265, (int)arg(0), arg(1), (int)arg(2))); return;       /* shmget(key, size, flags) */
+    case 262: {                             /* shmat(id, address, flags): the address as the result */
+        long r = syscall(262, (int)arg(0), PTR_ARG(1), (int)arg(2));
+        if (r == -1) { set_result(c, 0, errno); return; }
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
+    case 264: HOST(syscall(264, PTR_ARG(0))); return;          /* shmdt(address) */
+    case 263: {                             /* shmctl(id, cmd, struct shmid_ds *) */
+        /* shmid_ds (56 bytes, the same layout on i386 and PowerPC): words except mode and _seq (16, 18) and
+           shm_nattch (36), which are 16 bits */
+        static const uint8_t half[] = { 16, 18, 36 };
+        uint8_t b[56];
+        uint32_t a = arg(2), o, k;
+        int cmd = (int)arg(1), r;
+        if (!a || (cmd != IPC_STAT && cmd != IPC_SET)) { HOST(syscall(263, (int)arg(0), cmd, PTR_ARG(2))); return; }
+        for (o = 0; o < 56; o += 4) {
+            for (k = 0; k < sizeof half && half[k] != o; k++) ;
+            if (k < sizeof half || o == 36) continue;
+            *(uint32_t *)(b + o) = ld32(a + o);
+        }
+        for (k = 0; k < sizeof half; k++) *(uint16_t *)(b + half[k]) = (uint16_t)ld16(a + half[k]);
+        *(uint16_t *)(b + 38) = 0;
+        r = (int)syscall(263, (int)arg(0), cmd, b);
+        if (r < 0) { set_result(c, 0, errno); return; }
+        if (cmd == IPC_STAT) {
+            for (o = 0; o < 56; o += 4) {
+                for (k = 0; k < sizeof half && half[k] != o; k++) ;
+                if (k < sizeof half || o == 36) continue;
+                st32(a + o, *(uint32_t *)(b + o));
+            }
+            for (k = 0; k < sizeof half; k++) st16(a + half[k], *(uint16_t *)(b + half[k]));
+        }
+        set_result(c, (uint32_t)r, 0);
+        return;
+    }
     /* ---------- POSIX semaphores and shared memory: handles are plain numbers ---------- */
     case 267: HOST(syscall(267, PTR_ARG(0))); return;          /* shm_unlink(name) */
     case 268: HOST(syscall(268, PTR_ARG(0), (int)arg(1), (int)arg(2), (int)arg(3))); return;    /* sem_open */

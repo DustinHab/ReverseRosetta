@@ -15,6 +15,8 @@
 #include <semaphore.h>
 #include <termios.h>
 #include <pthread.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -649,6 +651,26 @@ static void t_sysctl(void)
     }
 }
 
+/* System V shared memory (SheepShaver, X11's MIT-SHM): create, attach, write, read the segment's state, detach, remove */
+static void t_sysv_shm(void)
+{
+    struct shmid_ds ds;
+    int id = shmget(IPC_PRIVATE, 8192, IPC_CREAT | 0600);
+    char *p;
+    if (id < 0) { printf("shmget failed\n"); return; }
+    p = shmat(id, 0, 0);
+    if (p == (char *)-1) { printf("shmat failed\n"); shmctl(id, IPC_RMID, 0); return; }
+    strcpy(p, "shared");
+    memset(&ds, 0, sizeof ds);
+    shmctl(id, IPC_STAT, &ds);
+    printf("shm: %s, size %u, attached %u, mode %o\n", p, (unsigned)ds.shm_segsz, (unsigned)ds.shm_nattch, ds.shm_perm.mode & 0777);
+    ds.shm_perm.mode = 0640;
+    printf("shm: set %d", shmctl(id, IPC_SET, &ds));
+    memset(&ds, 0, sizeof ds);
+    shmctl(id, IPC_STAT, &ds);
+    printf(", mode now %o, detach %d, remove %d\n", ds.shm_perm.mode & 0777, shmdt(p), shmctl(id, IPC_RMID, 0));
+}
+
 /* the main thread's stack as pthread reports it (from sysctl KERN_USRSTACK): conservative garbage collectors scan from
    the stack pointer up to its top (JavaScriptCore) */
 static void t_stack(void)
@@ -680,5 +702,6 @@ int main(int argc, char **argv)
     t_thread_signals();
     t_process();
     t_stack();
+    t_sysv_shm();
     return 0;
 }

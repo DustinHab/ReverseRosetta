@@ -16,6 +16,9 @@ Stub thunk_stub(uint32_t z);
 /* read the images again (after munmap/mmap of the guest) */
 void thunk_forget(void);
 
+/* guest address of an export that was replaced by fn (the first one found), 0 if none: alGetProcAddress */
+uint32_t thunk_guest_addr(Stub fn);
+
 /* name of the stub (for the statistics) */
 const char *thunk_name(Stub fn);
 

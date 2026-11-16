@@ -8,7 +8,7 @@ mkdir -p "$B"
 CF="-arch ppc -mcpu=7450 -O3 -mdynamic-no-pic -Wall -Wno-unused-function -std=gnu99"   # no PIC: startup -6 %, -O3: another -2 %
 gcc-4.2 $CF -faltivec -c -o "$B/gl.o" "$Q"/gl.c     # OpenGL: AltiVec for vertex data
 gcc-4.2 $CF -o "$B/rosetta" "$Q"/main.c "$Q"/macho.c "$Q"/decoder.c "$Q"/interp.c "$Q"/fpu.c "$Q"/sys.c \
-    "$Q"/mach_msg.c "$Q"/commpage.c "$Q"/sse.c "$Q"/thunk.c "$B"/gl.o "$Q"/jit.c "$Q"/thread.c -Wl,-pagezero_size,0x10000000
+    "$Q"/mach_msg.c "$Q"/commpage.c "$Q"/sse.c "$Q"/thunk.c "$Q"/al.c "$B"/gl.o "$Q"/jit.c "$Q"/thread.c -Wl,-pagezero_size,0x10000000
 ls -l "$B/rosetta"
 if [ "$1" = tests ] && [ -d "$Q/tests" ]; then
   S=/Developer/SDKs/MacOSX10.5.sdk
@@ -28,6 +28,8 @@ if [ "$1" = tests ] && [ -d "$Q/tests" ]; then
           gcc-4.2 -arch ppc -O1 -o "$B/$n.ppc" "$t" "/$C" ;;
       bench_gl) gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" -framework OpenGL
           gcc-4.2 -arch ppc -mcpu=7450 -O2 -o "$B/$n.ppc" "$t" -framework OpenGL ;;   # tests/gl_measure.sh
+      openal) gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" -framework OpenAL
+          gcc-4.2 -arch ppc -mcpu=7450 -O2 -o "$B/$n.ppc" "$t" -framework OpenAL ;;   # al.c against the system's OpenAL
       cf) gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" -framework CoreFoundation
           gcc-4.2 -arch ppc -mcpu=7450 -O2 -o "$B/$n.ppc" "$t" -framework CoreFoundation ;;
       *) gcc-4.2 -arch i386 -O2 -msse2 -o "$B/$n" "$t"

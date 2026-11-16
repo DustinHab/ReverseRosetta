@@ -977,3 +977,74 @@ Radeon 9200.
   floats through memory as native code does, and every argument goes through the Intel stack, `stfs`/`lwz`/`stwbrx`
   and back in the entry, where the native call passes it in an FPR), glGet (the driver writes the values and rosetta
   reads them right back for the byte swap: a store-to-load stall per call).
+**Ordinary programs and installed applications** (2026-11-16, night). Criticism from outside: the benchmarks are small
+kernels and say little about ordinary programs (gzip 2.8 times native on a G5, the JPEG decode 3.3 times, Calculator's
+startup 2.6 times the processor time). `tests/realworld.sh` now measures ordinary programs of the system on real input
+(processor time, the i386 and the PowerPC part of the same universal binary, first run with an empty translation
+cache and with a filled one); `tests/app_survey.sh` starts the i386 part of every universal application installed on
+the machine (`tools/apps_i386.sh`: 49 on the iBook, among them iWork '09, Xcode 3.1 and its tools, Cinebench R10,
+The Sims 2 Body Shop) and reports windows, processor time and how it ended.
+- First measurement (fraction of native speed, filled cache): gzip -9 46 %, gzip -d 50 %, bzip2 -9 50 %, bzip2 -d
+  72 %, sort 80 %, grep 67 %, md5 67 %, openssl sha1 29 %, openssl aes 32 %, perl 65 to 68 %, python 99 %. Short runs
+  lose most at startup (openssl: 0.04 s even when nothing is translated any more; the second start still translates
+  45000 instructions in 127 ms). sqlite is not comparable: the PowerPC library of this 10.5.9 is sqlite 3.7 (automatic
+  indexes), the i386 one of the 10.5.8 update 3.4 (a join 0.06 s against 17 s, the same answer). Python in /usr/bin is
+  PowerPC-only (the matrix compared it natively on both sides); the i386 build of the Intel root runs at 99 %.
+- gzip spent 17 % of its time in the interpreter: incw on memory (the frequency counters of the Huffman tables), shrb
+  on memory (the flag byte) and movw to a fixed address (the bit buffer, 342000 times) were not translated; the load
+  of `movw moffs, %ax` read one byte only when it was enabled. Now translated: incw/decw on memory, shl/shr/sar of a
+  byte in memory, of a word in memory by a fixed count, movw $imm16 into a register, movw with a fixed address.
+  `mem_access` reports the real sizes (stack slots that a 16-bit write touches must not stay in registers).
+  gzip -9 1.43 -> 1.12 s (native 0.65). `tests/mem16.c`: translated, interpreted and on an x86 PC alike.
+- bzip2: 7 % in C helpers for conditions whose flags come from another block (cmpb at the end of one block, seta at
+  the jump target in mainGtU). The inline path handled 32-bit compares only; the operands are now shifted to the top
+  of the word, one compare holds for 8, 16 and 32 bits. 5.78 -> 5.57 s. `tests/cond_sizes.c` (all 16 conditions, every
+  size, across a block boundary). Flags live across an indirect jump are not kept (compilers never leave them so).
+- What remains in gzip and bzip2 is ordinary integer code with many stack operands (seven registers on i386): no
+  single hot spot; superblocks of 128 instead of 48 instructions bring bzip2 8 % and gzip nothing (not changed: the
+  startup cost is unknown). openssl's SHA1 is unrolled C with read-modify-write on stack slots in straight-line code;
+  keeping slots in registers works in loops only.
+- Survey, first round: 24 of 43 applications open their windows (Interface Builder, Shark, Quartz Debug, FileMerge,
+  IORegistryExplorer, PackageMaker, The Unarchiver, HALLab, Core Image Fun House, OpenGL Profiler and Shader Builder
+  ...). The failures, by cause:
+  - Objective-C 2.0 garbage collection (Xcode, Icon Composer, Property List Editor): libauto suspends the other
+    threads and reads their registers with thread_get_state; the kernel knows only the PowerPC state of the host
+    thread (flavor 1 is PPC_THREAD_STATE, 40 words), the call failed, libauto stopped with ud2. mach_msg.c answers
+    thread_get_state (flavors 1 and 7) for guest threads from their Cpu (thread.c maps the host thread port to it).
+  - JavaScriptCore (Quartz Composer and its Visualizer): its collector scans the stack from the stack pointer up to
+    pthread_get_stackaddr_np, which libSystem takes from sysctl KERN_USRSTACK: that was rosetta's own stack, the scan
+    ran into unmapped memory. The sysctl now reports the guest's stack.
+  - Missing symbols in stub libraries (Keynote, Pages, Numbers: `_QTMovieCurrentTimeAttribute`; Cinebench:
+    `_QTGetPixMapPtrRowBytes`; Dashcode, BigTop, Saturn: GraphKit) and missing frameworks (CoreAudioKit, JavaVM):
+    stub libraries had only the symbols of programs installed before. `tools/sdk_stubs_all.sh` builds stubs with every
+    symbol of the SDK for each public library that is missing as i386 (26) and completes the existing ones (19);
+    `tools/app_stubs.sh` adds what installed programs import from private frameworks.
+  - access_extended (system call 284, NSFileManager) was missing.
+  - SheepShaver's __PAGEZERO is readable and writable (the low memory of the classic Mac OS at address 0); macho.c
+    refused page 0. A __PAGEZERO with access is now mapped.- OpenAL (games' sound): the 10.5.8 update has no i386 OpenAL; with the SDK stub a program loaded, but every call
+  returned an error. `al.c` bridges the 100 functions of OpenAL 1.1 and Apple's extensions to the system's PowerPC
+  OpenAL (dlopen at the first call), the way gl.c does it for OpenGL: thunk.c replaces the exports of the guest's
+  OpenAL image by name. Handles (devices, contexts) and strings are host pointers in the shared address space; names
+  of sources and buffers, attribute lists, values of getters and captured samples are converted; sample data of
+  alBufferData in 16-bit and 32-bit float formats is swapped into a copy (alBufferDataStatic keeps its copy until the
+  buffer is deleted or filled again); float and double results go to st(0). alGetProcAddress answers with the guest
+  address of the replaced export (thunk_guest_addr). `tests/openal.c`: devices, listener, sources, buffers, queueing
+  and playing (silently, listener gain 0) give the same output as the native build.
+- Paths with spaces: frameworks inside application bundles can have absolute install names with spaces
+  (/Developer/Applications/Quartz Composer.app/...); deps.sh split them and intel_stubs.sh built a stub library named
+  /Developer/Applications/Quartz.- Second survey round (complete stubs, GC and stack fixes): 31 of 44 with windows (AU Lab, Dashcode, Instruments, Quartz
+  Composer and its Visualizer, Icon Composer, Property List Editor, Bluetooth Explorer new), 5 running without a
+  window, 8 failing. Keynote, Pages, Numbers and BigTop then crashed in `_class_initialize`: the stub libraries
+  defined Objective-C classes as absolute symbols of value 0, a program's subclass (of QTMovieView, of a GraphKit
+  view) stayed unconnected in the old runtime and its +initialize went to a class without metaclass. The SDK's stubs
+  mark classes as S symbols, which sdk_stub.sh did not recognize at all. Stub libraries now define real, empty
+  classes (`tools/stub_classes.sh`) with the superclass the PowerPC library of the same path gives them
+  (`tools/objc_classes.c` asks the PowerPC Objective-C runtime): superclasses from the same library, Foundation,
+  AppKit or QuartzCore as they are, any other NSObject (also when no public declaration exists: NSNibConnector).
+  QTKit's 69 classes keep their hierarchy (QTMovieView : NSView).
+- Cinebench jumped into data: the stub defined `QTGetPixMapPtrRowBytes` as a CFString, because intel_stubs.sh takes
+  the kind of a symbol from how a program imports it (a function bound through a non-lazy pointer looks like data)
+  and merging let data win. The kind now comes from the SDK's stub, or from the PowerPC library of the system;
+  `tools/stubs_rebuild_all.sh` rebuilds every stub library that way (app_stubs.sh and install_app.sh call it).
+  EnterMovies and ExitMovies succeed in the stub: programs that need QuickTime only for an intro film go on.
+- System V shared memory (shmget, shmat, shmdt, shmctl with shmid_ds converted): SheepShaver, X11's MIT-SHM.

@@ -19,15 +19,20 @@ visit() {
     echo "$p" >> /tmp/dep_seen.txt
     f=$(resolve "$p")
     if [ -z "$f" ]; then echo "$p" >> /tmp/dep_missing.txt; return; fi
-    # (install names never contain spaces, client paths can: "Activity Monitor.app"; the edges are tab-separated)
-    otool -arch i386 -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -vxF "$p" | grep -v "^@" > /tmp/dep_d.$$
-    while read d; do printf '%s\t%s\n' "$p" "$d" >> /tmp/dep_edges.txt; done < /tmp/dep_d.$$
-    for d in $(cat /tmp/dep_d.$$); do visit "$d"; done
+    # client paths and install names can contain spaces ("Activity Monitor.app", frameworks with absolute install names
+    # inside /Developer/Applications/Quartz Composer.app): one name per line, the edges are tab-separated
+    otool -arch i386 -L "$f" 2>/dev/null | tail -n +2 | sed 's/^[[:space:]]*//; s/ (compatibility version.*//' |
+        grep -vxF "$p" | grep -v "^@" > /tmp/dep_d.$$
+    while IFS= read -r d; do printf '%s\t%s\n' "$p" "$d" >> /tmp/dep_edges.txt; done < /tmp/dep_d.$$
+    o=$IFS; IFS='
+'
+    for d in $(cat /tmp/dep_d.$$); do IFS=$o; visit "$d"; done      # (the list is taken before visit overwrites the file)
+    IFS=$o
 }
 for p in "$@"; do visit "$p"; done
 rm -f /tmp/dep_d.$$
 echo "$(wc -l < /tmp/dep_seen.txt | tr -d ' ') images, $(wc -l < /tmp/dep_missing.txt | tr -d ' ') missing:"
-while read m; do
+while IFS= read -r m; do
     n=$(basename "$m" | sed 's/\.dylib$//; s/\..*//')
     echo "== $m"
     grep "	$m\$" /tmp/dep_edges.txt | cut -f1 | while IFS= read -r v; do

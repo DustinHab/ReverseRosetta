@@ -11,7 +11,7 @@ W=${ROSETTA_INTEL:-$R/intel/root}
 S=/Developer/SDKs/MacOSX10.5.sdk
 sh "$D/deps.sh" "$@" > /dev/null
 [ -s /tmp/dep_missing.txt ] || { echo "nothing missing"; exit 0; }
-while read m; do
+while IFS= read -r m; do
     case "$m" in                            # reached through a symbolic link that deps.sh does not follow: never a stub
         /System/Library/Perl/*) echo "$m: skipped (exists under its real path)"; continue ;;
     esac
@@ -49,19 +49,29 @@ while read m; do
         echo '__attribute__((used)) static const char marker[] = "rosetta-stub";   /* kept even without functions */'
         while read kind sym; do
             c=${sym#_}
-            case "$sym" in              # class symbol of the old objc runtime: absolute, value 0 (as in the owning library)
-                .objc_class_name_*) printf '%s\n' "asm(\".globl $sym\\n$sym = 0\");"; continue ;;
+            case "$sym" in              # class symbol of the old objc runtime: a class of its own (stub_classes.sh)
+                .objc_class_name_*) continue ;;
             esac
             if [ "$kind" = nonlazy ]; then echo "const CFStringRef $c = CFSTR(\"$c\");"
             else
-                case "$c" in *Get*|*Is*|*Has*|*Release*|*Visible*|*Busy*|*Notification*) r=0 ;; *) r=$E ;; esac
+                case "$c" in *Get*|*Is*|*Has*|*Release*|*Visible*|*Busy*|*Notification*|EnterMovies|ExitMovies) r=0 ;; *) r=$E ;; esac
                 echo "long $c(void) { static int m; if (!m++) report_missing(\"$c\"); return $r; }"
             fi
         done < /tmp/pl_sym.txt
     } > "/tmp/pl_$n.c"
+    sh "$D/stub_classes.sh" "$m" /tmp/pl_sym.txt > /tmp/pl_classes.m
+    cls=; fw="-framework CoreFoundation"            # classes in a file of their own (no clash with Cocoa's declarations)
+    [ -s /tmp/pl_classes.m ] && { cls=/tmp/pl_classes.m; fw="-framework Cocoa -framework QuartzCore"; }
     mkdir -p "$(dirname "$W$m")"
-    gcc-4.2 -arch i386 -O1 -dynamiclib -isysroot $S -install_name "$m" -compatibility_version "$cv" -current_version "$cur" \
-        -o "$W$m" "/tmp/pl_$n.c" -framework CoreFoundation || exit 1
+    ok=0
+    for try in 1 2 3 4 5 6; do              # (superclasses without a public declaration: NSObject, as sdk_stub.sh)
+        gcc-4.2 -arch i386 -O1 -dynamiclib -isysroot $S -install_name "$m" -compatibility_version "$cv" -current_version "$cur" \
+            -o "$W$m" "/tmp/pl_$n.c" $cls $fw 2> /tmp/pl_err.txt && { ok=1; break; }
+        x=$(sed -n "s/.*cannot find interface declaration for '\([A-Za-z0-9_]*\)'.*/\1/p" /tmp/pl_err.txt | head -1)
+        [ -n "$x" ] && [ -n "$cls" ] || break
+        sed -i '' "s/ : $x @end/ : NSObject @end/" $cls
+    done
+    [ $ok = 1 ] || { cat /tmp/pl_err.txt; exit 1; }
     case "$m" in                            # framework: Versions/Current and the top-level link
         */Versions/A/*) fw=${m%/Versions/A/*}; ( cd "$W$fw" && ln -sfh A Versions/Current && ln -sfh "Versions/Current/$n" "$n" ) ;;
     esac

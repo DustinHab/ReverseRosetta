@@ -11,6 +11,7 @@
  */
 #include "thunk.h"
 #include "gl.h"
+#include "al.h"
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -137,8 +138,9 @@ static const struct { const char *name; Stub fn; char kind; void *native; } g_li
 
 /* frameworks besides libSystem whose exported functions are replaced by name (their i386 version is a stub library
    or does less than the PowerPC one) */
-/* OpenGL: gl.c (the Intel OpenGL cannot reach the graphics chip of a PowerPC Mac) */
-static const char *const g_native_libs[] = { "/Calculate.framework/", "/OpenGL.framework/", 0 };
+/* OpenGL: gl.c (the Intel OpenGL cannot reach the graphics chip of a PowerPC Mac); OpenAL: al.c (no i386 OpenAL in the
+   10.5.8 update: the Intel root has a stub library) */
+static const char *const g_native_libs[] = { "/Calculate.framework/", "/OpenGL.framework/", "/OpenAL.framework/", 0 };
 #define LIST (sizeof g_list / sizeof g_list[0])
 
 /* ---------- tables ---------- */
@@ -196,6 +198,12 @@ static Stub name_verify(const char *s)
         if ((fn = gl_stub(s, n)) != 0) return fn;
         n = 0;
     }
+    if (s[0] == 'a' && s[1] == 'l') {                     /* OpenAL (al.c) */
+        Stub fn;
+        while (s[n] && s[n] != '$') n++;
+        if ((fn = al_stub(s, n)) != 0) return fn;
+        n = 0;
+    }
     if (!g_first[(unsigned char)s[0]]) return 0;
     while (s[n] && s[n] != '$') if (++n > g_maxlen) return 0;
     return name_find(s, n);
@@ -206,6 +214,13 @@ static void addr_add(uint32_t a, Stub fn)
     uint32_t h = (a * 2654435761u) >> 20, i;
     for (i = 0; i < ADDRS; i++, h = (h + 1) & (ADDRS - 1))
         if (!g_addr[h].fn || g_addr[h].addr == a) { g_addr[h].addr = a; g_addr[h].fn = fn; return; }
+}
+
+uint32_t thunk_guest_addr(Stub fn)
+{
+    uint32_t i;
+    for (i = 0; i < ADDRS; i++) if (g_addr[i].fn == fn) return g_addr[i].addr;
+    return 0;
 }
 
 static Stub addr_find(uint32_t a)

@@ -3,7 +3,7 @@
  * The host is built with "-pagezero_size 0x10000000": the lower 256 MB are reserved at startup (no access), so
  * neither malloc nor libraries of the host land there. Guest segments in this range get their place by freeing
  * that piece of the reserve and mapping the file there; elsewhere only if the range is free. Page 0
- * (0..0x1000) always stays without access.
+ * (0..0x1000) stays without access, unless a __PAGEZERO segment asks for access there.
  */
 #include "macho.h"
 #include <stdio.h>
@@ -22,11 +22,12 @@
 static uint32_t le(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint32_t be(const uint8_t *p) { return (uint32_t)p[3] | (uint32_t)p[2] << 8 | (uint32_t)p[1] << 16 | (uint32_t)p[0] << 24; }
 
-/* make space [a, a+n) free for the guest: free it in the reserve, elsewhere check that it is free */
-static int slot(uint32_t a, uint32_t n)
+/* make space [a, a+n) free for the guest: free it in the reserve, elsewhere check that it is free. Page 0 only for
+   a segment that asks for access there (low): emulators of the classic Mac OS keep its low memory globals at 0 */
+static int slot(uint32_t a, uint32_t n, int low)
 {
     vm_address_t x = a;
-    if (a < 0x1000) return -1;
+    if (a < 0x1000 && !low) return -1;
     if ((uint64_t)a + n <= RESERVE_END) {
         vm_deallocate(mach_task_self(), a, n);
         return 0;
@@ -80,7 +81,8 @@ int macho_load(const char *path, uint32_t slide, Image *image)
             memcpy(name, lc + 8, 16); name[16] = 0;
             if (vmsize == 0 || (vmaddr == 0 && filesize == 0 && prot == 0)) { lc += cmdsize; continue; }  /* __PAGEZERO */
             prot = (prot & 7) | PROT_READ;
-            if (slot(a, vmsize)) {
+            /* a __PAGEZERO with access (SheepShaver: readable and writable memory at 0, its 68k low memory) is mapped */
+            if (slot(a, vmsize, a == 0 && vmaddr == 0 && prot != 0)) {
                 fprintf(stderr, "rosetta: no space for %s %s at %08x (%u bytes)\n", path, name, a, vmsize);
                 goto fail;
             }

@@ -63,5 +63,7 @@ IFS='
 '
 STUBS_REBUILD=1 sh "$T/intel_stubs.sh" $(cat /tmp/install_app_paths.txt) 2>&1 | tail -8
 unset IFS
+# what each symbol is (function or data) from the SDK or the PowerPC library, Objective-C classes with their superclass
+sh "$T/stubs_rebuild_all.sh" > /dev/null 2>&1
 echo "== launcher"
 sh "$T/finder_app.sh" "$N"
