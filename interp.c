@@ -993,12 +993,12 @@ static int run_halt(Cpu *c, const uint32_t *halt, int nh)
 static int run_loop(Cpu *c)
 {
     int r;
-    static uint32_t halt[8];
+    static uint32_t halt[32];
     static int nh = -1;
     if (nh < 0) {
         const char *h = getenv("ROSETTA_HALT");
         nh = 0;
-        while (h && *h && nh < 8) { halt[nh++] = (uint32_t)strtoul(h, (char **)&h, 16); if (*h == ',') h++; else break; }
+        while (h && *h && nh < 32) { halt[nh++] = (uint32_t)strtoul(h, (char **)&h, 16); if (*h == ',') h++; else break; }
     }
     if (nh > 0) return run_halt(c, halt, nh);
     for (;;) {

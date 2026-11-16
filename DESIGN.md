@@ -639,7 +639,8 @@ itself), events, timers and drawing work.
   byte-swapping mode, reads it raw as 0x4e20 (otherwise CSSMERR_CSSM_INCOMPATIBLE_VERSION, LaunchServices aborts).
   (3) LaunchServices waits forever without `IODeviceTree:/efi` (PowerPC: Open Firmware); the wait is skipped.
 - System calls: getfsstat (18), getattrlist (220) and getdirentriesattr (222) with byte-swapping of the packed
-  attributes by a type table (Finder info and strings raw).
+  attributes by a type table (Finder info and strings raw; directory attributes only for a directory, file and fork
+  attributes only for anything else, as the kernel packs them).
 - Hardening: predictions at translation time read guest memory with `vm_read_overwrite` (the host's shared library
   region has holes, vm_region still reports it as readable); memory calls of the guest (munmap, mprotect, fixed mmap,
   vm_deallocate/-protect) in the range 0x90000000-0xb0000000 are refused.
@@ -889,10 +890,19 @@ even when it had a handler (crash reporters, runtimes that recover from faults).
   the Radeon 9200 and the software renderer, translated CGLQueryRendererInfo fails and CGLChoosePixelFormat gives
   10015 "invalid code module": the i386 CGL reads the header of the display's GL driver bundle, which exists only for
   PowerPC, and never gets to the i386 software renderer in the Intel root) and Activity Monitor (its helper
-  pmTool must be setuid root, the copy is not). Keychain Access crashes when it quits: LaunchServices
-  `_FSNodeCopyExtension` keeps the extension's position in the node (16, as for "Keychain Access.app"), later reads
-  a name of at most 16 characters for the same node, gets an empty buffer and writes the terminator to address 0.
-  Where the shorter name comes from is open. Programs that use the keychain (iCal,
+  pmTool must be setuid root, the copy is not). Keychain Access crashed when it quits and The Sims 2 Read Me when it
+  opened its document: LaunchServices `_FSNodeCopyExtension` keeps the extension's position in the node (16, as for
+  "Keychain Access.app"), later reads a name of at most 16 characters for the same node, gets an empty buffer and
+  writes the terminator to address 0. The shorter name was rosetta's: getattrlist asked for directory and file
+  attributes of a bundle at once, the kernel packs only the directory group, and rosetta swapped the absent file
+  group as well, which byte-swapped the name behind it (for a file, the absent directory group shifted the sizes).
+  Now only the group that fits the object is swapped (the type from ATTR_CMN_OBJTYPE in the result, else from stat).
+  After that the Read Me still failed with -36: LaunchServices asks libquarantine for the quarantine label of every
+  document it opens (`__mac_syscall("mb", 0x50...)`), rosetta answered ENOSYS, and CarbonCore turned that into
+  ioErr. The quarantine calls 0x50-0x59 of policy "mb" now reach the kernel: their argument is 3 or 4 64-bit fields,
+  in the get calls one or two of them the address of a 64-bit length, all converted (the sandbox calls 0x4a/0x56 stay
+  ENOSYS). Every translated program that opens a document or a URL through LaunchServices failed the same way.
+  Programs that use the keychain (iCal,
   Mail) ask once per item: the keychain sees the process rosetta, not the program.
 - Images were slow: decoding a 2560x1600 JPEG with ImageIO took 16.3 s translated, 0.44 s native
   (`tools/probes/jpeg_decode.c`). 71 million SSE2 instructions went to the C implementation one by one (the IDCT:

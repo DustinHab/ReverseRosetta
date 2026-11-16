@@ -306,7 +306,7 @@ error code.
 | `ROSETTA_CACHE_MAX_MB=N` | translation caches of all programs together at most N MB (default 256; the ones used longest ago are deleted) |
 | `ROSETTA_HOST_CPU=1` | show the guest the real PowerPC processor instead of the Intel one |
 | `ROSETTA_STATS=1` | translator counters and times at exit; at the first idle moment processor time, page faults, system calls, Mach messages by id and interpreted opcodes of the startup |
-| `ROSETTA_LOG=1` | log of system calls and Mach traps (`=2`: with time and thread) |
+| `ROSETTA_LOG=1` | log of system calls and Mach traps, with paths and service names (`=2`: with time and thread, `=3`: also the words of every Mach message) |
 | `ROSETTA_ATS_LOG=1` | every message to the font server, in the server's byte order |
 | `ROSETTA_HPROFILE=FILE` | sampling profile of the translator and the guest (`ROSETTA_HPROFILE_CPU=1`: processor time) |
 | `ROSETTA_STATE=1` | `kill -USR2` prints where every guest thread is (for programs that hang) |
@@ -364,8 +364,6 @@ well.
   in translated guest code (dyld binding, the Objective-C runtime, CoreFoundation).
 - OpenGL: immediate mode with scalar arguments and glGet reach about 80 % of the native speed (the table under
   Performance). Tested with NSOpenGLView windows and CGL pbuffers; AGL and GLUT programs are untested.
-- LaunchServices crashes in _FSNodeCopyExtension when Keychain Access quits and when The Sims 2 Read Me opens its
-  document (the same in the interpreter: not a translation error; the cause is open).
 - The keychain sees the process `rosetta`, not the program: a program that reads a password asks once per item, and
   "Always Allow" lets every translated program read it. After rosetta is rebuilt, the keychain asks again.
 - Programs that need a setuid helper in their bundle (Activity Monitor's pmTool) do not work: the copy in

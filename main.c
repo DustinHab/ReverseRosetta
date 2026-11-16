@@ -415,7 +415,7 @@ int main(int argc, char **argv)
     if (i >= argc) { fprintf(stderr, "usage: rosetta [-s] [-0 name] program [arguments ...]\n"); return 2; }
     path = argv[i];
     if (name) argv[i] = (char *)name;        /* argv[0] of the guest; the file is still loaded from path */
-    g_log = getenv("ROSETTA_LOG") ? (atoi(getenv("ROSETTA_LOG")) > 1 ? 2 : 1) : 0;     /* 2: with time and thread */
+    g_log = getenv("ROSETTA_LOG") ? (atoi(getenv("ROSETTA_LOG")) > 1 ? atoi(getenv("ROSETTA_LOG")) : 1) : 0;   /* 2: with time and thread, 3: also the words of Mach messages */
     sys_init();
     {
         struct sigaction sa;

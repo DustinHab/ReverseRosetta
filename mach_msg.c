@@ -736,10 +736,40 @@ void mach_trap(Cpu *c, int n, uint32_t base)
             c->r[EAX] = KERN_INVALID_ADDRESS;
             return;
         }
-        c->r[EAX] = (uint32_t)guest_mach_msg(c, m, (mach_msg_option_t)opt, arg(2), arg(3), arg(4), arg(5), arg(6));
+        {
+            /* for the log: destination before the reply overwrites the header, and the service names of the ports
+               bootstrap_look_up (404) returned */
+            static struct { uint32_t port; char name[64]; } svc[64];
+            static int nsvc;
+            static char asked[64];
+            uint32_t to = g_log && (opt & MACH_SEND_MSG) ? ld32(m + 8) : 0;
+            const char *tn = "";
+            int i;
+            if (g_log && id == 404 && arg(2) >= 32 + 64) snprintf(asked, sizeof asked, "%s", (const char *)(uintptr_t)(m + 32));
+            if (g_log > 2 && (opt & MACH_SEND_MSG)) {     /* ROSETTA_LOG=3: the words of the message (guest order) */
+                uint32_t k, sz = ld32(m + 4);
+                fprintf(stderr, "    send %d:", id);
+                for (k = 24; k + 4 <= sz && k < 24 + 4 * 48; k += 4) fprintf(stderr, " %08x", ld32(m + k));
+                fprintf(stderr, "\n");
+            }
+            c->r[EAX] = (uint32_t)guest_mach_msg(c, m, (mach_msg_option_t)opt, arg(2), arg(3), arg(4), arg(5), arg(6));
+            if (g_log) {
+                for (i = 0; i < nsvc; i++) if (svc[i].port == to) { tn = svc[i].name; break; }
+                if (id == 404 && c->r[EAX] == 0 && (opt & MACH_RCV_MSG) && ld32(m + 20) == 504 && (ld32(m) & 0x80000000u)) {
+                    fprintf(stderr, "[bootstrap] %s -> port %x\n", asked, ld32(m + 28));
+                    if (nsvc < 64) { svc[nsvc].port = ld32(m + 28); snprintf(svc[nsvc].name, sizeof svc[0].name, "%s", asked); nsvc++; }
+                }
+                if (g_log > 2 && (opt & MACH_RCV_MSG) && c->r[EAX] == 0) {
+                    uint32_t k, sz = ld32(m + 4);
+                    fprintf(stderr, "    recv %d:", (int32_t)ld32(m + 20));
+                    for (k = 24; k + 4 <= sz && k < 24 + 4 * 48; k += 4) fprintf(stderr, " %08x", ld32(m + k));
+                    fprintf(stderr, "\n");
+                }
+                if (g_log > 1) sys_log_stamp();
+                fprintf(stderr, "[mach_msg] id %d to %x%s%s -> %x", id, to, *tn ? " " : "", tn, c->r[EAX]);
+            }
+        }
         if (g_log) {
-            if (g_log > 1) sys_log_stamp();
-            fprintf(stderr, "[mach_msg] id %d to %x -> %x", id, (opt & MACH_SEND_MSG) ? ld32(m + 8) : 0, c->r[EAX]);
             if ((opt & MACH_RCV_MSG) && c->r[EAX] == 0)
                 fprintf(stderr, ", reply id %d size %u RetCode %d NDR %02x%02x%02x%02x", (int32_t)ld32(m + 20), ld32(m + 4),
                         ld32(m + 4) >= 36 ? (int32_t)ld32(m + 32) : 0, ld8(m + 24), ld8(m + 25), ld8(m + 28), ld8(m + 29));

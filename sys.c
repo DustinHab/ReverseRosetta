@@ -314,8 +314,13 @@ static void attrlist_read(uint32_t a, struct attrlist *l)
 }
 
 /* swap the numeric fields of the attributes in l in place, from offset o up to len. Swapping the bytes of a field
-   is the same operation in both directions: getattrlist (host -> guest) and setattrlist (guest -> host). */
-static void attr_swap_fields(uint32_t a, uint32_t o, uint32_t len, const struct attrlist *l, const char *call)
+   is the same operation in both directions: getattrlist (host -> guest) and setattrlist (guest -> host).
+   The kernel packs directory attributes only for a directory and file (and fork) attributes only for anything else;
+   after them come the referenced data (the name). Swapping both groups regardless garbled the name of a directory
+   asked for both ("Keychain Access.app", an .rtfd document: LaunchServices then took a shorter name than the one it
+   had found the extension in, and crashed in _FSNodeCopyExtension). isdir: 1/0 if known, -1: from ATTR_CMN_OBJTYPE in
+   the result (getattrlist), or both groups (setattrlist: the caller packs what it asks for). */
+static void attr_swap_fields(uint32_t a, uint32_t o, uint32_t len, const struct attrlist *l, const char *call, int isdir)
 {
     const AttrType *tab[5] = { g_attr_cmn, g_attr_vol, g_attr_dir, g_attr_file, g_attr_branch };
     uint32_t masks[5], rest;
@@ -325,11 +330,15 @@ static void attr_swap_fields(uint32_t a, uint32_t o, uint32_t len, const struct 
     masks[0] = l->commonattr; masks[1] = l->volattr; masks[2] = l->dirattr; masks[3] = l->fileattr; masks[4] = l->forkattr;
     for (g = 0; g < 5; g++) {
         rest = masks[g];
+        if (g == 2 && isdir == 0) continue;                 /* directory attributes of a file: not packed */
+        if (g >= 3 && isdir == 1) continue;                 /* file and fork attributes of a directory: not packed */
         for (k = 0; tab[g][k].bit && rest; k++) {
             const AttrType *t = &tab[g][k];
             uint32_t i;
             if (!(rest & t->bit)) continue;
             rest &= ~t->bit;
+            if (g == 0 && t->bit == ATTR_CMN_OBJTYPE && isdir < 0 && call[0] == 'g' && o + 4 <= len)
+                isdir = *(uint32_t *)(p + o) == 2;         /* VDIR (host order: not swapped yet) */
             switch (t->kind) {
             case 'w': for (i = 0; i < t->n && o + 4 <= len; i++, o += 4) st32(a + o, *(uint32_t *)(p + o)); break;
             case 'q': for (i = 0; i < t->n && o + 8 <= len; i++, o += 8) st64(a + o, *(uint64_t *)(p + o)); break;
@@ -347,14 +356,14 @@ static void attr_swap_fields(uint32_t a, uint32_t o, uint32_t len, const struct 
 
 /* swap the result of one entry (length in front, at guest address a, at most size bytes, already copied raw);
    returns the length of the entry */
-static uint32_t attr_swap(uint32_t a, uint32_t size, const struct attrlist *l)
+static uint32_t attr_swap(uint32_t a, uint32_t size, const struct attrlist *l, int isdir)
 {
     uint32_t len;
     if (size < 4) return 0;
     len = *(uint32_t *)(uintptr_t)a;     /* host byte order */
     st32(a, len);
     if (len > size) len = size;
-    attr_swap_fields(a, 4, len, l, "getattrlist");
+    attr_swap_fields(a, 4, len, l, "getattrlist", isdir);
     return len;
 }
 
@@ -1659,6 +1668,12 @@ static void sys_bsd_call(Cpu *c, int sysenter)
     if (g_log) {
         if (g_log > 1) sys_log_stamp();
         fprintf(stderr, "[bsd %u %s] %08x %08x %08x %08x\n", n, sys_name(n), arg(0), arg(1), arg(2), arg(3));
+        switch (n) {                        /* calls with a path as the first argument: the path */
+        case 5: case 10: case 12: case 15: case 33: case 58: case 59: case 128: case 136: case 137: case 188: case 190:
+        case 266: case 338: case 340: case 381:
+            if (arg(0) >= 0x1000) fprintf(stderr, "    \"%.300s\"\n", (const char *)(uintptr_t)arg(0));
+            break;
+        }
     }
     switch (n) {
     case SYS_exit:
@@ -1833,9 +1848,22 @@ static void sys_bsd_call(Cpu *c, int sysenter)
         attrlist_read(arg(1), &l);
         r = getattrlist(gpath(arg(0)), &l, b, size, (unsigned)arg(4));
         if (r < 0) { free(b); set_result(c, 0, errno); return; }
+        if (g_log && (l.commonattr & ATTR_CMN_NAME) && size >= 12) {   /* the name comes first after the length */
+            int32_t o = *(int32_t *)((uint8_t *)b + 4);
+            uint32_t n = *(uint32_t *)((uint8_t *)b + 8);
+            fprintf(stderr, "[getattrlist] %s: attributes %08x/%08x/%08x/%08x, name \"%.*s\"\n", gpath(arg(0)), l.commonattr,
+                    l.volattr, l.dirattr, l.fileattr, (o > 0 && 4 + (uint32_t)o + n <= size) ? (int)n : 0, (char *)b + 4 + o);
+        }
         memcpy(PTR_ARG(2), b, size);
         free(b);
-        attr_swap(arg(2), size, &l);
+        {                                   /* kind of the object when the result does not tell (no ATTR_CMN_OBJTYPE) */
+            int isdir = -1;
+            struct stat st;
+            if (!(l.commonattr & ATTR_CMN_OBJTYPE) && (l.dirattr || l.fileattr || l.forkattr) &&
+                ((arg(4) & FSOPT_NOFOLLOW) ? lstat(gpath(arg(0)), &st) : stat(gpath(arg(0)), &st)) == 0)
+                isdir = S_ISDIR(st.st_mode) != 0;
+            attr_swap(arg(2), size, &l, isdir);
+        }
         set_result(c, 0, 0);
         return;
     }
@@ -1851,7 +1879,7 @@ static void sys_bsd_call(Cpu *c, int sysenter)
         memcpy(PTR_ARG(2), b, size);
         for (i = 0; i < count && o + 4 <= size; i++) {    /* entries one after another, each with the length in front */
             uint32_t lg = *(uint32_t *)(b + o);
-            attr_swap(arg(2) + o, size - o, &l);
+            attr_swap(arg(2) + o, size - o, &l, -1);
             if (!lg) break;
             o += (lg + 3) & ~3u;
         }
@@ -2517,7 +2545,35 @@ static void sys_bsd_call(Cpu *c, int sysenter)
         else set_result(c, (uint32_t)r, 0);
         return;
     }
-    case 381 ... 395: case 424 ... 426:     /* MAC framework (sandbox, quarantine, labels): not offered to the guest */
+    case 381: {                             /* __mac_syscall(policy, call, argument) */
+        /* the quarantine calls of policy "mb" (libquarantine: qtn_file_init_with_path ...). Their argument is 3 or 4 64-bit fields
+           (user addresses, a descriptor, lengths); the "get" calls pass in some of them the address of a 64-bit
+           length that the kernel reads and writes. Without it LaunchServices failed every document and URL it opened
+           for a translated program with -36 (ENOSYS from libquarantine became ioErr). The sandbox calls of "mb" (0x4a, 0x56)
+           are not offered to the guest. */
+        const char *pol = (const char *)PTR_ARG(0);
+        uint32_t call = arg(1), a = arg(2);
+        if (a && arg(0) && !strcmp(pol, "mb") && call >= 0x50 && call <= 0x59 && call != 0x55 && call != 0x56) {
+            uint64_t f[4], len[4];
+            int n = (call == 0x54 || call == 0x57) ? 4 : 3, k, r;
+            int lens = (call == 0x50 || call == 0x52 || call == 0x58) ? 0x2 : call == 0x54 ? 0x5 : 0;   /* fields */
+            for (k = 0; k < n; k++) {
+                f[k] = ld64(a + 8 * (uint32_t)k);
+                if (lens >> k & 1) {
+                    len[k] = ld64((uint32_t)f[k]);
+                    f[k] = (uint64_t)(uintptr_t)&len[k];
+                }
+            }
+            r = syscall(381, pol, (int)call, f);
+            for (k = 0; k < n; k++)
+                if (lens >> k & 1) st64(ld32(a + 8 * (uint32_t)k), len[k]);
+            set_result(c, (uint32_t)r, r < 0 ? errno : 0);
+            return;
+        }
+        set_result(c, 0, ENOSYS);
+        return;
+    }
+    case 382 ... 395: case 424 ... 426:     /* MAC framework (labels): not offered to the guest */
         set_result(c, 0, ENOSYS);
         return;
     case 165:                               /* quotactl: as on a volume without quotas */
@@ -2556,7 +2612,7 @@ static void sys_bsd_call(Cpu *c, int sysenter)
         if (!b) { set_result(c, 0, ENOMEM); return; }
         attrlist_read(arg(1), &l);
         memcpy(b, PTR_ARG(2), size);
-        attr_swap_fields((uint32_t)(uintptr_t)b, 0, size, &l, "setattrlist");
+        attr_swap_fields((uint32_t)(uintptr_t)b, 0, size, &l, "setattrlist", -1);
         r = setattrlist((const char *)PTR_ARG(0), &l, b, size, (unsigned)arg(4));
         e = errno;
         free(b);

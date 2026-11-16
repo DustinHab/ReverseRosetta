@@ -2,7 +2,8 @@
  * fork, vfork, execve (native, translated, script), system, popen, posix_spawn with file actions, waitid,
  * kqueue/kevent, fcntl locks against a child, POSIX semaphores, fifo, truncate, futimes, chflags, setattrlist,
  * blocked signals with and without handler (sigpending, sigwait), terminal settings on a pty, FIONBIO, sysctl
- * structures (kinfo_proc, own arguments, loadavg, swap usage, clock rate, vfsconf, nfsstats), getifaddrs, utmpx.
+ * structures (kinfo_proc, own arguments, loadavg, swap usage, clock rate, vfsconf, nfsstats), getifaddrs, utmpx,
+ * SysV shared memory, getattrlist with directory and file attributes at once, quarantine labels.
  * Prints no pids, times or paths. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/attr.h>
+#include <sys/xattr.h>
 #include <sys/resource.h>
 #include <sys/ptrace.h>
 #include <sys/sysctl.h>
@@ -683,6 +685,71 @@ static void t_stack(void)
            d > 0 && (size_t)d < size ? "yes" : "no");
 }
 
+/* getattrlist asking for directory and file attributes at once: the kernel packs only the group that fits the object,
+   the name comes after it (LaunchServices asks so for bundles; a swapped name made it crash) */
+static void attrs_show(const char *what, const char *path, int objtype)
+{
+    struct attrlist al;
+    uint32_t buf[64], *p;
+    attrreference_t *nr;
+    memset(&al, 0, sizeof al);
+    memset(buf, 0, sizeof buf);
+    al.bitmapcount = ATTR_BIT_MAP_COUNT;
+    al.commonattr = ATTR_CMN_NAME | (objtype ? ATTR_CMN_OBJTYPE : 0);
+    al.dirattr = ATTR_DIR_ENTRYCOUNT;
+    al.fileattr = ATTR_FILE_TOTALSIZE | ATTR_FILE_DATALENGTH;
+    if (getattrlist(path, &al, buf, sizeof buf, 0) != 0) { printf("getattrlist %s: error %d\n", what, errno); return; }
+    nr = (attrreference_t *)(buf + 1);
+    p = buf + 3;
+    {                                       /* the name is that of the path (it contains the pid: not printed) */
+        const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+        int same = nr->attr_length == strlen(base) + 1 && !memcmp((char *)nr + nr->attr_dataoffset, base, strlen(base));
+        printf("getattrlist %s: name %s", what, same ? "right" : "wrong");
+    }
+    if (objtype) printf(", type %u", *p++);
+    if (strstr(what, "directory")) printf(", entries %u\n", *p);
+    else printf(", size %lld, data %lld\n", *(long long *)p, *(long long *)(p + 2));
+}
+
+static void t_dir_attrs(void)
+{
+    char file[200];
+    int fd;
+    name("dir");
+    mkdir(tmp, 0700);
+    snprintf(file, sizeof file, "%s/file.rtf", tmp);
+    fd = open(file, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    write(fd, "{\\rtf1}", 7);
+    close(fd);
+    attrs_show("directory with type", tmp, 1);
+    attrs_show("directory without type", tmp, 0);
+    attrs_show("file with type", file, 1);
+    attrs_show("file without type", file, 0);
+    unlink(file);
+    rmdir(tmp);
+}
+
+/* libquarantine (__mac_syscall of policy "mb"): LaunchServices asks for the quarantine of every document it opens */
+extern void *_qtn_file_alloc(void);
+extern void _qtn_file_free(void *);
+extern int _qtn_file_init_with_path(void *, const char *);
+extern const char *_qtn_file_get_identifier(void *);
+static void t_quarantine(void)
+{
+    static const char label[] = "0000;4b000000;Safari;|com.apple.Safari";
+    void *q = _qtn_file_alloc();
+    int fd, r;
+    name("qtn");
+    fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    close(fd);
+    printf("quarantine of a new file: %d\n", _qtn_file_init_with_path(q, tmp));
+    setxattr(tmp, "com.apple.quarantine", label, sizeof label - 1, 0, 0);
+    r = _qtn_file_init_with_path(q, tmp);
+    printf("quarantine after setxattr: %d, agent %s\n", r, r == 0 ? _qtn_file_get_identifier(q) : "-");
+    _qtn_file_free(q);
+    unlink(tmp);
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, 0, _IONBF, 0);
@@ -703,5 +770,7 @@ int main(int argc, char **argv)
     t_process();
     t_stack();
     t_sysv_shm();
+    t_dir_attrs();
+    t_quarantine();
     return 0;
 }
