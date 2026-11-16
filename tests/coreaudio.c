@@ -43,6 +43,19 @@ int main(void)
     UInt32 sz = sizeof f;
     OSStatus e;
     if (!comp) { printf("no default output\n"); return 1; }
+    {   /* the default output device and its name and UID (CFStrings) */
+        AudioDeviceID dev = 0;
+        AudioObjectPropertyAddress pa = { kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, 0 };
+        UInt32 n = sizeof dev;
+        CFStringRef s = 0;
+        char name[256] = "", uid[256] = "";
+        printf("default output %d", (int)AudioObjectGetPropertyData(kAudioObjectSystemObject, &pa, 0, 0, &n, &dev));
+        pa.mSelector = kAudioObjectPropertyName; n = sizeof s;
+        if (!AudioObjectGetPropertyData(dev, &pa, 0, 0, &n, &s) && s) { CFStringGetCString(s, name, sizeof name, kCFStringEncodingUTF8); CFRelease(s); }
+        pa.mSelector = kAudioDevicePropertyDeviceUID; n = sizeof s; s = 0;
+        if (!AudioObjectGetPropertyData(dev, &pa, 0, 0, &n, &s) && s) { CFStringGetCString(s, uid, sizeof uid, kCFStringEncodingUTF8); CFRelease(s); }
+        printf(": \"%s\", UID \"%s\"\n", name, uid);
+    }
     e = OpenAComponent(comp, &au);
     printf("open %d\n", (int)e);
     e = AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, &sz);

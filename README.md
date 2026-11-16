@@ -391,8 +391,8 @@ well.
 - Real-time threads of translated programs run as ordinary time sharing (`ROSETTA_REALTIME=1` passes the request on):
   translated code is slower than the computation such a thread promises, and an overrunning real-time thread froze the
   whole iBook as soon as QuickTime decoded a movie.
-- CoreAudio properties that carry CF objects or pointers (device names and UIDs as CFString, value translations) are
-  not bridged and report kAudioHardwareUnknownPropertyError; the C-string names are.
+- CoreAudio properties that carry pointers (value translations such as device by UID) are not bridged and report
+  kAudioHardwareUnknownPropertyError; names and UIDs (CFString) are.
 - expect and tclsh need Tcl.framework, which has no i386 version on a PowerPC system (the Intel root has a stub).
 - The Sims 2 Body Shop asks for its licence agreement on the first start and loads the text through
   MLTEFile.bundle, which exists only for PowerPC; the dialog fails and the program quits.

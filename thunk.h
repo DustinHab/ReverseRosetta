@@ -18,6 +18,8 @@ void thunk_forget(void);
 
 /* guest address of an export that was replaced by fn (the first one found), 0 if none: alGetProcAddress */
 uint32_t thunk_guest_addr(Stub fn);
+/* address of an exported symbol (with underscore) of the loaded guest image whose install name contains part, or 0 */
+uint32_t thunk_guest_symbol(const char *part, const char *sym);
 
 /* name of the stub (for the statistics) */
 const char *thunk_name(Stub fn);

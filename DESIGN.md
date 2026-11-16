@@ -567,7 +567,9 @@ page). Running measurement series: `tests/measure_all.sh`.
   (AudioObjectGet/SetPropertyData, listeners), the old device/stream/hardware API on top of it, IOProcs
   (AddIOProc/CreateIOProcID, Start/Stop, StartAtTime) and the time functions. Property data by type: words, Float64
   values and ranges, stream descriptions (the big-endian flag of linear PCM dropped towards the guest and set towards the
-  host), C strings; CF objects and pointer translations refused; the run loop property ignored. The rest of CoreAudio,
+  host), C strings; CFString names and UIDs made in the guest (the host's string as UTF-8, the guest's
+  CFStringCreateWithCString through gcall.c, found by `thunk_guest_symbol`); pointer translations refused; the run loop
+  property ignored. The rest of CoreAudio,
   AudioToolbox and the AUHAL component stay i386 code above it.
 - `gcall.c`: guest functions called from host threads. A guest thread (created through the guest's pthread start
   routine, so with a pthread and TLS) loops in a few bytes of guest code around `int $0x90`: wait for a request (lock

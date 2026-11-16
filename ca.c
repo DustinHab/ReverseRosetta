@@ -8,15 +8,16 @@
  *
  * Property data is converted by its type (four-character selector): 32-bit words (default), Float64 values and ranges,
  * stream descriptions (Float64 sample rate, then words; the big-endian flag of linear PCM is dropped towards the guest
- * and set towards the host, the samples are swapped instead), C strings as they are. Properties that carry CF objects
- * or pointers (CFString names and UIDs, value translations) are refused with kAudioHardwareUnknownPropertyError; the
- * run loop property is accepted and ignored. IOProcs: the host HAL calls ca_ioproc on its I/O thread, which copies time
+ * and set towards the host, the samples are swapped instead), C strings as they are. CFString names and UIDs are made
+ * in the guest from the host's string (gcall.c); properties that carry pointers (value translations) are refused with
+ * kAudioHardwareUnknownPropertyError; the run loop property is accepted and ignored. IOProcs: the host HAL calls ca_ioproc on its I/O thread, which copies time
  * stamps and buffers into guest memory (swapping the samples), runs the program's IOProc through gcall.c and swaps
  * its output back. Listeners go the same way. The thread lock is given away around every call into the host HAL: its
  * I/O thread may wait for the guest (AudioDeviceStop waits for a running IOProc).
  * ROSETTA_CA_LOG=1 shows every call. */
 #include "ca.h"
 #include "gcall.h"
+#include "thunk.h"
 #include "thread.h"
 #include "cpu.h"
 #include <dlfcn.h>
@@ -76,7 +77,8 @@ F(AudioDeviceGetNearestStartTime); F(AudioDeviceStartAtTime);
 #define FOUR(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
 
 /* kind of a property's data: 'w' 32-bit words, 'd' Float64 values, 'A' stream descriptions (40 bytes), 'R' ranged
-   descriptions (56), 's' bytes, 'u' IOProc stream usage, 'n' run loop (ignored), 'x' not convertible */
+   descriptions (56), 's' bytes, 'u' IOProc stream usage, 'c' a CFString (made in the guest), 'n' run loop (ignored),
+   'x' not convertible */
 static int prop_kind(uint32_t sel)
 {
     switch (sel) {
@@ -96,6 +98,7 @@ static int prop_kind(uint32_t sel)
         return 'n';
     case FOUR('l','n','a','m'): case FOUR('l','m','a','k'): case FOUR('u','i','d',' '): case FOUR('m','u','i','d'):
     case FOUR('l','c','h','n'): case FOUR('l','c','a','t'): case FOUR('l','n','u','m'): case FOUR('c','a','p','p'):
+        return 'c';
     case FOUR('d','u','i','d'): case FOUR('u','i','d','d'): case FOUR('l','s','c','n'): case FOUR('s','s','c','n'):
     case FOUR('c','s','c','n'): case FOUR('l','c','s','n'): case FOUR('p','i','b','i'): case FOUR('b','o','x','d'):
     case FOUR('i','c','o','n'): case FOUR('t','r','a','n'):
@@ -126,7 +129,7 @@ static void prop_convert(uint32_t sel, uint8_t *p, uint32_t n, int to_guest)
 {
     uint32_t k, *w = (uint32_t *)(void *)p;
     switch (prop_kind(sel)) {
-    case 's': case 'n': case 'x':
+    case 's': case 'n': case 'x': case 'c':
         return;
     case 'd':
         for (k = 0; k + 8 <= n; k += 8) *(uint64_t *)(void *)(p + k) = swap64(*(uint64_t *)(void *)(p + k));
@@ -403,14 +406,47 @@ static OSStatus_ listen_remove(int kind, uint32_t obj, const Addr *a, uint32_t p
 
 static void addr_in(Addr *a, uint32_t g) { a->sel = ld32(g); a->scope = ld32(g + 4); a->element = ld32(g + 8); }
 
+/* a CFString property: the host's string as UTF-8, a guest CFString made of it by the guest's CoreFoundation (through
+   gcall.c; the caller gives the thread lock away meanwhile) */
+static void *g_cf;
+static OSStatus_ get_cfstring(Cpu *c, uint32_t obj, const Addr *a, uint32_t gsize, uint32_t gdata)
+{
+    static unsigned char (*get_cstr)(void *, char *, int32_t, uint32_t);
+    static void (*cf_release)(void *);
+    void *h = 0;
+    uint32_t n = sizeof h, fn, r = 0, args[3];
+    char s[1024];
+    OSStatus_ e;
+    if (ld32(gsize) < 4) return ERR_BAD_PROPERTY_SIZE;
+    if (!get_cstr) {
+        if (!g_cf) g_cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_LAZY | RTLD_LOCAL);
+        if (g_cf) { get_cstr = (unsigned char (*)(void *, char *, int32_t, uint32_t))dlsym(g_cf, "CFStringGetCString"); cf_release = (void (*)(void *))dlsym(g_cf, "CFRelease"); }
+        if (!get_cstr || !cf_release) return ERR_UNKNOWN_PROPERTY;
+    }
+    fn = thunk_guest_symbol("/CoreFoundation.framework/", "_CFStringCreateWithCString");
+    if (!fn || gcall_start(c)) return ERR_UNKNOWN_PROPERTY;
+    e = UNLOCKED(((OSStatus_ (*)(uint32_t, const Addr *, uint32_t, const void *, uint32_t *, void *))SYM(AudioObjectGetPropertyData))(
+        obj, a, 0, 0, &n, &h));
+    if (e) return e;
+    s[0] = 0;
+    if (h) { get_cstr(h, s, sizeof s, 0x08000100); cf_release(h); }
+    args[0] = 0; args[1] = (uint32_t)(uintptr_t)s; args[2] = 0x08000100;      /* kCFStringEncodingUTF8 */
+    if (!h) r = 0;
+    else if (guest_call(c, fn, args, 3, &r, 2000)) return ERR_UNKNOWN_PROPERTY;
+    st32(gdata, r);
+    st32(gsize, 4);
+    return 0;
+}
+
 /* get: data of the guest's size (ioSize at gsize) into gdata */
-static OSStatus_ get_data(uint32_t obj, const Addr *a, uint32_t qsize, uint32_t qdata, uint32_t gsize, uint32_t gdata)
+static OSStatus_ get_data(Cpu *c, uint32_t obj, const Addr *a, uint32_t qsize, uint32_t qdata, uint32_t gsize, uint32_t gdata)
 {
     uint32_t n = ld32(gsize), k;
     uint8_t *p, *q = 0;
     OSStatus_ e;
     int kind = prop_kind(a->sel);
     if (kind == 'x' || kind == 'n') return ERR_UNKNOWN_PROPERTY;
+    if (kind == 'c') return get_cfstring(c, obj, a, gsize, gdata);
     if (!(p = buf(n + qsize))) return ERR_BAD_PROPERTY_SIZE;
     if (qsize && qdata) {                    /* qualifier: words (device ids, class ids) */
         q = p + n;
@@ -439,7 +475,7 @@ static OSStatus_ set_data(uint32_t obj, const Addr *a, uint32_t qsize, uint32_t 
     uint32_t k;
     int kind = prop_kind(a->sel);
     if (kind == 'n') return 0;               /* run loop: the host HAL keeps its own thread for notifications */
-    if (kind == 'x') return ERR_UNKNOWN_PROPERTY;
+    if (kind == 'x' || kind == 'c') return ERR_UNKNOWN_PROPERTY;
     if (!(p = buf(size + qsize + 4))) return ERR_BAD_PROPERTY_SIZE;
     memcpy(p, (const void *)(uintptr_t)gdata, size);
     if (kind == 'u') {
@@ -469,7 +505,7 @@ static int c_AudioObjectGetPropertyData(Cpu *c)
 {
     Addr a;
     addr_in(&a, A(1));
-    RET(get_data(A(0), &a, A(2), A(3), A(4), A(5)));
+    RET(get_data(c, A(0), &a, A(2), A(3), A(4), A(5)));
 }
 
 static int c_AudioObjectGetPropertyDataSize(Cpu *c)
@@ -545,7 +581,7 @@ static Addr glob_addr(uint32_t sel)
 static int c_AudioDeviceGetProperty(Cpu *c)
 {
     Addr a = dev_addr(A(1), A(2), A(3));
-    RET(get_data(A(0), &a, 0, 0, A(4), A(5)));
+    RET(get_data(c, A(0), &a, 0, 0, A(4), A(5)));
 }
 
 static int c_AudioDeviceGetPropertyInfo(Cpu *c)
@@ -572,7 +608,7 @@ static int c_AudioStreamGetProperty(Cpu *c)
 {
     Addr a = dev_addr(A(1), 0, A(2));       /* (stream, channel, id, size, data) */
     a.scope = FOUR('g','l','o','b');
-    RET(get_data(A(0), &a, 0, 0, A(3), A(4)));
+    RET(get_data(c, A(0), &a, 0, 0, A(3), A(4)));
 }
 
 static int c_AudioStreamGetPropertyInfo(Cpu *c)
@@ -601,7 +637,7 @@ static int c_AudioStreamSetProperty(Cpu *c)
 static int c_AudioHardwareGetProperty(Cpu *c)
 {
     Addr a = glob_addr(A(0));
-    RET(get_data(1, &a, 0, 0, A(1), A(2)));   /* kAudioObjectSystemObject */
+    RET(get_data(c, 1, &a, 0, 0, A(1), A(2)));   /* kAudioObjectSystemObject */
 }
 
 static int c_AudioHardwareGetPropertyInfo(Cpu *c)

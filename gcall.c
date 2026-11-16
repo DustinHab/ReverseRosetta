@@ -29,6 +29,7 @@ static int g_ready;                     /* the guest thread waits for requests *
 static int g_state;                     /* 0 free, 1 requested, 2 running, 3 done */
 static uint32_t g_fn, g_args[GC_ARGS], g_result, g_saved_esp;
 static int g_nargs;
+static Cpu *g_gc_cpu;                    /* the serving thread (it cannot call itself) */
 static unsigned long g_st_calls, g_st_late;
 
 int gcall_start(Cpu *c)
@@ -56,8 +57,10 @@ int gcall_start(Cpu *c)
 void gcall_trap(Cpu *c)
 {
     if (c->r[EAX] == GC_WAIT) {
-        Cpu *me = glock_release();
+        Cpu *me;
         uint32_t esp, k;
+        g_gc_cpu = c;
+        me = glock_release();
         pthread_mutex_lock(&g_gm);
         g_ready = 1;
         pthread_cond_broadcast(&g_gc_done);           /* (a requester may wait for the thread to be ready) */
@@ -97,7 +100,7 @@ int guest_call(Cpu *c, uint32_t fn, const uint32_t *args, int n, uint32_t *resul
     struct timespec t;
     Cpu *me = 0;
     int r = 0, k;
-    if (!g_stub || n > GC_ARGS) return -1;
+    if (!g_stub || n > GC_ARGS || (c && c == g_gc_cpu)) return -1;
     if (c) me = glock_release();
     pthread_mutex_lock(&g_serial);
     pthread_mutex_lock(&g_gm);

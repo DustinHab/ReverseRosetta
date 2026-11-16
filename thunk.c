@@ -386,6 +386,61 @@ static void store_write(const uint8_t *uuid)
     else { close(fd); unlink(tmp); }
 }
 
+/* address of the exported symbol sym (with its underscore) of the loaded guest image whose install name contains part,
+   0 if there is none: the guest's memory regions are searched for i386 Mach headers as in image_read. For bridges that
+   have to create guest objects (ca.c: CFStrings through gcall.c). The last 16 answers are remembered. */
+uint32_t thunk_guest_symbol(const char *part, const char *sym)
+{
+    static struct { const char *part, *sym; uint32_t a; } memo[16];
+    static int nmemo;
+    vm_address_t a = 0x1000;
+    vm_size_t sz;
+    vm_region_basic_info_data_t info;
+    mach_msg_type_number_t cnt;
+    mach_port_t obj;
+    int m;
+    for (m = 0; m < nmemo; m++) if (memo[m].part == part && memo[m].sym == sym) return memo[m].a;
+    for (;;) {
+        uint32_t head[3] = { 0, 0, 0 };
+        vm_size_t got = 0;
+        cnt = VM_REGION_BASIC_INFO_COUNT;
+        if (vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO, (vm_region_info_t)&info, &cnt, &obj) || a >= 0x90000000u) break;
+        if ((info.protection & VM_PROT_READ) && sz >= 4096 &&
+            vm_read_overwrite(mach_task_self(), a, 12, (vm_address_t)head, &got) == KERN_SUCCESS && got == 12 &&
+            ld32((uint32_t)(uintptr_t)&head[0]) == 0xfeedface && ld32((uint32_t)(uintptr_t)&head[1]) == 7) {
+            uint32_t h = (uint32_t)a, ncmds = ld32(h + 16), lc = h + 28, i, text_vm = 0, le_vm = 0, le_off = 0, symoff = 0;
+            uint32_t nsyms = 0, stroff = 0, iext = 0, next = 0, base, slide, found = 0;
+            const char *name = 0;
+            for (i = 0; i < ncmds && lc < h + 0x10000; i++) {
+                uint32_t cmd = ld32(lc), csz = ld32(lc + 4);
+                if (cmd == 1) {
+                    const char *seg = (const char *)(uintptr_t)(lc + 8);
+                    if (!strncmp(seg, "__TEXT", 16)) text_vm = ld32(lc + 24);
+                    else if (!strncmp(seg, "__LINKEDIT", 16)) { le_vm = ld32(lc + 24); le_off = ld32(lc + 32); }
+                } else if (cmd == 2) { symoff = ld32(lc + 8); nsyms = ld32(lc + 12); stroff = ld32(lc + 16); }
+                else if (cmd == 0xb) { iext = ld32(lc + 16); next = ld32(lc + 20); }
+                else if (cmd == 0xd) name = (const char *)(uintptr_t)(lc + ld32(lc + 8));
+                if (csz < 8) break;
+                lc += csz;
+            }
+            if (name && strstr(name, part) && symoff && le_vm) {
+                slide = h - text_vm;
+                base = le_vm + slide - le_off;
+                if (!next || iext + next > nsyms) { iext = 0; next = nsyms; }
+                for (i = iext; i < iext + next; i++) {
+                    uint32_t s = base + symoff + 12 * i;
+                    if ((ld8(s + 4) & 0x0e) != 0x0e) continue;
+                    if (!strcmp((const char *)(uintptr_t)(base + stroff + ld32(s)), sym)) { found = ld32(s + 8) + slide; break; }
+                }
+                if (nmemo < 16) { memo[nmemo].part = part; memo[nmemo].sym = sym; memo[nmemo].a = found; nmemo++; }
+                return found;
+            }
+        }
+        a += sz;
+    }
+    return 0;
+}
+
 static void image_read(uint32_t head, uint32_t region_end)
 {
     uint32_t ncmds = ld32(head + 16), lc = head + 28, i;
