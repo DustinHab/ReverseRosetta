@@ -29,6 +29,7 @@ extern kern_return_t mk_timer_destroy(mach_port_name_t name);
 extern kern_return_t mk_timer_arm(mach_port_name_t name, uint64_t deadline);
 extern kern_return_t mk_timer_cancel(mach_port_name_t name, uint64_t *deadline);
 extern mach_port_name_t mach_reply_port(void);
+extern kern_return_t clock_sleep_trap(mach_port_name_t clock, sleep_type_t type, int sec, int nsec, mach_timespec_t *wakeup);
 extern kern_return_t map_fd(int fd, vm_offset_t offset, vm_offset_t *va, boolean_t findspace, vm_size_t size);
 
 static uint32_t g_base;
@@ -770,6 +771,19 @@ void mach_trap(Cpu *c, int n, uint32_t base)
         }
         glock_acquire(fc);
         g_base = trunc;
+        c->r[EAX] = (uint32_t)k;
+        return;
+    }
+    case 62: {                              /* clock_sleep_trap(clock, type, sec, nsec, wakeup *): emulators' timers */
+        uint32_t a0 = arg(0), a1 = arg(1), a2 = arg(2), a3 = arg(3), out = arg(4), trunc = g_base;
+        mach_timespec_t w = { 0, 0 }, t;
+        Cpu *fc = glock_release();
+        kern_return_t k;
+        t.tv_sec = a2; t.tv_nsec = (clock_res_t)a3;
+        k = clock_sleep_trap(a0, (sleep_type_t)a1, t.tv_sec, t.tv_nsec, &w);
+        glock_acquire(fc);
+        g_base = trunc;
+        if (out) { st32(out, w.tv_sec); st32(out + 4, (uint32_t)w.tv_nsec); }
         c->r[EAX] = (uint32_t)k;
         return;
     }
