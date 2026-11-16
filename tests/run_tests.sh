@@ -103,6 +103,8 @@ r_m16()   { ROSETTA_INTERP=1 ./rosetta ./mem16; }
 t_al()    { ./rosetta ./openal; }
 r_al()    { ./openal.ppc; }
 QTM="/System/Library/Compositions/Sunset.mov /System/Library/PreferencePanes/Trackpad.prefPane/Contents/Resources/bl_Dragging.mov"
+t_ca()    { sh ../tests/with_timeout.sh 60 ./rosetta ./coreaudio; }
+r_ca()    { ./coreaudio.ppc; }
 t_qt()    { sh ../tests/with_timeout.sh 180 ./rosetta ./quicktime $QTM; }
 r_qt()    { ./quicktime.ppc $QTM; }
 t_csz()   { ROSETTA_THRESHOLD=1 ./rosetta ./cond_sizes; }
@@ -118,6 +120,7 @@ same "conditions of 8/16/32-bit cmp and test across blocks (against interpreter)
 same "stack slots forwarded in a block: esp/ebp aliases, read-modify-write, xchg (against interpreter)" t_sfw r_sfw
 same "OpenAL: devices, sources, buffers, playing (silent), against native" t_al r_al
 same "MMX: 69 operations on mm registers, against a real x86 processor" t_mmx r_mmx
+same "CoreAudio: AudioUnit output and AudioQueue (silence) through the system's HAL, against native" t_ca r_ca
 same "QuickTime: H.264 movies opened and decoded (QuickTime 7.6.4 i386, MMX, aio), against native" t_qt r_qt
 same "packed doubles with special values (against interpreter)" t_pdo r_pdo
 same "SSE2 integer and packed floats with AltiVec (against interpreter)" t_vec r_vec

@@ -155,7 +155,9 @@ is filled (4.7 s at the very first start), the native one 0.66 s.
   garbage collection (Xcode) and JavaScriptCore work. Frameworks that the 10.5.8 update has no i386 version of are stub
   libraries with real Objective-C classes (see Limitations); an application that needs one of them for real fails at
   that point.
-- OpenAL (games' sound) through the system's PowerPC OpenAL (`tests/openal.c` gives the same output as natively).
+- Sound: OpenAL through the system's PowerPC OpenAL (`tests/openal.c`), and CoreAudio's device layer (HAL) through the
+  system's HAL, so that AudioUnit output (SDL, games), AudioQueue and QuickTime's sound run on the real hardware
+  (`tests/coreaudio.c`: render callbacks and queue callbacks as natively).
 - QuickTime through its own i386 framework from Apple's QuickTime 7.6.4 for Leopard (see Setup): movies open, and
   H.264 frames decode to the same pixels as natively (`tests/quicktime.c`); QuickTime Player's own i386 build opens its
   window, and the QuickTime messages of Cinebench, Keynote and Numbers are gone. Its codecs use MMX, which runs in the
@@ -337,7 +339,7 @@ error code.
 ## Tests
 
 ```
-tests/run_tests.sh      # 52 comparisons against native builds, real Intel output or the interpreter
+tests/run_tests.sh      # 53 comparisons against native builds, real Intel output or the interpreter
 tests/measure_all.sh    # the benchmark loads above
 tests/gl_measure.sh     # the OpenGL workloads, translated and native side by side (login session)
 tests/realworld.sh      # ordinary programs (gzip, bzip2, perl, python ...) translated against native
@@ -387,6 +389,9 @@ well.
 - Real-time threads of translated programs run as ordinary time sharing (`ROSETTA_REALTIME=1` passes the request on):
   translated code is slower than the computation such a thread promises, and an overrunning real-time thread froze the
   whole iBook as soon as QuickTime decoded a movie.
+- CoreAudio properties that carry CF objects or pointers (device names and UIDs as CFString, value translations) are
+  not bridged and report kAudioHardwareUnknownPropertyError; the C-string names are.
+- expect and tclsh need Tcl.framework, which has no i386 version on a PowerPC system (the Intel root has a stub).
 - The Sims 2 Body Shop asks for its licence agreement on the first start and loads the text through
   MLTEFile.bundle, which exists only for PowerPC; the dialog fails and the program quits.
 - Programs that need a setuid helper in their bundle (Activity Monitor's pmTool) do not work: the copy in

@@ -549,6 +549,28 @@ page). Running measurement series: `tests/measure_all.sh`.
   drops from 10 to 1 after 300 ms: Calculator's first start 4.7 s (wall 7.1 instead of 10.2 s), the short programs as
   with 10.
 
+### CoreAudio (16 Nov)
+
+- The i386 HAL cannot reach the sound hardware: io_service_open_extended passes the client's NDR record, and the kernel
+  refuses a cross-endian client (kIOReturnUnsupported, 0xe00002c7) unless the user client declares itself compatible;
+  the audio engine's does not, and its shared buffers are big-endian anyway. Render callbacks never ran.
+- `ca.c` bridges the HAL functions of the guest's CoreAudio image by name (thunk.c, like OpenAL): the object API
+  (AudioObjectGet/SetPropertyData, listeners), the old device/stream/hardware API on top of it, IOProcs
+  (AddIOProc/CreateIOProcID, Start/Stop, StartAtTime) and the time functions. Property data by type: words, Float64
+  values and ranges, stream descriptions (the big-endian flag of linear PCM dropped towards the guest and set towards the
+  host), C strings; CF objects and pointer translations refused; the run loop property ignored. The rest of CoreAudio,
+  AudioToolbox and the AUHAL component stay i386 code above it.
+- `gcall.c`: guest functions called from host threads. A guest thread (created through the guest's pthread start
+  routine, so with a pthread and TLS) loops in a few bytes of guest code around `int $0x90`: wait for a request (lock
+  given away), call the function with the arguments on a 16-byte aligned stack, report the result. The host HAL's I/O
+  thread copies time stamps and buffers into guest memory, swaps the samples, runs the program's IOProc this way (200 ms
+  limit: a late cycle stays silent) and swaps the output back; listeners go the same way. Every call into the host HAL
+  gives the thread lock away (AudioDeviceStop waits for a running IOProc, which needs the guest).
+- `tests/coreaudio.c`: default output AudioUnit with a render callback and an AudioQueue, silence, against native.
+- Stub libraries with Objective-C classes (since 15 Nov) carry an image info without GC support, so libobjc refused them
+  in GC programs (dscacheutil and OpenDirectory, Xcode's AppleScriptKit plugins: "GC capability mismatch"). The stub
+  tools now build the classes with -fobjc-gc (supported, not required).
+
 ### QuickTime (16 Nov)
 
 - The 10.5.8 update has no i386 QuickTime; Apple's QuickTime 7.6.4 for Leopard is universal (QuickTime, QTKit, CoreVideo,

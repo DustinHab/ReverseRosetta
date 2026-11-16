@@ -62,13 +62,15 @@ for m in "$@"; do
         done < /tmp/ss_sym.txt
     } > "/tmp/ss_$n.c"
     sh "$R/tools/stub_classes.sh" "$m" /tmp/ss_sym.txt > /tmp/ss_classes.m
-    cls=; fw="-framework CoreFoundation"            # classes in a file of their own (no clash with Cocoa's declarations)
+    # classes in a file of their own (no clash with Cocoa's declarations); built for garbage collection as well (-fobjc-gc:
+    # libobjc refuses an image with classes but without GC support in a GC program: dscacheutil, Xcode's AppleScriptKit plugins)
+    cls=; fw="-framework CoreFoundation"
     [ -s /tmp/ss_classes.m ] && { cls=/tmp/ss_classes.m; fw="-framework Cocoa -framework QuartzCore"; }
     mkdir -p "$(dirname "$W$m")"
     ok=0
     for try in 1 2 3 4 5 6; do
         gcc-4.2 -arch i386 -O1 -dynamiclib -isysroot $SDK -install_name "$m" -compatibility_version "$cv" -current_version "$cur" \
-            -o "$W$m" "/tmp/ss_$n.c" $cls $fw 2> /tmp/ss_err.txt && { ok=1; break; }
+            -o "$W$m" "/tmp/ss_$n.c" $cls ${cls:+-fobjc-gc} $fw 2> /tmp/ss_err.txt && { ok=1; break; }
         # a superclass without a public declaration (NSNibConnector): the class becomes a subclass of NSObject
         x=$(sed -n "s/.*cannot find interface declaration for '\([A-Za-z0-9_]*\)'.*/\1/p" /tmp/ss_err.txt | head -1)
         [ -n "$x" ] && [ -n "$cls" ] || break

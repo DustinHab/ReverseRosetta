@@ -66,7 +66,7 @@ while IFS= read -r m; do
     ok=0
     for try in 1 2 3 4 5 6; do              # (superclasses without a public declaration: NSObject, as sdk_stub.sh)
         gcc-4.2 -arch i386 -O1 -dynamiclib -isysroot $S -install_name "$m" -compatibility_version "$cv" -current_version "$cur" \
-            -o "$W$m" "/tmp/pl_$n.c" $cls $fw 2> /tmp/pl_err.txt && { ok=1; break; }
+            -o "$W$m" "/tmp/pl_$n.c" $cls ${cls:+-fobjc-gc} $fw 2> /tmp/pl_err.txt && { ok=1; break; }   # GC: see sdk_stub.sh
         x=$(sed -n "s/.*cannot find interface declaration for '\([A-Za-z0-9_]*\)'.*/\1/p" /tmp/pl_err.txt | head -1)
         [ -n "$x" ] && [ -n "$cls" ] || break
         sed -i '' "s/ : $x @end/ : NSObject @end/" $cls

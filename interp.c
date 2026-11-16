@@ -4,6 +4,7 @@
  * computed only when an instruction reads the flags (flags_fetch).
  */
 #include "interp.h"
+#include "gcall.h"
 #include "thread.h"
 #include "decoder_core.h"
 #include "sys.h"
@@ -692,6 +693,7 @@ static inline __attribute__((always_inline)) int step_core(Cpu *c)
         case 0x80: sys_bsd(c, 0); break;
         case 0x81: sys_mach(c); break;
         case 0x82: sys_machine(c); break;
+        case 0x90: gcall_trap(c); break;    /* rosetta's own: guest calls from host threads (gcall.c) */
         default: g_guest_exec = was; state_show(c, "int with unknown number"); return RUN_UNKNOWN;
         }
         g_guest_exec = was;
