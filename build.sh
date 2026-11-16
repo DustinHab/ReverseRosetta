@@ -16,7 +16,7 @@ if [ "$1" = tests ] && [ -d "$Q/tests" ]; then
     n=$(basename "$t" .c)
     case "$n" in
       raw*) gcc-4.2 -arch i386 -O1 -static -nostdlib -e _start -o "$B/$n" "$t" ;;
-      cmpsb|incdec8|mem16|cond_sizes|stack_fw|narrow_ops) gcc-4.2 -arch i386 -O2 -o "$B/$n" "$t" ;;           # i386 assembly: compared against the interpreter
+      cmpsb|incdec8|mem16|cond_sizes|stack_fw|narrow_ops|taken_loop) gcc-4.2 -arch i386 -O2 -o "$B/$n" "$t" ;;           # i386 assembly: compared against the interpreter
       faults|identity|remap) gcc-4.2 -arch i386 -O1 -o "$B/$n" "$t" ;; # i386 only: compared against tests/$n.expected
       mmx_ops) gcc-4.2 -arch i386 -Os -mmmx -msse -o "$B/$n" "$t" ;;   # MMX: against tests/mmx_ops.expected (x86; -O1 makes gcc-4.2 fail)
       loop_slots) gcc-4.2 -arch i386 -O0 -mmmx -o "$B/$n" "$t" ;;     # stack variables (-O0): compared against the interpreter

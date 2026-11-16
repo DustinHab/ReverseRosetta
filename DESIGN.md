@@ -557,6 +557,17 @@ page). Running measurement series: `tests/measure_all.sh`.
   bzip2's sorting) left a block every 48 instructions, with the flags stored and the stack knowledge lost each time.
   bzip2 -9 4.79 against 5.25 s, sha1 -7 %, aes -3 %, the others unchanged; cold and cached starts (Calculator, ls, perl,
   python, openssl) unchanged.
+- *Loops over the taken branch* (`ROSETTA_NO_TAKEN`): blocks follow the fall-through of conditional jumps, but gcc
+  often puts the rarely needed part right after the jump and the loop runs over the taken branch. gzip's
+  longest_match: `cmpb (%edx,%esi),%al; jne 290e` (most chain entries fail at the first byte), at 290e the next chain
+  entry and `jne 27f1` back to the loop head; the fall-through compares further bytes and ends in an inner loop
+  (`jmp 2833`). As two blocks every iteration left both (exit stub, flags, stack knowledge lost, the frame slots
+  0xd8/0xe0/0xe8/0xf3 loaded anew). Now the collector follows the taken branch if it leads back to the block start
+  within 20 instructions and the block's own fall-through path reaches neither the target nor the start within 100
+  (`path_reaches`; otherwise the target is an inner jump anyway): the jump's condition is negated and its target set
+  to the instruction after it (the side exit), so all analyses see an ordinary forward exit. At most two per block.
+  gzip -9 1.09 s against 0.99 s (output identical). `tests/taken_loop.c`: such a chain search and skipped long
+  bodies with every kind of compare against the interpreter.
 - Bug fixed: a translation cache named by `ROSETTA_CACHE_FILE` was taken for any program as long as the program that
   wrote it was unchanged on disk (gzip ran openssl's blocks at the same addresses and crashed); the saved program must
   now be the running one (inode and size).

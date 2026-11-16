@@ -171,6 +171,8 @@ static int g_loadcopy_dist = 16;      /* ROSETTA_LOADCOPY_DIST: ... unless it is
                                          (aes over 40 MB: 4-8 2.96 s, 12 2.90, 16 2.85, 24 3.00, unlimited 3.13;
                                          sha1 the same from 4 on) */
 static int g_no_narrowfw;             /* ROSETTA_NO_NARROWFW: 8/16-bit reads of a remembered slot go through memory */
+static int g_no_taken;                /* ROSETTA_NO_TAKEN: blocks follow only the fall-through of conditional jumps */
+static unsigned long g_st_taken;
 static int g_sw_skip, g_sw_skipped;   /* dead store: leave out the next 32-bit store (save_p) / it was left out */
 static int g_no_dead;                 /* without ROSETTA_DEAD=1 every store to a stack slot is done at once: leaving
                                          out dead ones removes instructions but gains nothing on the G4 (stores run
@@ -792,6 +794,7 @@ static int jit_create(void)
     g_no_loadcopy = getenv("ROSETTA_NO_LOADCOPY") != 0;
     if (getenv("ROSETTA_LOADCOPY_DIST")) g_loadcopy_dist = atoi(getenv("ROSETTA_LOADCOPY_DIST"));
     g_no_narrowfw = getenv("ROSETTA_NO_NARROWFW") != 0;
+    g_no_taken = getenv("ROSETTA_NO_TAKEN") != 0;
     g_no_dead = !getenv("ROSETTA_DEAD");   /* off: no measurable gain (sha1 1.10 s against 1.11 s, realworld equal) */
     g_dead_log = getenv("ROSETTA_DEAD_LOG") != 0;
     if (getenv("ROSETTA_DEAD_WINDOW")) sscanf(getenv("ROSETTA_DEAD_WINDOW"), "%d,%d", &g_dead_window, &g_dead_writes);
@@ -7100,10 +7103,10 @@ static int embed_worth_calc(uint32_t z, int max)
 
 /* Whether the code from a (after a call) soon leads back to the block start. Only then is continuing in the block
    worth it (otherwise a lot of code would be translated that may never run after the call: startup of hello +15 %) */
-static int loop_behind(uint32_t a, uint32_t eip)
+static int loop_behind_n(uint32_t a, uint32_t eip, int n)
 {
     int k;
-    for (k = 0; k < 20; k++) {
+    for (k = 0; k < n; k++) {
         Insn t;
         uint8_t l, s;
         int kind;
@@ -7113,6 +7116,31 @@ static int loop_behind(uint32_t a, uint32_t eip)
         if ((kind == JUMP_COND || kind == JUMP) && t.eip + t.len + t.imm == eip) return 1;
         if (kind != CONT && kind != JUMP_COND) return 0;
         a = t.eip + t.len;
+    }
+    return 0;
+}
+
+static int loop_behind(uint32_t a, uint32_t eip) { return loop_behind_n(a, eip, 20); }
+
+/* Does the block's own path from a (conditional jumps fall through, unconditional ones forward are followed, as the
+   collector does) arrive at t within n instructions, or jump back to the block start eip? */
+static int path_reaches(uint32_t a, uint32_t t, uint32_t eip, int n)
+{
+    int k;
+    for (k = 0; k < n; k++) {
+        Insn y;
+        uint8_t l, s;
+        int kind;
+        uint32_t z;
+        if (a == t || a == eip) return 1;
+        if (a - COMMPAGE_BASE < COMMPAGE_SIZE || !page_readonly(a) || !page_readonly(a + 15) ||
+            !code_present(a) || !decode(a, &y)) return 0;
+        if (!classify(&y, &l, &s, &kind)) kind = CONT;
+        z = y.eip + y.len + y.imm;
+        if ((kind == JUMP_COND || kind == JUMP) && z == eip) return 1;
+        if (kind == JUMP) { if (z <= y.eip) return 0; a = z; continue; }   /* backward: the collector stops there */
+        if (kind != CONT && kind != JUMP_COND) return 0;
+        a = y.eip + y.len;
     }
     return 0;
 }
@@ -7404,6 +7432,7 @@ static uint32_t *translate_block(uint32_t eip)
     uint32_t expected[MAX_INSNS], ret[2];   /* inlined calls: expected return address per ret */
     Stub stub_fn[MAX_INSNS];                /* direct math (traced 5): stub behind the import stub */
     int st_k = -1, st_x = 0, st_t = 0, st_b = 0;   /* switch jump table */
+    int ninv = 0, natt = 0;                 /* conditional jumps followed on their taken branch, checked for it */
     /* Loop head: in a variant (block from a call site for one fixed target) a jump back to
        the call site does not go to its own head, because the next target can be a different one */
     int var = g_var_active && eip == g_var_loc;
@@ -7451,7 +7480,33 @@ static uint32_t *translate_block(uint32_t eip)
         }
         if (k == CONT) { if (must_check && a - eip > 12) break; continue; }
         if (must_check) break;
-        if (k == JUMP_COND) continue;
+        if (k == JUMP_COND) {
+            /* The loop runs over the taken branch: gcc puts the rarely taken part inline after the jump (gzip's
+               longest_match: jne to the next chain entry, which jumps back to the loop head; the fall-through compares
+               further bytes). If the taken branch leads back to the block start soon and the fall-through does not
+               get there (nor to the target), follow the taken branch: the loop becomes one block with its back jump
+               (slots, constants, no exit per iteration). The jump is inverted and points to the instruction after
+               it, which is now the side exit. */
+            Insn *y = &b[n - 1];
+            uint32_t z = a + y->imm;
+            /* (forward jumps only, 12 instructions, the first 6 per block: the lookahead decodes; without these
+               limits bzip2's translation took 20 % longer) */
+            if (!g_no_taken && !var && ninv < 2 && n < max - 8 && z > a && z != keip && natt < 6 &&
+                ((y->op >= 0x70 && y->op <= 0x7f) || (y->op >= (OP_0F | 0x80) && y->op <= (OP_0F | 0x8f))) &&
+                z - COMMPAGE_BASE >= COMMPAGE_SIZE && !page_writable(z)) {
+                for (j = 0; j < n && b[j].eip != z; j++) ;
+                if (j == n) natt++;
+                if (j == n && loop_behind_n(z, keip, 12) && !path_reaches(a, z, keip, 100)) {
+                    y->op ^= 1;             /* condition negated (Intel: bit 0 of the condition code) */
+                    y->imm = 0;             /* target: the old fall-through */
+                    y->wm_ok = 0;
+                    ninv++;
+                    g_st_taken++;
+                    a = z;
+                }
+            }
+            continue;
+        }
         if (k == JUMP && n < max - 4) {
             uint32_t z = a + b[n - 1].imm;
             for (j = 0; j < n && b[j].eip != z; j++) ;
@@ -9873,9 +9928,9 @@ void jit_stats(void)
                 (double)g_cache_time * tb.numer / tb.denom / 1e6, g_cache_error, g_st_expected, g_st_inval_cache);
     }
     fprintf(stderr,"rosetta: %lu blocks with %lu instructions translated, %lu chained (%lu direct), %lu fused, "
-            "%lu page exits, %lu stack slots, %lu floating point (%lu loops, %lu packed), %lu x87, %lu direct (x87/SSE), %lu interpreted in block, %lu interpreted, %lu invalid, %lu flushes, %lu table misses, %lu inline caches, %lu stubs, %lu constants (%lu blocks with guard, %lu failed, %lu masks), %lu loops with prefetch (%lu streams, %lu faults), %lu mov saved, %lu forwarded, %lu calls inlined (%lu predicted, %lu wrong), %lu stack values forwarded (%lu ret without check, %lu dead stores, %lu written later), %lu math calls direct, %lu switch tables, cache %lu KB\n", g_st_blocks,
+            "%lu page exits, %lu stack slots, %lu floating point (%lu loops, %lu packed), %lu x87, %lu direct (x87/SSE), %lu interpreted in block, %lu interpreted, %lu invalid, %lu flushes, %lu table misses, %lu inline caches, %lu stubs, %lu constants (%lu blocks with guard, %lu failed, %lu masks), %lu loops with prefetch (%lu streams, %lu faults), %lu mov saved, %lu forwarded, %lu calls inlined (%lu predicted, %lu wrong), %lu stack values forwarded (%lu ret without check, %lu dead stores, %lu written later), %lu math calls direct, %lu switch tables, %lu taken branches followed, cache %lu KB\n", g_st_blocks,
             g_st_insns, g_st_linked, g_st_direct, g_st_fusion, g_st_pages, g_st_slots, g_st_fp, g_st_fp_loops, g_st_pd, g_st_x87, g_st_fp_direct, g_st_inline, g_st_interp, g_st_invalid,
-            g_st_flushes, g_st_table_miss, g_st_ic, g_st_stubs, g_st_const, g_st_watchdog, g_st_watchdog_miss, g_st_masks, g_st_prefetch, g_st_vl_streams, g_st_vl_error, g_st_mov, g_st_fw, g_st_embed, g_st_before, g_st_before_miss, g_st_sw, g_st_sw_ret, g_st_dead, g_st_dead_flush, g_st_math_direct, g_st_jumptab, (unsigned long)((uint8_t *)g_free - (uint8_t *)g_cache) / 1024);
+            g_st_flushes, g_st_table_miss, g_st_ic, g_st_stubs, g_st_const, g_st_watchdog, g_st_watchdog_miss, g_st_masks, g_st_prefetch, g_st_vl_streams, g_st_vl_error, g_st_mov, g_st_fw, g_st_embed, g_st_before, g_st_before_miss, g_st_sw, g_st_sw_ret, g_st_dead, g_st_dead_flush, g_st_math_direct, g_st_jumptab, g_st_taken, (unsigned long)((uint8_t *)g_free - (uint8_t *)g_cache) / 1024);
     {
         int i, k, best;
         {
