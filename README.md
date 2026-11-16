@@ -110,17 +110,22 @@ Startup time, translated against native, fastest of 7 runs with the translation 
 | `/bin/ls -la /usr/lib` (i386 part of the universal binary) | 71 ms | 42 ms |
 
 Programs with windows, time until the program is idle after the start (the translator's own measurement,
-`ROSETTA_STATS`, nothing else running), starting with an empty translation cache. The second start translates
-everything the first one only interpreted; from the third start on almost nothing is translated:
+`ROSETTA_STATS`, nothing else running), starting with an empty translation cache: wall time / processor time. The first
+start interprets code for 300 ms and translates from then on; the second translates what the first only interpreted;
+from the third start on almost nothing is translated:
 
 | Program | 1st start | 2nd start | from the 3rd start |
 |---|---|---|---|
-| Calculator.app | 4.0 s | 4.2 s | 2.1 s |
-| Transmission 2.42 | 6.1 s | 6.9 s | 3.9 to 4.1 s |
+| Calculator.app | 7.3 s / 4.7 s | 2.8 s / 1.9 s | 2.7 s / 1.7 s |
+| Transmission 2.42 | 14.1 s / 7.7 s | 5.3 s / 3.3 s | 5.3 to 5.8 s / 3.3 s |
+
+Transmission's wall time includes waiting for name lookups (DirectoryService answered its three queries in 1.4 s
+in one start); its processor time is what the translation costs.
 
 Measured from outside in the same way for both (the window polled every 0.2 s, which costs processor time
 itself), Calculator's window appears after 3.6 to 3.9 s with a filled translation cache and after 2.3 to 2.6 s for
-the native PowerPC build. At startup the translated Calculator uses 1.7 s of processor time, the native one 0.66 s.
+the native PowerPC build. At startup the translated Calculator uses 1.7 s of processor time once its translation cache
+is filled (4.7 s at the very first start), the native one 0.66 s.
 
 ## What runs
 
