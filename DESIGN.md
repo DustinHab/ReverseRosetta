@@ -542,6 +542,13 @@ page). Running measurement series: `tests/measure_all.sh`.
   word patched in the file afterwards with pwrite; a 14 MB copy before). A guest mmap/mprotect drops only the cached
   page-protection regions that overlap it, not all of them (Calculator: 125 vm_region calls at startup, now 36).
 
+- *Late threshold* (`ROSETTA_THRESHOLD_LATE`, `ROSETTA_THRESHOLD_MS`): without a translation cache a block is translated
+  on its 10th entry; that suits short programs (most of their code runs once), but AppKit's startup runs much code a
+  few times. Thresholds for Calculator's first start (processor time): 1: 4.7 s, 3: 5.1 s, 5: 5.6 s, 10: 6.8 s, 20: 8.6 s,
+  40: 11.2 s; for hello, perl -e, openssl, Foundation 10 is best (hello 30 against 70 ms with 1). The threshold now
+  drops from 10 to 1 after 300 ms: Calculator's first start 4.7 s (wall 7.1 instead of 10.2 s), the short programs as
+  with 10.
+
 ### QuickTime (16 Nov)
 
 - The 10.5.8 update has no i386 QuickTime; Apple's QuickTime 7.6.4 for Leopard is universal (QuickTime, QTKit, CoreVideo,

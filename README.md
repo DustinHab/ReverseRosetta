@@ -311,7 +311,7 @@ error code.
 |---|---|
 | `ROSETTA_INTEL=DIR` | Intel root (default: `intel/root` next to the `build` directory); `-` disables the redirection |
 | `ROSETTA_INTERP=1` | interpreter only, no translation |
-| `ROSETTA_THRESHOLD=N` | number of executions before a block is translated |
+| `ROSETTA_THRESHOLD=N` | number of executions before a block is translated (default 10, after 300 ms 1: `ROSETTA_THRESHOLD_LATE`, `ROSETTA_THRESHOLD_MS`) |
 | `ROSETTA_NO_CACHE=1` | do not read or write the translation cache |
 | `ROSETTA_CACHE_SHOW=1` | report why a cached translation is used or rejected (`=2`: every new and every discarded block) |
 | `ROSETTA_NO_CHECKPOINT=1` | write the translation cache only at the end |

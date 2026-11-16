@@ -8206,10 +8206,31 @@ static int only_allowed(uint32_t eip)
     return (eip >= lo && eip <= hi) || commpage_stub(eip) || thunk_find(eip);
 }
 
+/* Late threshold: short programs start fastest with threshold 10 (most of their code runs once: hello 30 against 70 ms,
+   perl -e 80 against 150 ms with 1), programs with windows with 1 (AppKit's startup runs much code a few times: Calculator's
+   first start 4.7 against 6.8 s processor time). So the threshold drops to ROSETTA_THRESHOLD_LATE (1) once the program has
+   run ROSETTA_THRESHOLD_MS (300) ms; not with an explicit ROSETTA_THRESHOLD. */
+static int g_threshold_late = -1;
+static uint64_t g_threshold_at;
+
+static void threshold_late_check(void)
+{
+    if (g_threshold_late < 0) {
+        mach_timebase_info_data_t tb;
+        const char *l = getenv("ROSETTA_THRESHOLD_LATE"), *ms = getenv("ROSETTA_THRESHOLD_MS");
+        mach_timebase_info(&tb);
+        g_threshold_late = getenv("ROSETTA_THRESHOLD") ? g_threshold : l ? atoi(l) : 1;
+        if (g_threshold_late < 1) g_threshold_late = 1;
+        g_threshold_at = mach_absolute_time() + (uint64_t)(ms ? atoi(ms) : 300) * 1000000ull * tb.denom / tb.numer;
+    }
+    if (g_threshold > g_threshold_late && mach_absolute_time() > g_threshold_at) g_threshold = g_threshold_late;
+}
+
 static int often_enough(uint32_t eip)
 {
     uint32_t h, msk;
     if (g_threshold <= 1) return 1;
+    threshold_late_check();
     if (!only_allowed(eip)) return 0;
     g_counted = eip;
     if (!g_count || 2 * (g_count_used + 1) > (1u << g_count_bits)) counter_grow();
