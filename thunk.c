@@ -239,6 +239,30 @@ uint32_t thunk_guest_addr(Stub fn)
     return 0;
 }
 
+/* entries of our own for stubs that no guest image exports (thunk_guest_entry): 16 bytes each on one page that
+   thunk_find knows before anything else; thunk_forget keeps them (a program holds the pointers) */
+#define OWN_N 256
+static uint32_t g_own_page;
+static Stub g_own[OWN_N];
+static int g_nown;
+
+uint32_t thunk_guest_entry(Stub fn)
+{
+    uint32_t a = thunk_guest_addr(fn);
+    vm_address_t p = 0;
+    int k;
+    if (a) return a;
+    for (k = 0; k < g_nown; k++) if (g_own[k] == fn) return g_own_page + 16 * (uint32_t)k;
+    if (!g_own_page) {
+        if (vm_allocate(mach_task_self(), &p, 4096, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return 0;
+        memset((void *)p, 0xcc, 4096);          /* int3: nothing runs there, thunk_find answers first */
+        g_own_page = (uint32_t)p;
+    }
+    if (g_nown == OWN_N) return 0;
+    g_own[g_nown] = fn;
+    return g_own_page + 16 * (uint32_t)g_nown++;
+}
+
 static Stub addr_find(uint32_t a)
 {
     uint32_t h = (a * 2654435761u) >> 20, i;
@@ -595,6 +619,8 @@ Stub thunk_find(uint32_t eip)
     mach_port_t obj;
     Stub gt = gl_tramp(eip);                    /* dispatch table of a guest OpenGL context */
     if (gt) return gt;
+    if (g_own_page && eip - g_own_page < 16 * (uint32_t)g_nown)     /* thunk_guest_entry */
+        return (eip & 15) ? 0 : g_own[(eip - g_own_page) / 16];
     if (g_off < 0) g_off = getenv("ROSETTA_NO_STUB") != 0;
     if (g_off) return 0;
     if (!g_names_done) names_build();

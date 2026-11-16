@@ -62,7 +62,22 @@ int main(void)
     printf("after the buffer: %s, %d processed, unqueued %s\n", state == AL_STOPPED ? "stopped" : "not stopped", done,
            got == buf ? "the buffer" : "something else");
     printf("doppler factor %g, error %x\n", alGetFloat(AL_DOPPLER_FACTOR), alGetError());
-    printf("alBufferDataStatic %s\n", alGetProcAddress("alBufferDataStatic") ? "found" : "missing");
+    {                                                       /* an extension only through alGetProcAddress, called */
+        typedef ALvoid (*StaticFn)(ALint, ALenum, ALvoid *, ALsizei, ALsizei);
+        StaticFn st = (StaticFn)alGetProcAddress("alBufferDataStatic");
+        ALuint b2 = 0;
+        ALint sz2 = 0, fr2 = 0;
+        printf("alBufferDataStatic %s", st ? "found" : "missing");
+        if (st) {
+            alGenBuffers(1, &b2);
+            st((ALint)b2, AL_FORMAT_MONO16, pcm, (ALsizei)(sizeof pcm / 2), 11025);
+            alGetBufferi(b2, AL_SIZE, &sz2);
+            alGetBufferi(b2, AL_FREQUENCY, &fr2);
+            alDeleteBuffers(1, &b2);
+            printf(", static buffer %d bytes at %d Hz, error %x", sz2, fr2, alGetError());
+        }
+        printf("\n");
+    }
     alDeleteSources(2, src);
     alDeleteBuffers(1, &buf);
     printf("deleted: %s, error %x\n", alIsBuffer(buf) ? "no" : "yes", alGetError());

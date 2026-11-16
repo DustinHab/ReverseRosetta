@@ -583,7 +583,8 @@ Stub al_stub(const char *s, size_t n)
 }
 
 /* alGetProcAddress/alcGetProcAddress: the guest address of the export of the guest's OpenAL image, which thunk.c
-   replaced by our function (thunk_guest_addr); 0 for what this file does not have */
+   replaced by our function, or an entry of thunk.c's own if the image does not export it or it was not read yet
+   (alBufferDataStatic: found only now and then before); 0 for what this file does not have */
 static uint32_t proc_address(uint32_t name)
 {
     char s[64];
@@ -593,7 +594,7 @@ static uint32_t proc_address(uint32_t name)
     for (i = 0; i + 1 < sizeof s && ld8(name + i); i++) s[i] = (char)ld8(name + i);
     s[i] = 0;
     fn = al_stub(s, i);
-    return fn ? thunk_guest_addr(fn) : 0;
+    return fn ? thunk_guest_entry(fn) : 0;
 }
 static int c_alGetProcAddress(Cpu *c) { RET(proc_address(A(0))); }
 static int c_alcGetProcAddress(Cpu *c) { RET(proc_address(A(1))); }

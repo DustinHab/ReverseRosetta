@@ -16,8 +16,11 @@ Stub thunk_stub(uint32_t z);
 /* read the images again (after munmap/mmap of the guest) */
 void thunk_forget(void);
 
-/* guest address of an export that was replaced by fn (the first one found), 0 if none: alGetProcAddress */
+/* guest address of an export that was replaced by fn (the first one found), 0 if none */
 uint32_t thunk_guest_addr(Stub fn);
+/* a guest address that calls fn: that export, or else an entry of our own (alGetProcAddress of extensions that the
+   guest's OpenAL does not export); 0 only if no memory is left */
+uint32_t thunk_guest_entry(Stub fn);
 /* address of an exported symbol (with underscore) of the loaded guest image whose install name contains part, or 0 */
 uint32_t thunk_guest_symbol(const char *part, const char *sym);
 
