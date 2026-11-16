@@ -149,8 +149,11 @@ the native PowerPC build. At startup the translated Calculator uses 1.7 s of pro
   Sims 2's Read Me opens its document in TextEdit and quits, as it does natively. Objective-C
   garbage collection (Xcode) and JavaScriptCore work. Frameworks that the 10.5.8 update has no i386 version of are stub
   libraries with real Objective-C classes (see Limitations); an application that needs one of them for real fails at
-  that point (The Sims 2 Body Shop needs QuickTime).
+  that point.
 - OpenAL (games' sound) through the system's PowerPC OpenAL (`tests/openal.c` gives the same output as natively).
+- QuickTime through its own i386 framework from Apple's QuickTime 7.6.4 for Leopard (see Setup): movies open, and
+  H.264 frames decode to the same pixels as natively (`tests/quicktime.c`). Its codecs use MMX, which runs in the
+  interpreter (correct, `tests/mmx_ops.c` against a real x86 processor, but slow for now).
 - x87, SSE and SSE2: scalar, packed double, packed integer and packed float (AltiVec), including Apple's Intel
   vDSP/vForce code and ImageIO's image decoders.
 - OpenGL with the graphics chip: the program's OpenGL calls go to the system's PowerPC OpenGL and its hardware
@@ -238,6 +241,10 @@ part of this repository.
 
    Run `tools/intel_patch.sh` again after every `intel_rebase.sh` or `intel_prebind.sh`.
 
+   QuickTime (optional, for programs that play movies or use QTKit): Apple's "QuickTime 7.6.4 for Leopard" is a
+   universal package whose i386 part the 10.5.8 update lacks. `tools/intel_quicktime.sh QuickTime764_Leopard.dmg`
+   puts it into the root (nothing is installed; download link and checksum in the script).
+
 The three patches change copies in `intel/root`, never the system. Each one checks the original bytes and keeps a
 backup in `intel/backup/`:
 
@@ -324,7 +331,7 @@ error code.
 ## Tests
 
 ```
-tests/run_tests.sh      # 50 comparisons against native builds, real Intel output or the interpreter
+tests/run_tests.sh      # 52 comparisons against native builds, real Intel output or the interpreter
 tests/measure_all.sh    # the benchmark loads above
 tests/gl_measure.sh     # the OpenGL workloads, translated and native side by side (login session)
 tests/realworld.sh      # ordinary programs (gzip, bzip2, perl, python ...) translated against native
@@ -371,6 +378,11 @@ well.
   Performance). Tested with NSOpenGLView windows and CGL pbuffers; AGL and GLUT programs are untested.
 - The keychain sees the process `rosetta`, not the program: a program that reads a password asks once per item, and
   "Always Allow" lets every translated program read it. After rosetta is rebuilt, the keychain asks again.
+- Real-time threads of translated programs run as ordinary time sharing (`ROSETTA_REALTIME=1` passes the request on):
+  translated code is slower than the computation such a thread promises, and an overrunning real-time thread froze the
+  whole iBook as soon as QuickTime decoded a movie.
+- The Sims 2 Body Shop asks for its licence agreement on the first start and loads the text through
+  MLTEFile.bundle, which exists only for PowerPC; the dialog fails and the program quits.
 - Programs that need a setuid helper in their bundle (Activity Monitor's pmTool) do not work: the copy in
   `intel/apps` is not setuid, and an i386 helper could not run with root rights through rosetta anyway.
 - Packed float instructions give the PowerPC default NaN (positive) where Intel processors give a negative one.

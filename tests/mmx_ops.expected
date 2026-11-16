@@ -1,0 +1,69 @@
+paddb        1aca4401cc5f2cef
+paddw        9ac32a2388106775
+paddd        03da35043d7cffeb
+paddsb       f5b54642b79c4c67
+paddsw       974a6a3d0f07ef88
+paddusb      3bac62a651c6d1c9
+paddusw      0b07335fbee7bb8e
+psubb        f02f8336b47d5865
+psubw        571df32d72ca938a
+psubd        af7dc222323412a5
+psubsb       3ac170fafd459300
+psubsw       6416a096b56d3a61
+psubusb      9e1cd249064548e5
+psubusw      2c877aa17dc15390
+pmullw       a7b5513ce0b47425
+pmulhw       31db13387d3f2403
+pmulhuw      18dbe19122be1eff
+pmaddwd      5c4e45fa5417c8cd
+pand         b8553933b581e875
+pandn        52e5ed68dba80aa2
+por          cee1ee9cad9aae45
+pxor         7c235795da757644
+pcmpeqb      09042cbd68cf5454
+pcmpeqw      307d509c7f4ff5c9
+pcmpeqd      5bf14bc391897ac8
+pcmpgtb      4df54dc8b86cfdfa
+pcmpgtw      f6a56551d6e2bc47
+pcmpgtd      2f6b4d0345c2d546
+punpcklbw    f8bf261b10617b2c
+punpcklwd    781872bffe76f439
+punpckldq    9828de4d002471a2
+punpckhbw    f7bc5bad587a839e
+punpckhwd    4145cb5f74f5df62
+punpckhdq    89065184480be6c1
+packsswb     6082fafc9a4f113a
+packssdw     e3cf8540b15ef82b
+packuswb     96e705bfc302ffb2
+psllw        36ec9d6ac40421bf
+pslld        40610e44172059a4
+psllq        2b08fe4deb620a64
+psrlw        3013d0dc96358161
+psrld        5f634d90821e0faf
+psrlq        eea12eadf4958343
+psraw        53617e72b52bec7d
+psrad        63e6fccb5acbadda
+psllw 3      97798887637128bf
+pslld 17     c4aa413ad6e7215d
+psllq 33     731bb69ed92a34c4
+psrlw 5      80ba88e896423916
+psrld 31     ddcc9f5e5b365677
+psrlq 7      9485cd7c6c8183fb
+psraw 15     9c314760bb32e119
+psrad 4      add671de0b80bb7c
+pavgb        f40cc5d7a9d9978d
+pavgw        6bffa439f096dc59
+pminub       59c795dca1426346
+pmaxub       30f8f31511cc9df5
+pminsw       389b013af0a8eb2b
+pmaxsw       6ebc23a19f5decef
+psadbw       c593cbe6cf6e5ffb
+pshufw 1b    ca097ba194dd04a4
+pshufw e4    76674853a7789363
+pshufw 5c    058446d536512527
+pmovmskb     694d160040ea5bbd
+pextrw 2     102903a259038c59
+pinsrw 3     816a28e03fa6519c
+movd         5cdc8ebc172ab964
+movd to mm   28d038a6f891a9d4
+cvtpi/ps     9caf27bdad06afd9

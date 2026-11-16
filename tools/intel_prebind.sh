@@ -6,7 +6,7 @@ R=$(cd "$(dirname "$0")/.." && pwd)
 cd $R || exit 1
 W=$R/intel/root
 gcc -O2 -Wall -o build/prebind tools/prebind.c || exit 1
-find "$W" -type f > /tmp/vb_all.txt
+find "$W/" -type f > /tmp/vb_all.txt     # (the slash: intel/root may be a symbolic link)
 : > /tmp/vb_dylibs.txt
 while read -r f; do
   k=$(head -c 16 "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n')

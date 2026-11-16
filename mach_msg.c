@@ -702,6 +702,31 @@ received:
     return r;
 }
 
+/* Real-time scheduling requests of the guest become ordinary time sharing. Translated code is slower than the computation a
+   time-constraint thread promises, and such a thread that runs over (or a fixed-priority RR/FIFO thread that spins)
+   takes the only processor: the iBook froze completely (ping answered, no process ran, not even sshd) as soon as
+   QuickTime's H.264 decoder started decoding. thread_policy_set (3617) with THREAD_TIME_CONSTRAINT_POLICY becomes
+   THREAD_EXTENDED_POLICY with timeshare on; thread_policy (3616, behind pthread_setschedparam) with POLICY_RR/FIFO
+   becomes POLICY_TIMESHARE (the base array of RR does not fit it: the call fails, which programs ignore).
+   Request layout (guest byte order, MIG with NDR): flavor/policy @32, count @36, data @40. ROSETTA_REALTIME=1 passes them. */
+static void realtime_demote(uint32_t m, int32_t id, uint32_t *size)
+{
+    static int allowed = -1, reported;
+    if (allowed < 0) allowed = getenv("ROSETTA_REALTIME") != 0;
+    if (allowed) return;
+    if (id == 3617 && *size >= 56 && ld32(m + 32) == THREAD_TIME_CONSTRAINT_POLICY) {
+        st32(m + 4, 44);
+        st32(m + 32, THREAD_EXTENDED_POLICY);
+        st32(m + 36, THREAD_EXTENDED_POLICY_COUNT);
+        st32(m + 40, 1);                    /* timeshare */
+        *size = 44;
+        if (!reported++ && g_log) fprintf(stderr, "rosetta: time-constraint thread policy made time sharing\n");
+    } else if (id == 3616 && *size >= 40 && (ld32(m + 32) == POLICY_RR || ld32(m + 32) == POLICY_FIFO)) {
+        st32(m + 32, POLICY_TIMESHARE);
+        if (!reported++ && g_log) fprintf(stderr, "rosetta: fixed-priority thread policy made time sharing\n");
+    }
+}
+
 void mach_trap(Cpu *c, int n, uint32_t base)
 {
     g_base = base;
@@ -715,8 +740,9 @@ void mach_trap(Cpu *c, int n, uint32_t base)
     case 28: c->r[EAX] = mach_task_self(); return;
     case 29: c->r[EAX] = mach_host_self(); return;
     case 31: {
-        uint32_t m = arg(0), opt = arg(1);
+        uint32_t m = arg(0), opt = arg(1), send_size = arg(2);
         int32_t id = (opt & MACH_SEND_MSG) ? (int32_t)ld32(m + 20) : 0;
+        if (id == 3616 || id == 3617) realtime_demote(m, id, &send_size);
         /* vm_protect (3803) on the own task with write access: make shared-mapped file ranges private first */
         if (id == 3803 && ld32(m + 8) == mach_task_self() && arg(2) >= 48 && (ld32(m + 44) & VM_PROT_WRITE))
             sys_make_private(ld32(m + 32), ld32(m + 36));
@@ -752,7 +778,7 @@ void mach_trap(Cpu *c, int n, uint32_t base)
                 for (k = 24; k + 4 <= sz && k < 24 + 4 * 48; k += 4) fprintf(stderr, " %08x", ld32(m + k));
                 fprintf(stderr, "\n");
             }
-            c->r[EAX] = (uint32_t)guest_mach_msg(c, m, (mach_msg_option_t)opt, arg(2), arg(3), arg(4), arg(5), arg(6));
+            c->r[EAX] = (uint32_t)guest_mach_msg(c, m, (mach_msg_option_t)opt, send_size, arg(3), arg(4), arg(5), arg(6));
             if (g_log) {
                 for (i = 0; i < nsvc; i++) if (svc[i].port == to) { tn = svc[i].name; break; }
                 if (id == 404 && c->r[EAX] == 0 && (opt & MACH_RCV_MSG) && ld32(m + 20) == 504 && (ld32(m) & 0x80000000u)) {

@@ -1,9 +1,10 @@
 #!/bin/sh
-# intel_root.sh - from the unpacked Combo Update (intel/raw), put every Mach-O file with an i386 part as a thin
-# i386 version under the same path into intel/root (rosetta redirects the guest's accesses there when the file
-# exists there). Symbolic links in frameworks are taken along. Nothing is installed.
+# intel_root.sh [SOURCE] - from the unpacked Combo Update (intel/raw, or SOURCE: another unpacked update such as
+# intel/raw_quicktime from QuickTime 7.6.4 for Leopard), put every Mach-O file with an i386 part as a thin i386
+# version under the same path into intel/root (rosetta redirects the guest's accesses there when the file exists there;
+# a stub library at the same path is replaced). Symbolic links in frameworks are taken along. Nothing is installed.
 R=$(cd "$(dirname "$0")/.." && pwd)
-Q=$R/intel/raw
+Q=${1:-$R/intel/raw}
 W=$R/intel/root
 cd "$Q" || exit 1
 mkdir -p "$W"

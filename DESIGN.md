@@ -541,6 +541,32 @@ page). Running measurement series: `tests/measure_all.sh`.
   does. The translation cache is written straight from the code region (blocks outside the images get their exit
   word patched in the file afterwards with pwrite; a 14 MB copy before). A guest mmap/mprotect drops only the cached
   page-protection regions that overlap it, not all of them (Calculator: 125 vm_region calls at startup, now 36).
+
+### QuickTime (16 Nov)
+
+- The 10.5.8 update has no i386 QuickTime; Apple's QuickTime 7.6.4 for Leopard is universal (QuickTime, QTKit, CoreVideo,
+  the CoreMedia private frameworks, all codec components, QuickTime Player; nothing DSMOS-protected).
+  `tools/intel_quicktime.sh` extracts the bundle package's payload and puts the i386 parts into the root, replacing the
+  stub libraries. The new libraries get fixed addresses above the existing ones (0x4cc00000 on the iBook) instead of a
+  rebase of the whole root, because `intel_patch.sh` finds its sites by address. `AppleVAH264HW.component` stays out:
+  it decodes H.264 on the graphics chip through IOKit user clients of the (here: PowerPC Radeon) accelerator.
+  `intel_prebind.sh` and `intel_rebase.sh` ran `find` on `intel/root` without a slash: on a root that is a symbolic
+  link they found nothing (`0 i386 libraries`), now `find "$W/"`.
+- Asynchronous I/O (313-320): QuickTime reads movie data with aio_read. Done synchronously, the result kept per control
+  block until aio_return; aio_error reports it, aio_suspend returns at once. Without it every frame stayed empty.
+- MMX (sse.c `mmx_step`): the integer instructions without prefix on mm0-mm7, kept apart from the x87 stack (programs
+  separate the two with emms). An mm register goes through an Xmm with a zero upper half, so the SSE2 element operations
+  serve as they are where the 64-bit form is the low half of the 128-bit one; unpacking the high halves and packing
+  differ. Also pshufw, pmovmskb, pinsrw/pextrw, maskmovq, movntq, cvtpi2ps/cvt(t)ps2pi, cvtpi2pd/cvt(t)pd2pi,
+  movdq2q/movq2dq. The JIT leaves them to the interpreter. `tests/mmx_ops.c`: 69 operations, identical to a real x86
+  processor (the reference built with gcc for x86-64 in WSL; Apple's gcc-4.2 sign-extends `_mm_extract_pi16`).
+- Real-time threads: QuickTimeComponents, CoreVideo, CoreAudio, AudioToolbox call thread_policy_set, CoreMediaPrivate
+  pthread_setschedparam. Passed on, a time-constraint or fixed-priority thread of slow translated code that spins took
+  the only processor: the iBook froze three times (ping answered, no process ran, not even sshd or a watchdog) as soon as
+  the H.264 decoder decoded a frame. `mach_msg.c realtime_demote`: thread_policy_set (3617) with
+  THREAD_TIME_CONSTRAINT_POLICY becomes THREAD_EXTENDED_POLICY with timeshare, thread_policy (3616) with POLICY_RR/FIFO
+  becomes POLICY_TIMESHARE; `ROSETTA_REALTIME=1` passes them on. Afterwards `tests/quicktime.c` decodes two H.264
+  movies with the same mean colours as natively.
 - *Conditions from stored flags* without a C helper, when the flag kind at run time is cmp/sub or logic (32 bit)
   (qsort: `jge` on a `jne`; bench_control_flow +9 %).
 - Bug fixed: `writes_reg` reported no written register for `mul/imul/div/idiv` (f6/f7 /4-7) and `not/neg r/m8`

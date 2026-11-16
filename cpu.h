@@ -93,6 +93,8 @@ typedef struct Cpu {
     void *gl_ctx;
     uint32_t gl_proxy;
     uint32_t mach_thread;         /* kernel port of the host thread that runs this guest thread (thread_get_state) */
+    uint8_t mm[8][8];             /* MMX registers, raw Intel bytes (apart from the x87 stack: programs separate the two
+                                     with emms; sse.c) */
 } Cpu;
 
 /* ---------- guest memory ---------- */

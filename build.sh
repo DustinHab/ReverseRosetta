@@ -18,6 +18,7 @@ if [ "$1" = tests ] && [ -d "$Q/tests" ]; then
       raw*) gcc-4.2 -arch i386 -O1 -static -nostdlib -e _start -o "$B/$n" "$t" ;;
       cmpsb|incdec8|mem16|cond_sizes|stack_fw) gcc-4.2 -arch i386 -O2 -o "$B/$n" "$t" ;;           # i386 assembly: compared against the interpreter
       faults|identity|remap) gcc-4.2 -arch i386 -O1 -o "$B/$n" "$t" ;; # i386 only: compared against tests/$n.expected
+      mmx_ops) gcc-4.2 -arch i386 -Os -mmmx -msse -o "$B/$n" "$t" ;;   # MMX: against tests/mmx_ops.expected (x86; -O1 makes gcc-4.2 fail)
       pd_ops|vec_ops) gcc-4.2 -arch i386 -O2 -msse2 -o "$B/$n" "$t" ;;   # SSE2 intrinsics: compared against the interpreter
       vdsp_d) V=$S/System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A
               gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" $V/libvDSP.dylib $V/libvMisc.dylib ;;   # Intel vecLib
@@ -30,6 +31,8 @@ if [ "$1" = tests ] && [ -d "$Q/tests" ]; then
           gcc-4.2 -arch ppc -mcpu=7450 -O2 -o "$B/$n.ppc" "$t" -framework OpenGL ;;   # tests/gl_measure.sh
       openal) gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" -framework OpenAL
           gcc-4.2 -arch ppc -mcpu=7450 -O2 -o "$B/$n.ppc" "$t" -framework OpenAL ;;   # al.c against the system's OpenAL
+      quicktime) gcc-4.2 -arch i386 -O1 -isysroot $S -o "$B/$n" "$t" -framework QuickTime -framework ApplicationServices -framework CoreServices 2> /dev/null
+          gcc-4.2 -arch ppc -O1 -o "$B/$n.ppc" "$t" -framework QuickTime -framework ApplicationServices -framework CoreServices 2> /dev/null ;;   # needs QuickTime 7.6.4 in the Intel root
       cf) gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" -framework CoreFoundation
           gcc-4.2 -arch ppc -mcpu=7450 -O2 -o "$B/$n.ppc" "$t" -framework CoreFoundation ;;
       *) gcc-4.2 -arch i386 -O2 -msse2 -o "$B/$n" "$t"

@@ -86,6 +86,8 @@ t_calc()  { ./rosetta ./calculate; }
 r_calc()  { ./calculate.ppc; }
 t_id()    { ./rosetta ./identity; }
 r_id()    { cat ../tests/identity.expected; }
+t_mmx()   { ROSETTA_THRESHOLD=1 ./rosetta ./mmx_ops; }
+r_mmx()   { cat ../tests/mmx_ops.expected; }
 t_remap() { ./rosetta ./remap; ./rosetta ./remap; ROSETTA_THRESHOLD=1 ./rosetta ./remap; }   # second run: translation cache
 r_remap() { cat ../tests/remap.expected ../tests/remap.expected ../tests/remap.expected; }
 t_remapc() { rm -f /tmp/rr_remap_cache; for n in 1 2 1 2; do ROSETTA_CACHE_FILE=/tmp/rr_remap_cache ./rosetta ./remap $n; done; rm -f /tmp/rr_remap_cache; }
@@ -100,6 +102,9 @@ t_m16()   { ROSETTA_THRESHOLD=1 ./rosetta ./mem16; }
 r_m16()   { ROSETTA_INTERP=1 ./rosetta ./mem16; }
 t_al()    { ./rosetta ./openal; }
 r_al()    { ./openal.ppc; }
+QTM="/System/Library/Compositions/Sunset.mov /System/Library/PreferencePanes/Trackpad.prefPane/Contents/Resources/bl_Dragging.mov"
+t_qt()    { sh ../tests/with_timeout.sh 180 ./rosetta ./quicktime $QTM; }
+r_qt()    { ./quicktime.ppc $QTM; }
 t_csz()   { ROSETTA_THRESHOLD=1 ./rosetta ./cond_sizes; }
 r_csz()   { ROSETTA_INTERP=1 ./rosetta ./cond_sizes; }
 t_sfw()   { ROSETTA_THRESHOLD=1 ./rosetta ./stack_fw; ROSETTA_NO_SLOTS=1 ROSETTA_THRESHOLD=1 ./rosetta ./stack_fw; }   # (loop slots take the loops otherwise)
@@ -112,6 +117,8 @@ same "incw, byte and word shifts in memory, movw (against interpreter)" t_m16 r_
 same "conditions of 8/16/32-bit cmp and test across blocks (against interpreter)" t_csz r_csz
 same "stack slots forwarded in a block: esp/ebp aliases, read-modify-write, xchg (against interpreter)" t_sfw r_sfw
 same "OpenAL: devices, sources, buffers, playing (silent), against native" t_al r_al
+same "MMX: 69 operations on mm registers, against a real x86 processor" t_mmx r_mmx
+same "QuickTime: H.264 movies opened and decoded (QuickTime 7.6.4 i386, MMX, aio), against native" t_qt r_qt
 same "packed doubles with special values (against interpreter)" t_pdo r_pdo
 same "SSE2 integer and packed floats with AltiVec (against interpreter)" t_vec r_vec
 same "threads (mutex, condition, spinlock, pipe, join)" t_thr r_thr

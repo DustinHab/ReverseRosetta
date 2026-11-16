@@ -187,6 +187,116 @@ static void int_shift(Xmm *d, int kind, int g, uint64_t n)
     }
 }
 
+/* ---------- MMX: the integer instructions without prefix on mm0-mm7 (64 bit) ----------
+ * QuickTime's codecs use them. An mm register goes through an Xmm whose upper half is zero, so the element
+ * operations of SSE2 serve as they are where the 64-bit form is the low half of the 128-bit one; the unpacking of the
+ * high halves and the packing differ and are done here. The JIT leaves these instructions to the interpreter. */
+static Xmm mm_get(Cpu *c, int r) { Xmm x; memset(&x, 0, sizeof x); memcpy(x.b, c->mm[r], 8); return x; }
+static void mm_set(Cpu *c, int r, const Xmm *x) { memcpy(c->mm[r], x->b, 8); }
+
+static Xmm mm_src(Cpu *c, const Insn *b)
+{
+    Xmm x;
+    if (!b->mem) return mm_get(c, b->rm);
+    memset(&x, 0, sizeof x);
+    memcpy(x.b, (const void *)(uintptr_t)op_addr(c, b), 8);
+    return x;
+}
+
+static int mmx_step(Cpu *c, const Insn *b, int o)
+{
+    Xmm d = mm_get(c, b->reg), s, r;
+    int i;
+    switch (o) {
+    case 0x6e:                              /* movd mm, r/m32 */
+        memset(&d, 0, sizeof d);
+        xw_s(&d, 0, b->mem ? ld32(op_addr(c, b)) : c->r[b->rm]);
+        mm_set(c, b->reg, &d);
+        return RUN_OK;
+    case 0x7e:                              /* movd r/m32, mm */
+        if (b->mem) st32(op_addr(c, b), xw(&d, 0)); else c->r[b->rm] = xw(&d, 0);
+        return RUN_OK;
+    case 0x6f:                              /* movq mm, mm/m64 */
+        s = mm_src(c, b);
+        mm_set(c, b->reg, &s);
+        return RUN_OK;
+    case 0x7f: case 0xe7:                   /* movq mm/m64, mm; movntq */
+        if (b->mem) memcpy((void *)(uintptr_t)op_addr(c, b), c->mm[b->reg], 8);
+        else memcpy(c->mm[b->rm], c->mm[b->reg], 8);
+        return RUN_OK;
+    case 0x70:                              /* pshufw */
+        s = mm_src(c, b);
+        r = s;
+        for (i = 0; i < 4; i++) xh_s(&r, i, xh(&s, (int)((b->imm >> (2 * i)) & 3)));
+        mm_set(c, b->reg, &r);
+        return RUN_OK;
+    case 0x71: case 0x72: case 0x73: {      /* shifts by an immediate, destination r/m */
+        Xmm z = mm_get(c, b->rm);
+        if (b->mem || (o == 0x73 && b->reg != 2 && b->reg != 6) || (o != 0x73 && b->reg != 2 && b->reg != 4 && b->reg != 6))
+            return RUN_UNKNOWN;
+        int_shift(&z, b->reg == 6 ? 0 : b->reg == 2 ? 1 : 2, o == 0x71 ? 2 : o == 0x72 ? 4 : 8, b->imm & 0xff);
+        mm_set(c, b->rm, &z);
+        return RUN_OK;
+    }
+    case 0xd1: case 0xd2: case 0xd3: case 0xe1: case 0xe2: case 0xf1: case 0xf2: case 0xf3:
+        s = mm_src(c, b);
+        int_shift(&d, o >= 0xf1 ? 0 : o >= 0xe1 ? 2 : 1, (o & 3) == 1 ? 2 : (o & 3) == 2 ? 4 : 8, xq(&s, 0));
+        mm_set(c, b->reg, &d);
+        return RUN_OK;
+    case 0xd7: {                            /* pmovmskb r32, mm */
+        uint32_t m = 0;
+        for (i = 0; i < 8; i++) m |= (uint32_t)(c->mm[b->rm][i] >> 7) << i;
+        c->r[b->reg] = m;
+        return RUN_OK;
+    }
+    case 0xc4:                              /* pinsrw mm, r32/m16, imm */
+        xh_s(&d, (int)(b->imm & 3), b->mem ? ld16(op_addr(c, b)) : c->r[b->rm] & 0xffff);
+        mm_set(c, b->reg, &d);
+        return RUN_OK;
+    case 0xc5:                              /* pextrw r32, mm, imm */
+        s = mm_get(c, b->rm);
+        c->r[b->reg] = xh(&s, (int)(b->imm & 3));
+        return RUN_OK;
+    case 0xf7:                              /* maskmovq: bytes of mm (reg) whose mask byte (rm) has bit 7, to [edi] */
+        for (i = 0; i < 8; i++) if (c->mm[b->rm][i] & 0x80) st8(c->r[EDI] + (uint32_t)i, c->mm[b->reg][i]);
+        return RUN_OK;
+    case 0x68: case 0x69: case 0x6a: {      /* punpckhbw/wd/dq: the low form on the high halves */
+        Xmm dh, sh;
+        s = mm_src(c, b);
+        memset(&dh, 0, sizeof dh); memset(&sh, 0, sizeof sh);
+        memcpy(dh.b, d.b + 4, 4); memcpy(sh.b, s.b + 4, 4);
+        int_binary(&dh, &sh, o - 8);
+        mm_set(c, b->reg, &dh);
+        return RUN_OK;
+    }
+    case 0x63: case 0x67: case 0x6b:        /* packsswb, packuswb, packssdw: d's elements low, s's high */
+        s = mm_src(c, b);
+        memset(&r, 0, sizeof r);
+        if (o == 0x6b)
+            for (i = 0; i < 2; i++) {
+                xh_s(&r, i, (uint32_t)sat16((int32_t)xw(&d, i)));
+                xh_s(&r, 2 + i, (uint32_t)sat16((int32_t)xw(&s, i)));
+            }
+        else
+            for (i = 0; i < 4; i++) {
+                r.b[i] = (uint8_t)(o == 0x63 ? (uint32_t)sat8((int16_t)xh(&d, i)) : usat8((int16_t)xh(&d, i)));
+                r.b[4 + i] = (uint8_t)(o == 0x63 ? (uint32_t)sat8((int16_t)xh(&s, i)) : usat8((int16_t)xh(&s, i)));
+            }
+        mm_set(c, b->reg, &r);
+        return RUN_OK;
+    case 0x60: case 0x61: case 0x62: case 0x64: case 0x65: case 0x66: case 0x74: case 0x75: case 0x76:
+    case 0xd4: case 0xd5: case 0xd8: case 0xd9: case 0xda: case 0xdb: case 0xdc: case 0xdd: case 0xde: case 0xdf:
+    case 0xe0: case 0xe3: case 0xe4: case 0xe5: case 0xe8: case 0xe9: case 0xea: case 0xeb: case 0xec: case 0xed:
+    case 0xee: case 0xef: case 0xf4: case 0xf5: case 0xf6: case 0xf8: case 0xf9: case 0xfa: case 0xfb: case 0xfc:
+    case 0xfd: case 0xfe:
+        s = mm_src(c, b);
+        int_binary(&d, &s, o);
+        mm_set(c, b->reg, &d);
+        return RUN_OK;
+    }
+    return RUN_UNKNOWN;
+}
+
 int sse_step(Cpu *c, const Insn *b)
 {
     int o = b->op & 0xff, p = b->rep == 0xf3 ? P_F3 : b->rep == 0xf2 ? P_F2 : b->p66 ? P_66 : P_NO, i;
@@ -212,9 +322,32 @@ int sse_step(Cpu *c, const Insn *b)
         st32(op_addr(c, b), c->r[b->reg]);
         return RUN_OK;
     }
-    /* MMX (without prefix) is not supported: integer instructions 60-7F, D0-FF without 66 */
-    if (p == P_NO && ((o >= 0x60 && o <= 0x7f && o != 0x77) || o >= 0xd0)) return RUN_UNKNOWN;
+    /* MMX: integer instructions 60-7F, C4, C5, D0-FF without prefix */
+    if (p == P_NO && ((o >= 0x60 && o <= 0x7f && o != 0x77) || o >= 0xd0 || o == 0xc4 || o == 0xc5)) return mmx_step(c, b, o);
     if (o == 0x77) return RUN_OK;          /* emms */
+    if (o == 0xd6 && p == P_F2 && !b->mem) { memcpy(c->mm[b->reg], c->xmm[b->rm].b, 8); return RUN_OK; }     /* movdq2q */
+    if (o == 0xd6 && p == P_F3 && !b->mem) {                                                                   /* movq2dq */
+        memset(d, 0, sizeof *d);
+        memcpy(d->b, c->mm[b->rm], 8);
+        return RUN_OK;
+    }
+    if (o == 0x2a && (p == P_NO || p == P_66)) {        /* cvtpi2ps, cvtpi2pd xmm, mm/m64 */
+        Xmm q = mm_src(c, b);
+        if (p == P_NO) { xf_s(d, 0, (float)(int32_t)xw(&q, 0)); xf_s(d, 1, (float)(int32_t)xw(&q, 1)); }
+        else { double x0 = (int32_t)xw(&q, 0), x1 = (int32_t)xw(&q, 1); xd_s(d, 0, x0); xd_s(d, 1, x1); }
+        return RUN_OK;
+    }
+    if ((o == 0x2c || o == 0x2d) && (p == P_NO || p == P_66)) {      /* cvt(t)ps2pi, cvt(t)pd2pi mm, xmm/m */
+        Xmm q;
+        s = src(c, b, p == P_NO ? 8 : 16);
+        memset(&q, 0, sizeof q);
+        for (i = 0; i < 2; i++) {
+            double v = p == P_NO ? xf(&s, i) : xd(&s, i);
+            xw_s(&q, i, (uint32_t)(o == 0x2c ? truncate_d(v) : round_mxcsr(c, v)));
+        }
+        mm_set(c, b->reg, &q);
+        return RUN_OK;
+    }
 
     switch (o) {
     case 0x10: case 0x11: {                 /* movups/movupd/movss/movsd */

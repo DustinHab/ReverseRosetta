@@ -27,7 +27,7 @@ for l in /usr/lib/*.dylib /usr/lib/system/*.dylib; do
 done
 echo "$n system libraries copied into the root as i386"
 # all libraries (MH_DYLIB, i386 = header ce fa ed fe, type 6) of the root
-find "$W" -type f > /tmp/ir_all.txt
+find "$W/" -type f > /tmp/ir_all.txt     # (the slash: intel/root may be a symbolic link)
 : > /tmp/ir_dylibs.txt
 while read -r f; do
   k=$(head -c 16 "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n')

@@ -22,6 +22,7 @@
 #include <dirent.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
+#include <aio.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/mman.h>
@@ -1647,6 +1648,87 @@ static uint32_t no_nocancel(uint32_t n)
 
 static void sys_bsd_call(Cpu *c, int sysenter);
 
+/* ---------- POSIX asynchronous I/O (313-320; QuickTime reads movie data with it) ----------
+ * Done synchronously: aio_read/aio_write transfer at once and keep the result per control block (guest address)
+ * until aio_return; aio_error reports it, aio_suspend returns at once, aio_cancel finds everything done. The guest's
+ * aiocb (same layout on i386 and PowerPC): fildes @0, offset @4 (64 bit), buf @12, nbytes @16, reqprio @20, sigevent
+ * @24 (notify @24, signo @28), lio_opcode @44. A requested completion signal is raised at once. */
+#define AIO_N 256
+static struct { uint32_t cb; int32_t ret; int err; } g_aio[AIO_N];
+
+static int aio_slot(uint32_t cb, int create)
+{
+    int k, free_k = -1;
+    for (k = 0; k < AIO_N; k++) {
+        if (g_aio[k].cb == cb) return k;
+        if (!g_aio[k].cb && free_k < 0) free_k = k;
+    }
+    if (!create || free_k < 0) return -1;
+    g_aio[free_k].cb = cb;
+    return free_k;
+}
+
+/* one transfer; returns the error of the call itself (0: queued, that is done) */
+static int aio_do(uint32_t cb, int write)
+{
+    int k = aio_slot(cb, 1);
+    ssize_t r;
+    void *buf = (void *)(uintptr_t)ld32(cb + 12);
+    if (k < 0) return EAGAIN;
+    errno = 0;
+    r = write ? pwrite((int)ld32(cb), buf, ld32(cb + 16), (off_t)ld64(cb + 4))
+              : pread((int)ld32(cb), buf, ld32(cb + 16), (off_t)ld64(cb + 4));
+    g_aio[k].ret = (int32_t)r;
+    g_aio[k].err = r < 0 ? errno : 0;
+    if (ld32(cb + 24) == SIGEV_SIGNAL && ld32(cb + 28)) kill(getpid(), (int)ld32(cb + 28));
+    return 0;
+}
+
+static void sys_aio(Cpu *c, uint32_t n)
+{
+    uint32_t cb = n == 313 ? arg(1) : n == 316 ? arg(1) : arg(0);
+    int k;
+    switch (n) {
+    case 318: case 319:                     /* aio_read, aio_write */
+        set_result(c, 0, cb ? aio_do(cb, n == 319) : EINVAL);
+        return;
+    case 313:                               /* aio_fsync(op, cb) */
+        if (!cb || (k = aio_slot(cb, 1)) < 0) { set_result(c, 0, cb ? EAGAIN : EINVAL); return; }
+        g_aio[k].ret = fsync((int)ld32(cb));
+        g_aio[k].err = g_aio[k].ret < 0 ? errno : 0;
+        set_result(c, 0, 0);
+        return;
+    case 317:                               /* aio_error: the error of the finished transfer as the result */
+        if ((k = aio_slot(cb, 0)) < 0) { set_result(c, 0, EINVAL); return; }
+        set_result(c, (uint32_t)g_aio[k].err, 0);
+        return;
+    case 314:                               /* aio_return: the result, once */
+        if ((k = aio_slot(cb, 0)) < 0) { set_result(c, 0, EINVAL); return; }
+        g_aio[k].cb = 0;
+        if (g_aio[k].err) set_result(c, 0, g_aio[k].err); else set_result(c, (uint32_t)g_aio[k].ret, 0);
+        return;
+    case 315:                               /* aio_suspend: everything is done already */
+        set_result(c, 0, 0);
+        return;
+    case 316:                               /* aio_cancel(fd, cb) */
+        set_result(c, AIO_ALLDONE, 0);
+        return;
+    case 320: {                             /* lio_listio(mode, list, nent, sigevent) */
+        uint32_t list = arg(1), i, nent = arg(2), sig = arg(3);
+        int e = 0;
+        for (i = 0; i < nent && list; i++) {
+            uint32_t p = ld32(list + 4 * i), op;
+            if (!p) continue;
+            op = ld32(p + 44);
+            if ((op == LIO_READ || op == LIO_WRITE) && aio_do(p, op == LIO_WRITE)) e = EAGAIN;
+        }
+        if (arg(0) == LIO_NOWAIT && sig && ld32(sig) == SIGEV_SIGNAL && ld32(sig + 4)) kill(getpid(), (int)ld32(sig + 4));
+        set_result(c, 0, e);
+        return;
+    }
+    }
+}
+
 /* int $0x80 is timed here, sysenter in sys_sysenter (ROSETTA_STATS) */
 void sys_bsd(Cpu *c, int sysenter)
 {
@@ -1730,6 +1812,7 @@ static void sys_bsd_call(Cpu *c, int sysenter)
         return;
     }
     case SYS_pread: HOST(pread((int)arg(0), PTR_ARG(1), arg(2), (off_t)arg64(3))); return;
+    case 313 ... 320: sys_aio(c, n); return;  /* asynchronous I/O (synchronously) */
     case SYS_pwrite: HOST(pwrite((int)arg(0), PTR_ARG(1), arg(2), (off_t)arg64(3))); return;
     case SYS_lseek: {
         off_t r = lseek((int)arg(0), (off_t)arg64(1), (int)arg(3));
