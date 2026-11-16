@@ -536,6 +536,11 @@ page). Running measurement series: `tests/measure_all.sh`.
 - Bug fixed: a translation cache named by `ROSETTA_CACHE_FILE` was taken for any program as long as the program that
   wrote it was unchanged on disk (gzip ran openssl's blocks at the same addresses and crashed); the saved program must
   now be the running one (inode and size).
+- `ROSETTA_STATS=1` no longer asks task_info for page faults around every translation (twice per block, ~50 us each:
+  Calculator's second start, which translates 36,000 blocks, looked 2.2 times slower than it is); `ROSETTA_STATS=2`
+  does. The translation cache is written straight from the code region (blocks outside the images get their exit
+  word patched in the file afterwards with pwrite; a 14 MB copy before). A guest mmap/mprotect drops only the cached
+  page-protection regions that overlap it, not all of them (Calculator: 125 vm_region calls at startup, now 36).
 - *Conditions from stored flags* without a C helper, when the flag kind at run time is cmp/sub or logic (32 bit)
   (qsort: `jge` on a `jne`; bench_control_flow +9 %).
 - Bug fixed: `writes_reg` reported no written register for `mul/imul/div/idiv` (f6/f7 /4-7) and `not/neg r/m8`

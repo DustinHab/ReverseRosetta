@@ -138,7 +138,8 @@ static uint8_t write_mask(const Insn *b);
 static int mem_access(const Insn *b, int *sz, int *reads, int *writes);
 static int is_push(const Insn *b);
 static int (*g_step_fn)(Cpu *) = step;
-static int g_vt_on;
+static int g_vt_on;                   /* ROSETTA_STATS: translation time; =2 also its page faults (task_info twice per
+                                         block, ~50 us each: it made the second start of Calculator look 2.2 times slower) */
 static int g_align = 32;           /* align loop heads (ROSETTA_ALIGN=0/16/32) */
 static Cpu *g_cpu;                      /* guest state at translation (= at the first entry into the block) */
 static Cpu *g_fcpu[256];                /* Cpus of all threads (a flush resets their return rings) */
@@ -701,10 +702,12 @@ static int pages_hit(uint32_t a, uint32_t len) { return pages_hit_in(g_codepages
 static int g_cache_show;
 static void jit_range_changed(uint32_t a, uint32_t len, const char *why);
 
+static void ranges_forget(uint32_t a, uint32_t len);
+
 /* guest remapped [a, a + len) or changed its protection */
 void jit_flush_schedule(uint32_t a, uint32_t len)
 {
-    g_ranges_old = 1;                 /* always rebuild the region cache of page protections */
+    ranges_forget(a, len);              /* the region cache of page protections */
     memset(g_need_eip, 0, sizeof g_need_eip);     /* remembered results depended on page protection */
     memset(g_el_eip, 0, sizeof g_el_eip);
     if (g_no_pageexact || pages_hit(a, len)) jit_range_changed(a, len, "mapping/protection");
@@ -758,7 +761,7 @@ static int jit_create(void)
     g_no_fusion = getenv("ROSETTA_NO_FUSION") != 0;
     g_no_slots = getenv("ROSETTA_NO_SLOTS") != 0;
     g_poison = getenv("ROSETTA_POISON") != 0;   /* merged floating-point compares poison the flags in memory */
-    if (getenv("ROSETTA_STATS")) { g_step_fn = step_counted; g_vt_on = 1; }
+    if (getenv("ROSETTA_STATS")) { g_step_fn = step_counted; g_vt_on = atoi(getenv("ROSETTA_STATS")) > 1 ? 2 : 1; }
     if (getenv("ROSETTA_ALIGN")) g_align = atoi(getenv("ROSETTA_ALIGN"));
     g_no_pic = getenv("ROSETTA_NO_PIC") != 0;
     g_no_const = getenv("ROSETTA_NO_CONST") != 0;
@@ -922,6 +925,19 @@ static int page_prot(uint32_t a)
     g_range[i].prot = info.protection;
     latest = i;
     return info.protection;
+}
+
+/* [a, a + len) remapped or protected anew: cached regions that overlap it are dropped; the others keep their
+   protection (an mmap can merge them with the new range, but does not change their pages). Dropping all of them at
+   every guest mmap made the translator ask vm_region again and again at startup (8 % of Calculator's first start) */
+static void ranges_forget(uint32_t a, uint32_t len)
+{
+    int i;
+    uint32_t e = a + len;
+    if (!len) return;
+    if (e < a) { g_ranges_old = 1; return; }
+    for (i = 0; i < RANGES; i++)
+        if (g_range[i].start < e && a < g_range[i].end) g_range[i].start = g_range[i].end = 0;
 }
 
 static int page_readonly(uint32_t a)
@@ -7005,14 +7021,14 @@ static uint32_t *translate(uint32_t eip)
     int f0;
     if (!g_vt_on || g_trans_depth) return translate_block(eip);
     g_trans_depth++;
-    f0 = jit_pagefault();
+    f0 = g_vt_on > 1 ? jit_pagefault() : 0;
     t0 = mach_absolute_time();
     r = translate_block(eip);
     if (g_cache_show > 1)
         fprintf(stderr, "rosetta: new %08x kind %u bytes %02x %02x %02x %s\n", eip, g_cpu ? g_cpu->jit_kind : 0, ld8(eip),
                 ld8(eip + 1), ld8(eip + 2), page_writable(eip) ? "writable" : "fixed");
     g_trans_time += mach_absolute_time() - t0;
-    g_trans_error += jit_pagefault() - f0;
+    if (g_vt_on > 1) g_trans_error += jit_pagefault() - f0;
     g_trans_depth--;
     return r;
 }
@@ -8552,23 +8568,21 @@ static void cache_write(void)
             size_t front = sizeof k + sizeof *b * k.nimages + 4 * (size_t)(s - t);
             static const char null[4096];
             k.codeoffset = (uint32_t)((front + 4095) & ~(size_t)4095);
-            uint32_t *code = (uint32_t *)(void *)g_cache_start;
             size_t len = k.code - k.prolog;
-            if (nforeign && (code = malloc(len)) != 0) {   /* copy: blocks outside the images start with the exit */
-                memcpy(code, g_cache_start, len);
-                for (i = 0, n = 0; i < g_nused; i++)
-                    if (foreign[i]) {
-                        uint32_t *at = g_map[g_inuse[i]].code;
-                        code[at - g_cache_start] = B_((uint32_t)(uintptr_t)stub[n] - (uint32_t)(uintptr_t)at);
-                        n++;
-                    }
-            }
-            ok = code && write(fd, &k, sizeof k) == (ssize_t)sizeof k &&
+            ok = write(fd, &k, sizeof k) == (ssize_t)sizeof k &&
                  write(fd, b, sizeof *b * k.nimages) == (ssize_t)(sizeof *b * k.nimages) &&
                  write(fd, t, 4 * (size_t)(s - t)) == (ssize_t)(4 * (size_t)(s - t)) &&
                  (k.codeoffset == front || write(fd, null, k.codeoffset - front) == (ssize_t)(k.codeoffset - front)) &&
-                 write(fd, code, len) == (ssize_t)len;
-            if (code && code != (uint32_t *)(void *)g_cache_start) free(code);
+                 write(fd, g_cache_start, len) == (ssize_t)len;
+            /* blocks outside the images start with the exit in the file: the word patched there afterwards (a copy of
+               the whole code for these few words cost 14 MB of memcpy and fresh pages at each of Calculator's writes) */
+            for (i = 0, n = 0; ok && i < g_nused; i++)
+                if (foreign[i]) {
+                    uint32_t *at = g_map[g_inuse[i]].code;
+                    uint32_t w = B_((uint32_t)(uintptr_t)stub[n] - (uint32_t)(uintptr_t)at);
+                    ok = pwrite(fd, &w, 4, (off_t)k.codeoffset + 4 * (off_t)(at - g_cache_start)) == 4;
+                    n++;
+                }
         }
     }
     if (close(fd) == 0 && ok) rename(tmp, g_cache_path); else unlink(tmp);
