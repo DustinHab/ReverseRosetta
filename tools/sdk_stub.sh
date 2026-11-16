@@ -4,7 +4,8 @@
 # (DictionaryServices, Help, ImageKit ...): umbrellas can then re-export them (intel_umbrellas.sh) and programs that
 # take a symbol from the umbrella load. Functions report "missing" on their first call and return an error code
 # (Get/Is/Has/Release...: 0), data symbols become CFStrings with their name (notification names and keys), Objective-C
-# class symbols are absolute 0, as in intel_stubs.sh. An existing library that is not a stub library stays.
+# class symbols are absolute 0, as in intel_stubs.sh. An existing library that is not a stub library stays; an existing
+# stub library keeps the symbols it had (private ones that programs imported) besides those of the SDK.
 R=$(cd "$(dirname "$0")/.." && pwd)
 W=${ROSETTA_INTEL:-$R/intel/root}
 SDK=/Developer/SDKs/MacOSX10.5.sdk
@@ -19,7 +20,22 @@ for m in "$@"; do
     nm -arch i386 -g "$S" 2>/dev/null | awk '
         $2 == "T" && $3 ~ /^_[A-Za-z0-9_]+$/ { print "lazy", $3 }
         ($2 == "D" || $2 == "S") && $3 ~ /^_[A-Za-z0-9_]+$/ { print "nonlazy", $3 }
-        $2 == "A" && $3 ~ /^\.objc_class_name_/ { print "class", $3 }' | sort -u > /tmp/ss_sym.txt
+        $2 == "A" && $3 ~ /^\.objc_class_name_/ { print "class", $3 }' > /tmp/ss_sym0.txt
+    if [ -f "$W$m" ]; then              # symbols of the existing stub library
+        nm -arch i386 -g "$W$m" 2>/dev/null | awk '
+            $2 == "T" && $3 ~ /^_[A-Za-z0-9_]+$/ { print "lazy", $3 }
+            ($2 == "D" || $2 == "S") && $3 ~ /^_[A-Za-z0-9_]+$/ { print "nonlazy", $3 }
+            $2 == "A" && $3 ~ /^\.objc_class_name_/ { print "class", $3 }' >> /tmp/ss_sym0.txt
+    fi
+    # one kind per symbol (a data symbol of the SDK wins over a function of an older stub)
+    sort -u /tmp/ss_sym0.txt | awk '{ k[$2] = (k[$2] == "nonlazy" || $1 == "nonlazy") ? "nonlazy" : (k[$2] == "class" || $1 == "class") ? "class" : $1 }
+        END { for (s in k) print k[s], s }' | sort > /tmp/ss_sym.txt
+    case "$m" in                         # error code of the framework (as intel_stubs.sh)
+        *CoreVideo*) E=-6660 ;;
+        *SpeechRecognition*) E=-5100 ;;
+        *CarbonSound*) E=-201 ;;
+        *) E=-1 ;;
+    esac
     {
         echo "/* stub library for $m (sdk_stub.sh: every symbol of the SDK's stub) */"
         echo '#include <stdio.h>'
@@ -31,7 +47,7 @@ for m in "$@"; do
             case "$kind" in
             class) printf '%s\n' "asm(\".globl $sym\\n$sym = 0\");" ;;
             nonlazy) echo "const CFStringRef $c = CFSTR(\"$c\");" ;;
-            *)  case "$c" in *Get*|*Is*|*Has*|*Release*|*Visible*|*Busy*|*Notification*) r=0 ;; *) r=-1 ;; esac
+            *)  case "$c" in *Get*|*Is*|*Has*|*Release*|*Visible*|*Busy*|*Notification*) r=0 ;; *) r=$E ;; esac
                 echo "long $c(void) { static int m; if (!m++) report_missing(\"$c\"); return $r; }" ;;
             esac
         done < /tmp/ss_sym.txt

@@ -44,6 +44,8 @@ extern void (*g_checkpoint_fn)(void);
    watchdog again if it was running (not for a child that only execs) */
 void thread_after_fork(Cpu *c, int watchdog_again);
 
+/* guest thread run by the host thread with this kernel port (0: none): thread_get_state answers from its Cpu */
+Cpu *thread_by_port(uint32_t port);
 /* statistics (ROSETTA_STATS) */
 void thread_stats(void);
 

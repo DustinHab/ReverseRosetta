@@ -22,6 +22,7 @@ void sys_set_args(int argc, char **argv, const char *path);
 
 /* address range of dyld (main.c): system calls from there are the loader's (Intel library redirection) */
 extern uint32_t g_dyld_from, g_dyld_to;
+extern uint32_t g_stack_top;               /* top of the guest's main thread stack (main.c): KERN_USRSTACK */
 
 /* signals to the guest: pending (from the host handler or kill to itself) and mask of the guest; the dispatcher
    calls sig_deliver when (g_sig_pending & ~g_sig_mask) != 0 */

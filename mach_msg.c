@@ -500,6 +500,50 @@ static uint32_t efi_query(uint8_t *m, uint32_t size)
     return h->msgh_size;
 }
 
+/* thread_get_state (MIG 3603) for a guest thread: the kernel knows only the PowerPC state of the host thread (flavor
+   1 is PPC_THREAD_STATE there, 40 words), so a garbage collector that suspends the other threads and scans their
+   registers and stacks (libauto: Objective-C 2.0 garbage collection in Xcode, Property List Editor ...) stopped with
+   a fatal error. Answered here from the thread's Cpu: a thread that does not hold the lock waits where its registers
+   are stored. Flavors x86_THREAD_STATE32 (1, 16 words) and x86_THREAD_STATE (7, with flavor and count first).
+   Request (guest order body): NDR @24, flavor @32, count @36. Reply (header in host order, body in guest order):
+   NDR, RetCode @32, count @36, state from @40; id 3703. Returns the size of the reply in g_buffer, 0 if not ours. */
+#define THREAD_GET_STATE 3603
+static uint32_t thread_state_reply(uint8_t *m, uint32_t size)
+{
+    mach_msg_header_t *h = (mach_msg_header_t *)m;
+    uint32_t flavor, cnt, w[18], n, i, k = 0;
+    Cpu *t;
+    if (size < 40 || h->msgh_id != THREAD_GET_STATE || !(t = thread_by_port(h->msgh_remote_port))) return 0;
+    flavor = swap32(*(uint32_t *)(m + 32));
+    cnt = swap32(*(uint32_t *)(m + 36));
+    if (flavor != 1 && flavor != 7) return 0;           /* other flavors: the kernel (and its answer) as before */
+    n = flavor == 1 ? 16 : 18;
+    if (flavor == 7) { w[k++] = 1; w[k++] = 16; }
+    w[k++] = t->r[EAX]; w[k++] = t->r[EBX]; w[k++] = t->r[ECX]; w[k++] = t->r[EDX];
+    w[k++] = t->r[EDI]; w[k++] = t->r[ESI]; w[k++] = t->r[EBP]; w[k++] = t->r[ESP];
+    w[k++] = 0x1f;                                      /* ss */
+    w[k++] = flags_fetch(t);
+    w[k++] = t->eip;
+    w[k++] = 0x17; w[k++] = 0x1f; w[k++] = 0x1f; w[k++] = 0x1f; w[k++] = 0x37;   /* cs ds es fs gs as on Intel Leopard */
+    h->msgh_bits = MACH_MSGH_BITS(0, MACH_MSG_TYPE_PORT_SEND_ONCE);
+    h->msgh_remote_port = MACH_PORT_NULL;
+    h->msgh_id = THREAD_GET_STATE + 100;
+    if (cnt < n) {                                      /* as the kernel: the buffer is too small */
+        *(uint32_t *)(m + 32) = swap32(KERN_INVALID_ARGUMENT);
+        *(uint32_t *)(m + 36) = 0;
+        n = 0;
+    } else {
+        *(uint32_t *)(m + 32) = 0;
+        *(uint32_t *)(m + 36) = swap32(n);
+        for (i = 0; i < n; i++) *(uint32_t *)(m + 40 + 4 * i) = swap32(w[i]);
+    }
+    h->msgh_size = 40 + 4 * n;
+    *(uint32_t *)(m + h->msgh_size) = MACH_MSG_TRAILER_FORMAT_0;   /* trailer: type and size, host order */
+    *(uint32_t *)(m + h->msgh_size + 4) = sizeof(mach_msg_trailer_t);
+    if (g_log) fprintf(stderr, "[mach] thread_get_state of guest thread %x answered (flavor %u)\n", t->mach_thread, flavor);
+    return h->msgh_size;
+}
+
 /* ROSETTA_STATS: per message id sent (receive only: id 0) count, time in mach_msg (kernel and the server's answer)
    and time converting; shown at the first idle moment (mach_msg_stats) */
 #define MSG_STATS 256
@@ -565,7 +609,7 @@ static mach_msg_return_t guest_mach_msg_call(Cpu *c, uint32_t msg, mach_msg_opti
     uint8_t *g_buffer;
     size_t g_buffer_size;
     int ats_search = 0, ats_query = 0, basic_info = 0;
-    uint32_t ats_type = 0;
+    uint32_t ats_type = 0, own = 0;
     AtsCopy ats_copy = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     if (need > c->msg_size) {
         free(c->msg);
@@ -588,7 +632,9 @@ static mach_msg_return_t guest_mach_msg_call(Cpu *c, uint32_t msg, mach_msg_opti
         basic_info = send_size >= 40 && ((mach_msg_header_t *)g_buffer)->msgh_id == HOST_INFO_ID &&
                      swap32(*(uint32_t *)(g_buffer + 32)) == HOST_BASIC_INFO;    /* flavor, still in guest order */
         send_size = efi_query(g_buffer, send_size);
+        own = thread_state_reply(g_buffer, send_size);
     }
+    if (own) { r = MACH_MSG_SUCCESS; goto received; }    /* answered here (thread_get_state of a guest thread) */
     {
         /* Wait interruptibly: otherwise the libSystem wrapper of the host silently restarts an interrupted send/receive,
            and a guest signal (SIGTERM to a Cocoa program in the event loop) would never arrive. Without a pending
@@ -624,6 +670,7 @@ static mach_msg_return_t guest_mach_msg_call(Cpu *c, uint32_t msg, mach_msg_opti
             !(option & (r == MACH_SEND_INTERRUPTED ? MACH_SEND_INTERRUPT : MACH_RCV_INTERRUPT)))
             jit_interrupt();
     }
+received:
     if ((r == MACH_SEND_INTERRUPTED || r == MACH_RCV_INTERRUPTED) && getenv("ROSETTA_HPROFILE"))
         fprintf(stderr, "rosetta: mach_msg interrupted (%x)\n", r);
     if ((option & MACH_RCV_MSG) && (r == MACH_MSG_SUCCESS || r == MACH_RCV_TOO_LARGE)) {

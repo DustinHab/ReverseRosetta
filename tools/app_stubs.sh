@@ -1,8 +1,19 @@
 #!/bin/sh
-# app_stubs.sh NAME - missing i386 libraries of an assembled program (including plug-ins
-# and embedded frameworks) as stub libraries in the Intel root (intel_stubs.sh)
+# app_stubs.sh APP... - stub libraries for application bundles that stay where they are installed (universal
+# programs in /Applications run their i386 part through rosetta): as install_app.sh does for intel/apps, the
+# libraries that the i386 executables of the bundle need and that are missing as i386 get stub libraries, and existing
+# stub libraries get the symbols these programs import (private frameworks such as GraphKit are not in the SDK, so
+# sdk_stubs_all.sh cannot complete them).
 R=$(cd "$(dirname "$0")/.." && pwd)
-Z=$R/intel/apps/$1.app
-L=$(find "$Z/Contents" -type f -perm -u+x 2>/dev/null | while read f; do lipo -info "$f" 2>/dev/null | grep -q i386 && echo "$f"; done)
-echo "$(echo "$L" | wc -l | tr -d ' ') executable images with i386"
-sh "$(dirname "$0")/intel_stubs.sh" $L
+for A in "$@"; do
+    A=${A%/}
+    echo "== $(basename "$A" .app)"
+    find "$A/Contents" -type f -perm -u+x 2>/dev/null | while read -r f; do
+        lipo -info "$f" 2>/dev/null | grep -q i386 && echo "$f"
+    done > /tmp/app_stubs_paths.txt
+    [ -s /tmp/app_stubs_paths.txt ] || { echo "no i386 executables"; continue; }
+    IFS='
+'
+    STUBS_REBUILD=1 sh "$R/tools/intel_stubs.sh" $(cat /tmp/app_stubs_paths.txt) 2>&1 | tail -6
+    unset IFS
+done

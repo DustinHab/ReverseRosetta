@@ -649,6 +649,18 @@ static void t_sysctl(void)
     }
 }
 
+/* the main thread's stack as pthread reports it (from sysctl KERN_USRSTACK): conservative garbage collectors scan from
+   the stack pointer up to its top (JavaScriptCore) */
+static void t_stack(void)
+{
+    char here;
+    char *top = pthread_get_stackaddr_np(pthread_self());
+    size_t size = pthread_get_stacksize_np(pthread_self());
+    long d = top - &here;
+    printf("main stack: top above the stack pointer %s, within the stack size %s\n", d > 0 ? "yes" : "no",
+           d > 0 && (size_t)d < size ? "yes" : "no");
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, 0, _IONBF, 0);
@@ -667,5 +679,6 @@ int main(int argc, char **argv)
     t_sysctl();
     t_thread_signals();
     t_process();
+    t_stack();
     return 0;
 }

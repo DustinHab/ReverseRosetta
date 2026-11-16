@@ -812,6 +812,16 @@ static void sys_sysctl(Cpu *c)
         set_result(c, 0, 0);
         return;
     }
+    if (n == 2 && name[0] == CTL_KERN && (name[1] == 35 || name[1] == 59)) {
+        /* KERN_USRSTACK32/64: the top of the main thread's stack, where libSystem's pthread_get_stackaddr_np has it
+           from. The kernel knows rosetta's stack only; garbage collectors that scan the stack up to there
+           (JavaScriptCore) ran past the guest's stack into unmapped memory */
+        uint32_t sz = name[1] == 35 ? 4 : 8;
+        if (prev) { if (l < sz) { set_result(c, 0, ENOMEM); return; } st32(prev, g_stack_top); if (sz == 8) st32(prev + 4, 0); }
+        if (oldlen) st32(oldlen, sz);
+        set_result(c, 0, fresh ? EPERM : 0);
+        return;
+    }
     if (n == 3 && name[0] == CTL_KERN && name[1] == KERN_PROCARGS2 && name[2] == getpid() && g_args_path) {
         uint32_t need = procargs2_own(prev, (uint32_t)l);
         if (prev && need > l) { set_result(c, 0, ENOMEM); return; }
@@ -2445,6 +2455,25 @@ static void sys_bsd_call(Cpu *c, int sysenter)
         return;
     }
     case 285: HOST(syscall(285, arg(0), arg(1))); return;      /* settid(uid, gid) */
+    case 284: {                             /* access_extended(entries, size, results, uid): NSFileManager */
+        /* entries: struct accessx_descriptor { name offset, flags, pad[2] } (32-bit words) up to the first name,
+           then the names; results: one int per descriptor */
+        uint32_t size = arg(1), i, n, first;
+        uint8_t *b;
+        if (size < 16 || size > (1u << 16)) { set_result(c, 0, EINVAL); return; }
+        first = ld32(arg(0));
+        n = first / 16;
+        if (!n || first > size) { set_result(c, 0, EINVAL); return; }
+        b = malloc(size);
+        if (!b) { set_result(c, 0, ENOMEM); return; }
+        memcpy(b, PTR_ARG(0), size);
+        for (i = 0; i < 4 * n; i++) ((uint32_t *)b)[i] = ld32(arg(0) + 4 * i);
+        if (syscall(284, b, size, PTR_ARG(2), arg(3)) < 0) { set_result(c, 0, errno); free(b); return; }
+        for (i = 0; i < n; i++) st32(arg(2) + 4 * i, ((uint32_t *)PTR_ARG(2))[i]);
+        free(b);
+        set_result(c, 0, 0);
+        return;
+    }
     case SYS_getpriority: {                 /* -1 is a valid priority */
         int r;
         errno = 0;

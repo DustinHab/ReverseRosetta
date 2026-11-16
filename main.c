@@ -33,6 +33,7 @@
 extern char **environ;
 
 #define STACK_SIZE (8u << 20)
+uint32_t g_stack_top;
 #define DYLD_TARGET 0x0fe00000u           /* the i386 dyld wants to go to 0x8fe00000, the host's dyld is there */
 
 static uint32_t chain_put(uint32_t *top, const char *s)
@@ -50,6 +51,7 @@ static uint32_t stack_build(int argc, char **argv, const char *path, uint32_t mh
     uint32_t *argvp, *envp, apple;
     if (s == MAP_FAILED) { perror("rosetta: stack"); exit(1); }
     top = (uint32_t)(uintptr_t)s + STACK_SIZE;
+    g_stack_top = top;                      /* libSystem asks for it (sysctl KERN_USRSTACK): the main thread's stack */
     while (environ[nenv]) nenv++;
     argvp = calloc((size_t)argc + 1, 4);
     envp = calloc(nenv + 1, 4);

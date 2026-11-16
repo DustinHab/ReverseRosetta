@@ -48,8 +48,31 @@ static int g_only_interp;
 static unsigned long g_st_created, g_st_finished, g_st_yielded, g_st_free;
 static uint64_t g_st_wait, g_st_empty, g_empty_since;   /* time: waited for the lock; lock free and nobody waiting */
 
+/* guest threads by the port of their host thread (thread_get_state of another thread: libauto's collector) */
+#define PORTS_N 1024
+static Cpu *g_port_cpu[PORTS_N];
+static void port_note(Cpu *c)
+{
+    int k;
+    for (k = 0; k < PORTS_N; k++) if (!g_port_cpu[k]) { g_port_cpu[k] = c; return; }
+}
+static void port_forget(Cpu *c)
+{
+    int k;
+    for (k = 0; k < PORTS_N; k++) if (g_port_cpu[k] == c) g_port_cpu[k] = 0;
+}
+Cpu *thread_by_port(uint32_t port)
+{
+    int k;
+    if (!port) return 0;
+    for (k = 0; k < PORTS_N; k++) if (g_port_cpu[k] && g_port_cpu[k]->mach_thread == port) return g_port_cpu[k];
+    return 0;
+}
+
 void thread_start(Cpu *main_cpu, int only_interp)
 {
+    main_cpu->mach_thread = mach_thread_self();
+    port_note(main_cpu);
     mach_timebase_info_data_t tb;
     mach_timebase_info(&tb);
     g_slice = (uint64_t)SLICE_US * 1000 * tb.denom / tb.numer;
@@ -227,6 +250,7 @@ static void *thread_main(void *arg)
     r = g_only_interp ? run(c) : jit_thread_run(c);
     if (!c->thread_end) main_end(c, r);   /* exit (or error) from this thread: whole process */
     jit_thread_unregister(c);
+    port_forget(c);
     g_threads--;
     g_st_finished++;
     free(c->msg);
@@ -270,6 +294,8 @@ int thread_spawn(Cpu *c, uint32_t fn, uint32_t arg, uint32_t stack, uint32_t pth
     /* the new thread waits for the lock (this thread holds it): set the registers now */
     port = pthread_mach_thread_np(t);
     mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, 1);  /* reference for the guest */
+    n->mach_thread = port;
+    port_note(n);
     n->eip = g_start;
     n->r[EAX] = th_pthread;
     n->r[EBX] = port;
@@ -370,6 +396,7 @@ static void *wq_thread(void *arg)
         if (!c->wq_done) {
             if (!c->thread_end) main_end(c, r);   /* exit from the worker thread */
             jit_thread_unregister(c);              /* has terminated itself with bsdthread_terminate */
+            port_forget(c);
             g_threads--;
             g_wq_threads--;
             thread_release();
@@ -401,6 +428,8 @@ static int wq_thread_new(void)
     if (pthread_create(&t, &at, wq_thread, w)) { pthread_attr_destroy(&at); munmap(a, sz); free(w); free(n); return EAGAIN; }
     pthread_attr_destroy(&at);
     w->port = pthread_mach_thread_np(t);    /* the thread is still waiting for the lock */
+    n->mach_thread = w->port;
+    port_note(n);
     mach_port_mod_refs(mach_task_self(), w->port, MACH_PORT_RIGHT_SEND, 1);
     g_threads++;
     g_wq_threads++;

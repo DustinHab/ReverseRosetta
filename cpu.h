@@ -92,6 +92,7 @@ typedef struct Cpu {
     /* OpenGL (gl.c): current context of this thread on the host and its object in guest memory */
     void *gl_ctx;
     uint32_t gl_proxy;
+    uint32_t mach_thread;         /* kernel port of the host thread that runs this guest thread (thread_get_state) */
 } Cpu;
 
 /* ---------- guest memory ---------- */
