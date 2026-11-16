@@ -158,6 +158,8 @@ is filled (4.7 s at the very first start), the native one 0.66 s.
 - Sound: OpenAL through the system's PowerPC OpenAL (`tests/openal.c`), and CoreAudio's device layer (HAL) through the
   system's HAL, so that AudioUnit output (SDL, games), AudioQueue and QuickTime's sound run on the real hardware
   (`tests/coreaudio.c`: render callbacks and queue callbacks as natively).
+- Text encodings: CFString conversions in i386 code, the Text Encoding Converter (TEC*) through the system's CarbonCore,
+  whose encoding plugins exist only for PowerPC (`tests/textenc.c`: MacRoman, Shift-JIS, EUC-CN, EUC-KR, UTF-8/16).
 - QuickTime through its own i386 framework from Apple's QuickTime 7.6.4 for Leopard (see Setup): movies open, and
   H.264 frames decode to the same pixels as natively (`tests/quicktime.c`); QuickTime Player's own i386 build opens its
   window, and the QuickTime messages of Cinebench, Keynote and Numbers are gone. Its codecs use MMX, which runs in the
@@ -339,7 +341,7 @@ error code.
 ## Tests
 
 ```
-tests/run_tests.sh      # 53 comparisons against native builds, real Intel output or the interpreter
+tests/run_tests.sh      # 54 comparisons against native builds, real Intel output or the interpreter
 tests/measure_all.sh    # the benchmark loads above
 tests/gl_measure.sh     # the OpenGL workloads, translated and native side by side (login session)
 tests/realworld.sh      # ordinary programs (gzip, bzip2, perl, python ...) translated against native

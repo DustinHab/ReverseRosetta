@@ -13,6 +13,7 @@
 #include "gl.h"
 #include "al.h"
 #include "ca.h"
+#include "tec.h"
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -142,7 +143,8 @@ static const struct { const char *name; Stub fn; char kind; void *native; } g_li
 /* OpenGL: gl.c (the Intel OpenGL cannot reach the graphics chip of a PowerPC Mac); OpenAL: al.c (no i386 OpenAL in the
    10.5.8 update: the Intel root has a stub library) */
 static const char *const g_native_libs[] = { "/Calculate.framework/", "/OpenGL.framework/", "/OpenAL.framework/",
-                                             "/CoreAudio.framework/", 0 };     /* CoreAudio: its HAL (ca.c) */
+                                             "/CoreAudio.framework/", "/CarbonCore.framework/", 0 };   /* CoreAudio: its HAL (ca.c);
+                                                                                     CarbonCore: TEC (tec.c) */
 #define LIST (sizeof g_list / sizeof g_list[0])
 
 /* ---------- tables ---------- */
@@ -198,6 +200,12 @@ static Stub name_verify(const char *s)
         Stub fn;
         while (s[n] && s[n] != '$') n++;
         if ((fn = gl_stub(s, n)) != 0) return fn;
+        n = 0;
+    }
+    if (s[0] == 'T' && s[1] == 'E' && s[2] == 'C') {      /* the Text Encoding Converter (tec.c) */
+        Stub fn;
+        while (s[n] && s[n] != '$') n++;
+        if ((fn = tec_stub(s, n)) != 0) return fn;
         n = 0;
     }
     if (s[0] == 'A' && s[1] == 'u' && s[2] == 'd') {      /* CoreAudio's HAL (ca.c) */

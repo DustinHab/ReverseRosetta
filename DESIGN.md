@@ -549,6 +549,15 @@ page). Running measurement series: `tests/measure_all.sh`.
   drops from 10 to 1 after 300 ms: Calculator's first start 4.7 s (wall 7.1 instead of 10.2 s), the short programs as
   with 10.
 
+### Text Encoding Converter (16 Nov)
+
+- TECCreateConverter and the rest of the converter API load the plugins in /System/Library/TextEncodings (Unicode,
+  Chinese, Japanese, Korean Encodings), which have no i386 part: every converter failed (-8770, even UTF-8 to MacRoman),
+  wxWidgets programs (wxrc) stopped at an assertion. TextToUnicodeInfo and CFString conversions were not affected.
+  `tec.c` bridges the TEC* functions of the guest's CarbonCore by name to the system's CarbonCore (converters,
+  sniffers, encoding lists, internet names); Unicode in the host's byte order (16- and 32-bit formats without explicit
+  BE/LE) is swapped on the way in and out. `tests/textenc.c` against native.
+
 ### CoreAudio (16 Nov)
 
 - The i386 HAL cannot reach the sound hardware: io_service_open_extended passes the client's NDR record, and the kernel
