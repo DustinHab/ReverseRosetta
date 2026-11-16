@@ -1464,8 +1464,9 @@ static void cond_after_eq(int x, int reversed)
     if (reversed) e(CROR(CR_EQ, x, x)); else e(CRNOR(CR_EQ, x, x));
 }
 
-/* Flags are in memory, kind known only at run time: compute the common kinds (cmp/sub and test/logic, 32 bit)
-   directly from Cpu.cc_*, otherwise through C. Result: condition true <=> CR0.EQ = 0. */
+/* Flags are in memory, kind known only at run time: compute the common kinds (cmp/sub and test/logic, 8, 16 and 32 bit:
+   the operands shifted to the top of the word, so that one compare holds for every size) directly from Cpu.cc_*,
+   otherwise through C. Result: condition true <=> CR0.EQ = 0. */
 static Cond cond_helper(int k)
 {
     int kk = k >> 1, negated = k & 1;
@@ -1476,14 +1477,17 @@ static Cond cond_helper(int k)
     if (kk != 0 && kk != 5 && !g_poison) {    /* overflow and parity only through C */
         e(LWZ(0, OFF(cc_op), RCPU));
         e(LWZ(11, OFF(cc_size), RCPU));
-        e(CMPWI(1, 11, 4)); cont_sz = p; e(BC_(BO_FALSE, 4 + CR_EQ, 0));
+        e(CMPLWI(1, 11, 4)); cont_sz = p; e(BC_(BO_TRUE, 4 + CR_GT, 0));    /* sizes 1, 2, 4 (bzip2: cmpb) */
+        e(RLWINM(11, 11, 3, 0, 31));
+        e(SUBFIC(11, 11, 32));                /* shift: 24, 16, 0 */
         e(CMPWI(1, 0, CC_SUB)); cont_sub = p; e(BC_(BO_FALSE, 4 + CR_EQ, 0));
         e(LWZ(3, OFF(cc_a), RCPU)); e(LWZ(4, OFF(cc_b), RCPU));
+        e(SLW(3, 3, 11)); e(SLW(4, 4, 11));
         switch (kk) {                       /* d - s: a = d, b = s */
         case 1: e(CMPLW(0, 3, 4)); cond_after_eq(CR_LT, negated); break;           /* b: a < b unsigned */
         case 2: e(CMPLW(0, 3, 4)); cond_after_eq(CR_EQ, negated); break;           /* e */
         case 3: e(CMPLW(0, 3, 4)); cond_after_eq(CR_GT, !negated); break;          /* be: not greater */
-        case 4: e(LWZ(3, OFF(cc_res), RCPU)); e(CMPWI(0, 3, 0)); cond_after_eq(CR_LT, negated); break;   /* s */
+        case 4: e(LWZ(3, OFF(cc_res), RCPU)); e(SLW(3, 3, 11)); e(CMPWI(0, 3, 0)); cond_after_eq(CR_LT, negated); break;   /* s */
         case 6: e(CMPW(0, 3, 4)); cond_after_eq(CR_LT, negated); break;            /* l */
         default: e(CMPW(0, 3, 4)); cond_after_eq(CR_GT, !negated); break;          /* le */
         }
@@ -1491,6 +1495,7 @@ static Cond cond_helper(int k)
         bc_set(cont_sub, p);
         e(CMPWI(1, 0, CC_LOGIC)); cont_logic = p; e(BC_(BO_FALSE, 4 + CR_EQ, 0));
         e(LWZ(3, OFF(cc_res), RCPU));
+        e(SLW(3, 3, 11));
         e(CMPWI(0, 3, 0));
         switch (kk) {                       /* CF = OF = 0 */
         case 1: e(negated ? CRXOR(CR_EQ, CR_EQ, CR_EQ) : CREQV(CR_EQ, CR_EQ, CR_EQ)); break;   /* b: never */

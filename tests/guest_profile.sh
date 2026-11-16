@@ -1,7 +1,8 @@
 #!/bin/sh
 # guest_profile.sh ["PROG ARGS"] [RUNS] - sampling profile on guest functions: where the Intel program runs (in
 # translated code: block eip; when interpreting: Cpu.eip), resolved through the i386 symbols of the images (Intel
-# root before system). Plus the share of host work (translation, dispatcher, system calls).
+# root before system). Plus the share of host work (translation, dispatcher, system calls). GP_BLOCKS=1: per block
+# (image + offset of the block start) instead of per function.
 R=$(cd "$(dirname "$0")/.." && pwd)
 cd $R/build || exit 1
 P=${1:-./hello}; N=${2:-10}
@@ -33,6 +34,7 @@ perl -e '
   sub gfn { my $g = shift; return "?" unless $g =~ /^(.*)\+([0-9a-f]+)$/; my ($b, $o) = ($1, hex $2);
     my $short = $b; $short =~ s{.*/}{};
     my $ao = $bo{$b}; return sprintf("%s+%x (no symbols: block)", $short, $o) unless $ao && @$ao;
+    return sprintf("%s+%x", $short, $o) if $ENV{GP_BLOCKS};      # GP_BLOCKS=1: the blocks themselves
     my ($lo, $hi) = (0, $#$ao); return "$short+?" if $o < $ao->[0];
     while ($lo < $hi) { my $m = int(($lo + $hi + 1) / 2); if ($ao->[$m] <= $o) { $lo = $m } else { $hi = $m - 1 } }
     return "$short:" . $bs{$b}[$lo]; }
