@@ -100,6 +100,8 @@ t_idb()   { ROSETTA_THRESHOLD=1 ./rosetta ./incdec8; }
 r_idb()   { ROSETTA_INTERP=1 ./rosetta ./incdec8; }
 t_m16()   { ROSETTA_THRESHOLD=1 ./rosetta ./mem16; }
 r_m16()   { ROSETTA_INTERP=1 ./rosetta ./mem16; }
+t_nar()   { ROSETTA_THRESHOLD=1 ./rosetta ./narrow_ops; ROSETTA_NO_NARROW=1 ROSETTA_THRESHOLD=1 ./rosetta ./narrow_ops; }
+r_nar()   { ROSETTA_INTERP=1 ./rosetta ./narrow_ops; ROSETTA_INTERP=1 ./rosetta ./narrow_ops; }
 t_al()    { ./rosetta ./openal; }
 r_al()    { ./openal.ppc; }
 QTM="/System/Library/Compositions/Sunset.mov /System/Library/PreferencePanes/Trackpad.prefPane/Contents/Resources/bl_Dragging.mov"
@@ -118,6 +120,7 @@ same "64-bit shifts, shld/shrd with flags" t_shf r_shf
 same "cmpsb (translated against interpreter)" t_cmpsb r_cmpsb
 same "incb/decb with flags (against interpreter)" t_idb r_idb
 same "incw, byte and word shifts in memory, movw (against interpreter)" t_m16 r_m16
+same "or/and/xor of byte and word registers with constants (against interpreter)" t_nar r_nar
 same "conditions of 8/16/32-bit cmp and test across blocks (against interpreter)" t_csz r_csz
 same "stack slots forwarded in a block: esp/ebp aliases, read-modify-write, xchg (against interpreter)" t_sfw r_sfw
 same "OpenAL: devices, sources, buffers, playing (silent), against native" t_al r_al

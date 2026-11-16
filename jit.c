@@ -109,6 +109,7 @@ static uint32_t g_shadow_base;       /* return stack (ring buffer, aligned to it
 static void (*g_entry)(Cpu *, uint32_t *);
 static uint32_t *g_exit, *g_link, *g_interrupt;
 static int g_flush, g_careful, g_no_fusion, g_no_slots, g_ranges_old, g_poison;
+static int g_no_narrow;                /* ROSETTA_NO_NARROW: 8/16-bit or/and/xor with a constant through extract/insert */
 static unsigned long g_st_blocks, g_st_insns, g_st_interp, g_st_linked, g_st_flushes, g_st_invalid;
 static unsigned long g_st_fusion, g_st_direct, g_st_pages, g_st_inline, g_st_table_miss, g_st_ic, g_st_fp_direct;
 static int step_counted(Cpu *c);
@@ -759,6 +760,7 @@ static int jit_create(void)
     if (!(g_shadow_base = ring_new())) return -1;
     g_careful = getenv("ROSETTA_CAREFUL") ? (atoi(getenv("ROSETTA_CAREFUL")) ? atoi(getenv("ROSETTA_CAREFUL")) : 7) : 0;   /* 1 call, 2 ret, 4 jump tables */
     g_no_fusion = getenv("ROSETTA_NO_FUSION") != 0;
+    g_no_narrow = getenv("ROSETTA_NO_NARROW") != 0;
     g_no_slots = getenv("ROSETTA_NO_SLOTS") != 0;
     g_poison = getenv("ROSETTA_POISON") != 0;   /* merged floating-point compares poison the flags in memory */
     if (getenv("ROSETTA_STATS")) { g_step_fn = step_counted; g_vt_on = atoi(getenv("ROSETTA_STATS")) > 1 ? 2 : 1; }
@@ -1825,6 +1827,39 @@ static void gen_alu(const Insn *b, int op, int sz, int dir, int needs)
     alu_calc(op, sz, o.vd, o.vs, dir >= 2, b->imm, vr, needs);
     g_res = vr;
     if (op != 7 && op != 8) alu_back(b, &o, sz, vr);
+}
+
+/* mask m as rlwinm bounds (one run of ones, also wrapping around): 1 and *mb, *me set */
+static int rlw_bounds(uint32_t m, int *mb, int *me)
+{
+    int i, starts = 0;
+    if (m == 0 || m == 0xffffffffu) return 0;
+    for (i = 0; i < 32; i++) {
+        int cur = (m >> (31 - i)) & 1, prev = (m >> (31 - ((i + 31) & 31))) & 1, next = (m >> (31 - ((i + 1) & 31))) & 1;
+        if (cur && !prev) { *mb = i; starts++; }
+        if (cur && !next) *me = i;
+    }
+    return starts == 1;
+}
+
+/* or/and/xor of an 8- or 16-bit register with a constant whose flags nobody reads: on the whole host register
+   (orb $0xff,%dl: one ori instead of extracting the byte, computing and inserting it again) */
+static int alu_narrow_imm(const Insn *b, int op, int sz, int dir)
+{
+    int r, h, sh = 0, mb = 0, me = 0;
+    uint32_t lane = sz == 1 ? 0xff : 0xffff, imm, clear;
+    if ((sz != 1 && sz != 2) || (op != 1 && op != 4 && op != 6) || (dir != 2 && dir != 3) || (dir == 2 && b->mem))
+        return 0;
+    r = dir == 3 ? EAX : b->rm;
+    if (sz == 1 && r >= 4) { h = R(r - 4); sh = 8; } else h = R(r);
+    imm = b->imm & lane;
+    if (op == 1) { if (imm) e(ORI(h, h, imm << sh)); return 1; }
+    if (op == 6) { if (imm) e(XORI(h, h, imm << sh)); return 1; }
+    clear = (~imm & lane) << sh;
+    if (!clear) return 1;
+    if (rlw_bounds(~clear, &mb, &me)) e(RLWINM(h, h, 0, mb, me));
+    else { load_imm(0, clear); e(ANDC(h, h, 0)); }
+    return 1;
 }
 
 static void gen_inc_dec(const Insn *b, int reg, int dec, int needs, int needs_cf)
@@ -5382,8 +5417,9 @@ static void gen(const Insn *b, int needs, int needs_cf)
         return;
     }
     if (op < 0x40 && (op & 7) < 6) {
-        int g = (op & 1) ? sz : 1;
-        gen_alu(b, op >> 3, g, (op & 7) < 2 ? 0 : (op & 7) < 4 ? 1 : 3, needs);
+        int g = (op & 1) ? sz : 1, dir = (op & 7) < 2 ? 0 : (op & 7) < 4 ? 1 : 3;
+        if (!needs && !g_no_narrow && alu_narrow_imm(b, op >> 3, g, dir)) return;
+        gen_alu(b, op >> 3, g, dir, needs);
         return;
     }
     switch (op) {
@@ -5419,6 +5455,7 @@ static void gen(const Insn *b, int needs, int needs_cf)
         gen_imul(b->reg, R(b->reg), v, 0, 0, needs);
         return;
     case 0x80: case 0x81: case 0x83:
+        if (!needs && !g_no_narrow && alu_narrow_imm(b, b->reg, op == 0x80 ? 1 : sz, 2)) return;
         gen_alu(b, b->reg, op == 0x80 ? 1 : sz, 2, needs);
         return;
     case 0x84: case 0x85:

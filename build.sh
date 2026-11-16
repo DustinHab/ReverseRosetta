@@ -16,7 +16,7 @@ if [ "$1" = tests ] && [ -d "$Q/tests" ]; then
     n=$(basename "$t" .c)
     case "$n" in
       raw*) gcc-4.2 -arch i386 -O1 -static -nostdlib -e _start -o "$B/$n" "$t" ;;
-      cmpsb|incdec8|mem16|cond_sizes|stack_fw) gcc-4.2 -arch i386 -O2 -o "$B/$n" "$t" ;;           # i386 assembly: compared against the interpreter
+      cmpsb|incdec8|mem16|cond_sizes|stack_fw|narrow_ops) gcc-4.2 -arch i386 -O2 -o "$B/$n" "$t" ;;           # i386 assembly: compared against the interpreter
       faults|identity|remap) gcc-4.2 -arch i386 -O1 -o "$B/$n" "$t" ;; # i386 only: compared against tests/$n.expected
       mmx_ops) gcc-4.2 -arch i386 -Os -mmmx -msse -o "$B/$n" "$t" ;;   # MMX: against tests/mmx_ops.expected (x86; -O1 makes gcc-4.2 fail)
       pd_ops|vec_ops) gcc-4.2 -arch i386 -O2 -msse2 -o "$B/$n" "$t" ;;   # SSE2 intrinsics: compared against the interpreter
@@ -35,7 +35,7 @@ if [ "$1" = tests ] && [ -d "$Q/tests" ]; then
           gcc-4.2 -arch ppc -O1 -o "$B/$n.ppc" "$t" -framework CoreServices 2> /dev/null ;;   # tec.c against the system's TEC
       coreaudio) gcc-4.2 -arch i386 -O1 -isysroot $S -o "$B/$n" "$t" -framework AudioUnit -framework AudioToolbox -framework CoreAudio -framework CoreServices 2> /dev/null
           gcc-4.2 -arch ppc -O1 -o "$B/$n.ppc" "$t" -framework AudioUnit -framework AudioToolbox -framework CoreAudio -framework CoreServices 2> /dev/null ;;   # ca.c against the system's HAL
-      quicktime) gcc-4.2 -arch i386 -O1 -isysroot $S -o "$B/$n" "$t" -framework QuickTime -framework ApplicationServices -framework CoreServices 2> /dev/null
+      quicktime|bench_qt) gcc-4.2 -arch i386 -O1 -isysroot $S -o "$B/$n" "$t" -framework QuickTime -framework ApplicationServices -framework CoreServices 2> /dev/null
           gcc-4.2 -arch ppc -O1 -o "$B/$n.ppc" "$t" -framework QuickTime -framework ApplicationServices -framework CoreServices 2> /dev/null ;;   # needs QuickTime 7.6.4 in the Intel root
       cf) gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" -framework CoreFoundation
           gcc-4.2 -arch ppc -mcpu=7450 -O2 -o "$B/$n.ppc" "$t" -framework CoreFoundation ;;
