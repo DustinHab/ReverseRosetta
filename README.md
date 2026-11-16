@@ -5,9 +5,10 @@ Mac OS X 10.5 Leopard: it loads an i386 Mach-O program, translates its machine c
 passes system calls and Mach messages to the PowerPC kernel and system services. This is the reverse direction of
 Apple's Rosetta, which ran PowerPC programs on Intel Macs.
 
-> **Translated Intel code runs at up to native speed on a PowerPC G4.** Integer code reaches 102 % of the speed of the
-> same program compiled natively for PowerPC, call-heavy code 83 %, control flow 72 %, packed SSE2 code 68 %, libm
-> code 67 %, floating point 60 %. A Foundation program starts in 69 ms (native: 47 ms).
+> **How fast?** Ordinary programs run at about half to four fifths of the speed of their native PowerPC build on a G4:
+> gzip 61 %, bzip2 52 %, perl 66 to 69 %, sort 80 %, Python 98 %. Programs that run for a fraction of a second lose most
+> at startup (openssl sha1 29 %), and the first starts of a program are slower while its code is translated. Small
+> computing kernels reach 60 to 102 %, OpenGL 80 to 110 %. Details and how it is measured below.
 
 ![Transmission 2.42 (x86_64/i386 only) running on an iBook G4](docs/transmission-on-ibook-g4.png)
 
@@ -17,9 +18,41 @@ placed at their screen positions.
 
 ## Performance
 
-Measured on an iBook G4 (PowerPC 7447A, 1.33 GHz). Each benchmark is a C program built twice from the same source
-with gcc-4.2 -O2: once for i386 and run translated, once natively for PowerPC. Both builds print the same result,
-which the measurement compares.
+Measured on an iBook G4 (PowerPC 7447A, 1.33 GHz, on mains power at full clock).
+
+### Ordinary programs
+
+Programs of the system on real input (`tests/realworld.sh`): the i386 and the PowerPC part of the same universal binary,
+processor time (user and system) of the fastest of 3 runs. `first` is the first run with an empty translation cache,
+`cached` a later one. Translated and native output are identical.
+
+| Program | Native | Translated, first run | Translated, cached | Speed vs. native |
+|---|---|---|---|---|
+| gzip -9 (4 MB of C headers) | 0.65 s | 1.11 s | 1.07 s | 61 % |
+| gzip -d | 0.05 s | 0.13 s | 0.10 s | 50 % |
+| bzip2 -9 | 2.87 s | 5.60 s | 5.50 s | 52 % |
+| bzip2 -d | 0.63 s | 0.94 s | 0.89 s | 71 % |
+| sort | 0.40 s | 0.54 s | 0.50 s | 80 % |
+| grep -c (regular expression over a dictionary) | 0.06 s | 0.14 s | 0.09 s | 67 % |
+| md5 | 0.06 s | 0.12 s | 0.10 s | 60 % |
+| openssl sha1 | 0.05 s | 0.31 s | 0.17 s | 29 % |
+| openssl aes-128-cbc | 0.12 s | 0.42 s | 0.37 s | 32 % |
+| perl (hash, sort) | 0.61 s | 1.00 s | 0.88 s | 69 % |
+| perl (regular expression over words) | 0.35 s | 0.61 s | 0.53 s | 66 % |
+| python (loop, big integers) | 1.48 s | 1.52 s | 1.51 s | 98 % |
+
+Short runs are dominated by startup: dyld, libSystem and the libraries run translated, and even with everything
+translated a program like openssl needs about 40 ms more than natively before it does any work. Compute-heavy C code
+with many stack operands (i386 has seven general registers, the translation keeps stack slots in PowerPC registers
+only in loops) runs at 50 to 70 %. The Python of /usr/bin is PowerPC-only; the i386 one comes from the Intel root.
+sqlite is not in the table: the PowerPC library of an updated 10.5.9 is sqlite 3.7, the i386 one of the 10.5.8 update
+sqlite 3.4, which lacks automatic indexes (the same query 0.06 s natively, 17 s translated).
+
+### Computing kernels
+
+The upper bound: small C programs built twice from the same source with gcc-4.2 -O2, once for i386 and run
+translated, once natively for PowerPC. Both builds print the same result, which the measurement compares. Hot loops
+that fit the translator's optimizations; ordinary programs reach less (see above).
 
 | Benchmark | What it does | Translated | Native | Speed vs. native |
 |---|---|---|---|---|
@@ -34,6 +67,8 @@ MIPS is the number of i386 instructions per round (counted by the interpreter) d
 time per round is the slope between a short and a long run, so startup costs drop out. The native column uses the
 same instruction count with the native run time, so the last column is the ratio of the run times. Fastest of 3
 runs; the values vary by a few percent between measurement runs. `tests/measure_all.sh` repeats the measurement.
+
+### Libraries and OpenGL
 
 Library code: decoding a 2560x1600 JPEG with ImageIO and drawing it into a bitmap (`tools/probes/jpeg_decode.c`)
 takes 1.47 s translated and 0.44 s native. ImageIO's decoder is SSE2 code; before packed SSE2 integer and float
@@ -59,6 +94,8 @@ than native because rosetta converts them in cache-sized pieces, which the drive
 | texture upload 256x256 BGRA | 6.27 ms | 5.10 ms | 81 % |
 | `glReadPixels` 256x256 | 17.45 ms | 15.68 ms | 90 % |
 | `glGet` | 1.23 ms | 0.96 ms | 78 % |
+
+### Startup
 
 Startup time, translated against native, fastest of 7 runs with the translation cache filled:
 
@@ -101,6 +138,14 @@ the native PowerPC build. At startup the translated Calculator uses 1.7 s of pro
   Keychain Access open their windows; Preview shows PDF documents; Chess draws its board with OpenGL. Transmission 2.42 downloads. Safari shows pages
   over HTTP with CSS, JavaScript and images (HTTPS to current servers fails on 10.5 natively too). Text rendering goes through the system's
   PowerPC font server; font metrics, glyph outlines and paths are identical to a native build (`tests/fonts.c`).
+- Installed universal applications through their i386 part (`tests/app_survey.sh`, `tools/apps_i386.sh`): of the 44 on
+  the test machine, 37 open their windows within 45 seconds, among them Keynote, Pages and Numbers ('09), Xcode 3.1,
+  Interface Builder's sibling tools (Dashcode, Instruments, Quartz Composer, Shark, FileMerge, PackageMaker, Icon
+  Composer), Cinebench R10, SheepShaver and The Unarchiver; 4 more run without a window of their own. Objective-C
+  garbage collection (Xcode) and JavaScriptCore work. Frameworks that the 10.5.8 update has no i386 version of are stub
+  libraries with real Objective-C classes (see Limitations); an application that needs one of them for real fails at
+  that point (The Sims 2 Body Shop needs QuickTime).
+- OpenAL (games' sound) through the system's PowerPC OpenAL (`tests/openal.c` gives the same output as natively).
 - x87, SSE and SSE2: scalar, packed double, packed integer and packed float (AltiVec), including Apple's Intel
   vDSP/vForce code and ImageIO's image decoders.
 - OpenGL with the graphics chip: the program's OpenGL calls go to the system's PowerPC OpenGL and its hardware
@@ -274,9 +319,11 @@ error code.
 ## Tests
 
 ```
-tests/run_tests.sh      # 46 comparisons against native builds, real Intel output or the interpreter
+tests/run_tests.sh      # 49 comparisons against native builds, real Intel output or the interpreter
 tests/measure_all.sh    # the benchmark loads above
 tests/gl_measure.sh     # the OpenGL workloads, translated and native side by side (login session)
+tests/realworld.sh      # ordinary programs (gzip, bzip2, perl, python ...) translated against native
+tests/app_survey.sh     # start installed applications through their i386 part (login session), windows and crashes
 tests/cli_matrix.sh     # every universal command line program of the system, translated against native
 ```
 
@@ -308,13 +355,17 @@ well.
   running translated code assumes a single CPU and uses no memory barriers; rare crashes or hangs are possible there.
 - Accessibility (System Events, assistive devices) does not see the windows of translated programs.
 - Frameworks that the 10.5.8 update does not contain as i386 (QuickTime, QTKit, CoreVideo, Tcl, OpenDirectory ...)
-  are stubs; features that need them do not work. Calculator's engine is the exception: it runs as the native
+  are stubs; features that need them do not work. Their functions report `rosetta-stub: NAME missing` once and return
+  an error code, their Objective-C classes exist with the right superclass and answer unknown messages with nil
+  (`tools/sdk_stubs_all.sh`, `tools/app_stubs.sh`, `tools/stubs_rebuild_all.sh`). Calculator's engine is the exception: it runs as the native
   PowerPC function.
 - Programs with windows start slowly the first two times (see the table under Performance). With the translation
   cache filled, Calculator still uses about 2.5 times the processor time of the native build at startup, most of it
   in translated guest code (dyld binding, the Objective-C runtime, CoreFoundation).
 - OpenGL: immediate mode with scalar arguments and glGet reach about 80 % of the native speed (the table under
   Performance). Tested with NSOpenGLView windows and CGL pbuffers; AGL and GLUT programs are untested.
+- LaunchServices crashes in _FSNodeCopyExtension when Keychain Access quits and when The Sims 2 Read Me opens its
+  document (the same in the interpreter: not a translation error; the cause is open).
 - The keychain sees the process `rosetta`, not the program: a program that reads a password asks once per item, and
   "Always Allow" lets every translated program read it. After rosetta is rebuilt, the keychain asks again.
 - Programs that need a setuid helper in their bundle (Activity Monitor's pmTool) do not work: the copy in
