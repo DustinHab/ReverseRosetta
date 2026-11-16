@@ -28,23 +28,25 @@ processor time (user and system) of the fastest of 3 runs. `first` is the first 
 
 | Program | Native | Translated, first run | Translated, cached | Speed vs. native |
 |---|---|---|---|---|
-| gzip -9 (4 MB of C headers) | 0.65 s | 1.11 s | 1.07 s | 61 % |
-| gzip -d | 0.05 s | 0.13 s | 0.10 s | 50 % |
-| bzip2 -9 | 2.87 s | 5.60 s | 5.50 s | 52 % |
-| bzip2 -d | 0.63 s | 0.94 s | 0.89 s | 71 % |
-| sort | 0.40 s | 0.54 s | 0.50 s | 80 % |
-| grep -c (regular expression over a dictionary) | 0.06 s | 0.14 s | 0.09 s | 67 % |
+| gzip -9 (4 MB of C headers) | 0.65 s | 1.10 s | 1.06 s | 61 % |
+| gzip -d | 0.05 s | 0.14 s | 0.09 s | 56 % |
+| bzip2 -9 | 2.87 s | 4.91 s | 4.78 s | 60 % |
+| bzip2 -d | 0.63 s | 0.95 s | 0.89 s | 71 % |
+| sort | 0.39 s | 0.54 s | 0.50 s | 78 % |
+| grep -c (regular expression over a dictionary) | 0.06 s | 0.15 s | 0.09 s | 67 % |
 | md5 | 0.06 s | 0.12 s | 0.10 s | 60 % |
-| openssl sha1 | 0.05 s | 0.31 s | 0.17 s | 29 % |
-| openssl aes-128-cbc | 0.12 s | 0.42 s | 0.37 s | 32 % |
-| perl (hash, sort) | 0.61 s | 1.00 s | 0.88 s | 69 % |
-| perl (regular expression over words) | 0.35 s | 0.61 s | 0.53 s | 66 % |
-| python (loop, big integers) | 1.48 s | 1.52 s | 1.51 s | 98 % |
+| openssl sha1 | 0.05 s | 0.22 s | 0.14 s | 36 % |
+| openssl aes-128-cbc | 0.12 s | 0.40 s | 0.33 s | 36 % |
+| perl (hash, sort) | 0.61 s | 0.99 s | 0.87 s | 70 % |
+| perl (regular expression over words) | 0.35 s | 0.61 s | 0.52 s | 67 % |
+| python (loop, big integers) | 1.48 s | 1.52 s | 1.52 s | 97 % |
 
 Short runs are dominated by startup: dyld, libSystem and the libraries run translated, and even with everything
 translated a program like openssl needs about 40 ms more than natively before it does any work. Compute-heavy C code
-with many stack operands (i386 has seven general registers, the translation keeps stack slots in PowerPC registers
-only in loops) runs at 50 to 70 %. The Python of /usr/bin is PowerPC-only; the i386 one comes from the Intel root.
+with many stack operands (i386 has seven general registers) runs at 55 to 70 %: every local in memory costs a
+byte-reversed load or store that native PowerPC code keeps in a register. Within a block the translation reads stack
+slots back from registers (loops keep them in registers throughout); OpenSSL's hash and cipher code, nearly all stack
+traffic, reaches about a third. The Python of /usr/bin is PowerPC-only; the i386 one comes from the Intel root.
 sqlite is not in the table: the PowerPC library of an updated 10.5.9 is sqlite 3.7, the i386 one of the 10.5.8 update
 sqlite 3.4, which lacks automatic indexes (the same query 0.06 s natively, 17 s translated).
 
@@ -136,12 +138,15 @@ the native PowerPC build. At startup the translated Calculator uses 1.7 s of pro
 - Cocoa programs with windows, events and text. Of the Intel applications of the 10.5.8 update, Calculator (computing
   with the system's own engine), Terminal, Console, System Profiler, Dictionary, iCal, Address Book, Safari, Mail and
   Keychain Access open their windows; Preview shows PDF documents; Chess draws its board with OpenGL. Transmission 2.42 downloads. Safari shows pages
-  over HTTP with CSS, JavaScript and images (HTTPS to current servers fails on 10.5 natively too). Text rendering goes through the system's
+  over HTTP with CSS, JavaScript and images (HTTPS to current servers fails on 10.5 natively too). Programs open
+  documents and URLs in other applications through LaunchServices (a game's Read Me opens in TextEdit), with the
+  quarantine labels of downloaded files read and written as natively. Text rendering goes through the system's
   PowerPC font server; font metrics, glyph outlines and paths are identical to a native build (`tests/fonts.c`).
 - Installed universal applications through their i386 part (`tests/app_survey.sh`, `tools/apps_i386.sh`): of the 44 on
-  the test machine, 37 open their windows within 45 seconds, among them Keynote, Pages and Numbers ('09), Xcode 3.1,
+  the test machine, 38 open their windows within 40 seconds, among them Keynote, Pages and Numbers ('09), Xcode 3.1,
   Interface Builder's sibling tools (Dashcode, Instruments, Quartz Composer, Shark, FileMerge, PackageMaker, Icon
-  Composer), Cinebench R10, SheepShaver and The Unarchiver; 4 more run without a window of their own. Objective-C
+  Composer), BigTop, Cinebench R10, SheepShaver and The Unarchiver; 4 more run without a window of their own, and The
+  Sims 2's Read Me opens its document in TextEdit and quits, as it does natively. Objective-C
   garbage collection (Xcode) and JavaScriptCore work. Frameworks that the 10.5.8 update has no i386 version of are stub
   libraries with real Objective-C classes (see Limitations); an application that needs one of them for real fails at
   that point (The Sims 2 Body Shop needs QuickTime).
@@ -319,7 +324,7 @@ error code.
 ## Tests
 
 ```
-tests/run_tests.sh      # 49 comparisons against native builds, real Intel output or the interpreter
+tests/run_tests.sh      # 50 comparisons against native builds, real Intel output or the interpreter
 tests/measure_all.sh    # the benchmark loads above
 tests/gl_measure.sh     # the OpenGL workloads, translated and native side by side (login session)
 tests/realworld.sh      # ordinary programs (gzip, bzip2, perl, python ...) translated against native

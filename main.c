@@ -322,6 +322,12 @@ static void guest_name(FILE *f, uint32_t g)
     fprintf(f, g ? "%08x" : "-", g);
 }
 
+void guest_where(FILE *f, uint32_t g, int refresh)
+{
+    if (refresh || !g_npimage) images_find();
+    guest_name(f, g);
+}
+
 static void profile_start(void)
 {
     struct sigaction sa;

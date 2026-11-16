@@ -102,12 +102,15 @@ t_al()    { ./rosetta ./openal; }
 r_al()    { ./openal.ppc; }
 t_csz()   { ROSETTA_THRESHOLD=1 ./rosetta ./cond_sizes; }
 r_csz()   { ROSETTA_INTERP=1 ./rosetta ./cond_sizes; }
+t_sfw()   { ROSETTA_THRESHOLD=1 ./rosetta ./stack_fw; ROSETTA_NO_SLOTS=1 ROSETTA_THRESHOLD=1 ./rosetta ./stack_fw; }   # (loop slots take the loops otherwise)
+r_sfw()   { ROSETTA_INTERP=1 ./rosetta ./stack_fw; ROSETTA_INTERP=1 ./rosetta ./stack_fw; }
 same raw_arith t_raw r_raw
 same "64-bit shifts, shld/shrd with flags" t_shf r_shf
 same "cmpsb (translated against interpreter)" t_cmpsb r_cmpsb
 same "incb/decb with flags (against interpreter)" t_idb r_idb
 same "incw, byte and word shifts in memory, movw (against interpreter)" t_m16 r_m16
 same "conditions of 8/16/32-bit cmp and test across blocks (against interpreter)" t_csz r_csz
+same "stack slots forwarded in a block: esp/ebp aliases, read-modify-write, xchg (against interpreter)" t_sfw r_sfw
 same "OpenAL: devices, sources, buffers, playing (silent), against native" t_al r_al
 same "packed doubles with special values (against interpreter)" t_pdo r_pdo
 same "SSE2 integer and packed floats with AltiVec (against interpreter)" t_vec r_vec

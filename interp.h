@@ -4,6 +4,7 @@
 
 #include "cpu.h"
 #include "decoder.h"
+#include <stdio.h>
 
 /* RUN_SIGNAL: a synchronous exception (division error, ud2, int3, hlt) went to the guest's handler; eip is unchanged
    (int3: after the instruction) and the signal is pending, the caller continues at the dispatcher, which delivers
@@ -19,6 +20,8 @@ int run(Cpu *c);
 
 /* print the state (debugging) */
 void state_show(Cpu *c, const char *reason);
+/* guest address as image+offset (main.c); refresh: look for the loaded images again first */
+void guest_where(FILE *f, uint32_t g, int refresh);
 
 extern int g_lane;                  /* 1: print every instruction */
 

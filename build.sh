@@ -16,7 +16,7 @@ if [ "$1" = tests ] && [ -d "$Q/tests" ]; then
     n=$(basename "$t" .c)
     case "$n" in
       raw*) gcc-4.2 -arch i386 -O1 -static -nostdlib -e _start -o "$B/$n" "$t" ;;
-      cmpsb|incdec8|mem16|cond_sizes) gcc-4.2 -arch i386 -O2 -o "$B/$n" "$t" ;;           # i386 assembly: compared against the interpreter
+      cmpsb|incdec8|mem16|cond_sizes|stack_fw) gcc-4.2 -arch i386 -O2 -o "$B/$n" "$t" ;;           # i386 assembly: compared against the interpreter
       faults|identity|remap) gcc-4.2 -arch i386 -O1 -o "$B/$n" "$t" ;; # i386 only: compared against tests/$n.expected
       pd_ops|vec_ops) gcc-4.2 -arch i386 -O2 -msse2 -o "$B/$n" "$t" ;;   # SSE2 intrinsics: compared against the interpreter
       vdsp_d) V=$S/System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A

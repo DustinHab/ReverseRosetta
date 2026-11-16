@@ -73,7 +73,8 @@
 #define CACHE_SIZE (24u << 20)
 #define TABLE 65536                   /* entries of the jump table (eip, code) */
 #define MAX_INSNS 128                 /* array size; the limit per block is g_max_insns */
-static int g_max_insns = 48;          /* ROSETTA_MAX_INSNS: Intel instructions per superblock */
+static int g_max_insns = 128;         /* ROSETTA_MAX_INSNS: Intel instructions per superblock (48 until 16.11.:
+                                         128 gives bzip2 -9 %, SHA-1 -7 %, startup unchanged) */
 #define FRAME_SIZE 400                       /* 64..167 scratch area, 168..311 f14..f31, 320 VRSAVE, 324.. r13..r31 */
 #define FSAFE 168
 
@@ -161,6 +162,7 @@ static int g_no_xfh;                  /* ROSETTA_NO_XFH: high halves not in f24.
 static int g_no_native;                /* ROSETTA_NO_NATIVE: math stubs through the C wrapper */
 static int g_no_embed;            /* ROSETTA_NO_EMBED: do not inline direct calls */
 static int g_no_sw;                   /* ROSETTA_NO_SW: no forwarding through the Intel stack */
+static int g_no_sw2;                  /* ROSETTA_NO_SW2: only mov, only esp-known slots (forwarding as before 16.11.) */
 static int g_no_jumptab;            /* ROSETTA_NO_JUMPTAB: switch tables through the general hash table */
 static void sw_all_drop(void);
 static int sw_slot(const Insn *b, int32_t *off);
@@ -767,6 +769,7 @@ static int jit_create(void)
     g_no_native = getenv("ROSETTA_NO_NATIVE") != 0;
     g_no_embed = getenv("ROSETTA_NO_EMBED") != 0;
     g_no_sw = getenv("ROSETTA_NO_SW") != 0;
+    g_no_sw2 = getenv("ROSETTA_NO_SW2") != 0;
     g_no_ret = getenv("ROSETTA_NO_WRITEBACK") != 0;
     g_no_budget = getenv("ROSETTA_NO_BUDGET") != 0;
     g_no_close = getenv("ROSETTA_NO_CLOSE") != 0;
@@ -1331,8 +1334,11 @@ static int slot_reg(const Insn *b, int sz)
 }
 
 /* after every memory write: update the slot or check for overlap. ra < 0: address = base + d */
+static void sw_store_note(const Insn *b, int val);
+
 static void after_save(const Insn *b, int sz, int ra, int rb, int val)
 {
+    if (sz == 4 && val >= 0) sw_store_note(b, val);     /* stack forwarding */
     if (!g_sl_active) return;
     if (is_slot(b, g_sl_base)) {
         int c = slot_reg(b, sz);
@@ -1364,10 +1370,13 @@ static void slots_load(void)
     }
 }
 
+static int sw_load(const Insn *b, int t);
+
 static void load_m(int t, const Insn *b, int sz)
 {
     int ra, rb, c = slot_reg(b, sz);
     if (c >= 0) { if (c != t) e(MR(t, c)); return; }
+    if (sz == 4 && sw_load(b, t)) return;   /* stack slot written or read in the block */
     if (sz == 1 && byte_direct(b)) { e(LBZ(t, (int32_t)b->disp, R(b->base))); return; }
     ea_pair(b, 1, &ra, &rb);
     load_p(t, ra, rb, sz);
@@ -1747,7 +1756,7 @@ static AluOp alu_operands(const Insn *b, int sz, int dir, int writes)
     else if (dir == 3) { o.target = EAX; o.vd = reg_val(EAX, sz, 3); }
     else if (!b->mem) { o.target = b->rm; o.vd = reg_val(o.target, sz, 3); }
     else if ((o.c = slot_reg(b, sz)) >= 0) { o.vd = o.c; if (writes && !g_sl_wb_now) ea_pair(b, 1, &o.ra, &o.rb); }
-    else { ea_pair(b, 1, &o.ra, &o.rb); load_p(3, o.ra, o.rb, sz); o.vd = 3; }
+    else { ea_pair(b, 1, &o.ra, &o.rb); if (sz != 4 || !sw_load(b, 3)) load_p(3, o.ra, o.rb, sz); o.vd = 3; }
     return o;
 }
 
@@ -1843,7 +1852,7 @@ static void gen_inc_dec(const Insn *b, int reg, int dec, int needs, int needs_cf
         int c = slot_reg(b, 4);
         only_reg = c >= 0 && g_sl_wb_now;
         if (!only_reg) ea_pair(b, 1, &ra, &rb);
-        if (c >= 0) vd = c; else { load_p(3, ra, rb, 4); vd = 3; }
+        if (c >= 0) vd = c; else { if (!sw_load(b, 3)) load_p(3, ra, rb, 4); vd = 3; }
         q = vd;
     }
     e(ADDI(vd, q, dec ? -1 : 1));
@@ -1861,7 +1870,7 @@ static void gen_rotate(const Insn *b, int right, int count)
         int c = slot_reg(b, 4);
         only_reg = c >= 0 && g_sl_wb_now;
         if (!only_reg) ea_pair(b, 1, &ra, &rb);
-        if (c >= 0) vd = c; else { load_p(3, ra, rb, 4); vd = 3; }
+        if (c >= 0) vd = c; else { if (!sw_load(b, 3)) load_p(3, ra, rb, 4); vd = 3; }
     }
     e(RLWINM(vd, vd, sh, 0, 31));
     if (!only_reg) { save_p(vd, ra, rb, 4); after_save(b, 4, ra, rb, vd); }
@@ -1878,7 +1887,7 @@ static void gen_rotate_cl(const Insn *b, int right)
         int c = slot_reg(b, 4);
         only_reg = c >= 0 && g_sl_wb_now;
         if (!only_reg) ea_pair(b, 1, &ra, &rb);
-        if (c >= 0) vd = c; else { load_p(3, ra, rb, 4); vd = 3; }
+        if (c >= 0) vd = c; else { if (!sw_load(b, 3)) load_p(3, ra, rb, 4); vd = 3; }
     }
     e(RLWNM(vd, vd, 5, 0, 31));
     if (!only_reg) { save_p(vd, ra, rb, 4); after_save(b, 4, ra, rb, vd); }
@@ -1948,7 +1957,7 @@ static void gen_shift(const Insn *b, int kind, int count, int needs)
         int c = slot_reg(b, 4);
         only_reg = c >= 0 && g_sl_wb_now;
         if (!only_reg) ea_pair(b, 1, &ra, &rb);
-        if (c >= 0) vd = c; else { load_p(3, ra, rb, 4); vd = 3; }
+        if (c >= 0) vd = c; else { if (!sw_load(b, 3)) load_p(3, ra, rb, 4); vd = 3; }
         vr = vd;
     }
     if (count >= 0) {                      /* fixed count 1..31 */
@@ -1987,7 +1996,7 @@ static void gen_double_shift(const Insn *b, int left, int count, int needs)
         int c = slot_reg(b, 4);
         only_reg = c >= 0 && g_sl_wb_now;
         if (!only_reg) ea_pair(b, 1, &ra, &rb);
-        if (c >= 0) vd = c; else { load_p(3, ra, rb, 4); vd = 3; }
+        if (c >= 0) vd = c; else { if (!sw_load(b, 3)) load_p(3, ra, rb, 4); vd = 3; }
         vr = vd;
     }
     if (count > 0) {
@@ -3672,25 +3681,37 @@ static void fw_pre_insn(const Insn *b, int interp, int verf)
  * mov r,[esp/ebp+d] then take the value without a load (load after store stalls the G4 ~8 cycles); the ret of an
  * inlined function is dropped entirely if its return slot provably holds the expected address. */
 #define SW_N 8
-typedef struct { int32_t off; char valid, kind; int8_t reg; uint32_t val, nr; } SwEntry;  /* art 'k', 'g', 'w' */
+/* kind 'k' constant, 'g' guest register, 'w' copy in host register reg; store: the slot got the value from a store
+   in the block (reading it from memory would stall the G4: a 'g' entry then moves to a copy when its register
+   changes) */
+typedef struct { int32_t off; char valid, kind; int8_t reg; char store; uint32_t val, nr; } SwEntry;
 static SwEntry g_sw[SW_N];
 static uint32_t g_sw_nr;                /* sequence number per entry: same number = same entry */
 static int g_sw_next, g_sw_host_next, g_sw_host_from = 32;
 static int g_sw_esp_ok, g_sw_ebp_ok;
 static int32_t g_sw_esp, g_sw_ebp;
+/* ebp unchanged since the block head while its relation to esp is unknown (a function body after the prologue): its slots
+   [ebp+d] are offsets in a second name space, SW_NSB + d. A write in one name space may hit any slot of the other. */
+#define SW_NSB 0x40000000
+static int g_sw_ebp_own, g_sw_aebp_own;
+static uint8_t g_sw_wm;                 /* registers the current instruction writes */
 static unsigned long g_st_sw, g_st_sw_ret;
 
-static void sw_all_drop(void) { int k; for (k = 0; k < SW_N; k++) g_sw[k].valid = 0; }
+/* the entry of the current instruction's memory operand as it was before the instruction (sw_pre_insn drops what the
+   instruction writes; a read-modify-write such as orl %eax,-0xa4(%ebp) reads the slot first) */
+static SwEntry g_sw_pre;
+
+static void sw_all_drop(void) { int k; for (k = 0; k < SW_N; k++) g_sw[k].valid = 0; g_sw_pre.valid = 0; }
 
 /* state at an inner jump; at the target only what holds on both paths remains */
-typedef struct { SwEntry e[SW_N]; int esp_ok, ebp_ok; int32_t esp, ebp; } SwStatus;
+typedef struct { SwEntry e[SW_N]; int esp_ok, ebp_ok, ebp_own; int32_t esp, ebp; } SwStatus;
 
 static SwStatus g_inner_sw[MAX_INSNS];
 
 static void sw_status_note(SwStatus *s)
 {
     memcpy(s->e, g_sw, sizeof g_sw);
-    s->esp_ok = g_sw_esp_ok; s->ebp_ok = g_sw_ebp_ok; s->esp = g_sw_esp; s->ebp = g_sw_ebp;
+    s->esp_ok = g_sw_esp_ok; s->ebp_ok = g_sw_ebp_ok; s->esp = g_sw_esp; s->ebp = g_sw_ebp; s->ebp_own = g_sw_ebp_own;
 }
 
 static void sw_status_hit(const SwStatus *s)
@@ -3705,6 +3726,7 @@ static void sw_status_hit(const SwStatus *s)
     }
     if (!s->esp_ok || s->esp != g_sw_esp) g_sw_esp_ok = 0;
     if (!s->ebp_ok || s->ebp != g_sw_ebp) g_sw_ebp_ok = 0;
+    if (!s->ebp_own) g_sw_ebp_own = 0;
 }
 
 /* at the block head: nothing known except esp = offset 0; host registers from host_from on are free */
@@ -3713,6 +3735,7 @@ static void sw_head(int host_from)
     sw_all_drop();
     g_sw_esp_ok = g_sw_aesp_ok = 1; g_sw_esp = g_sw_aesp = 0;
     g_sw_ebp_ok = g_sw_aebp_ok = 0;
+    g_sw_ebp_own = g_sw_aebp_own = !g_no_sw2;
     g_sw_host_from = host_from; g_sw_host_next = 0;
 }
 
@@ -3722,6 +3745,10 @@ static int sw_slot(const Insn *b, int32_t *off)
     if (!b->mem || b->seg || b->index >= 0) return 0;
     if (b->base == ESP && g_sw_aesp_ok) { *off = g_sw_aesp + (int32_t)b->disp; return 1; }
     if (b->base == EBP && g_sw_aebp_ok) { *off = g_sw_aebp + (int32_t)b->disp; return 1; }
+    if (b->base == EBP && g_sw_aebp_own && (int32_t)b->disp > -0x1000000 && (int32_t)b->disp < 0x1000000) {
+        *off = SW_NSB + (int32_t)b->disp;
+        return 1;
+    }
     return 0;
 }
 
@@ -3735,19 +3762,24 @@ static int sw_find(int32_t off)
 
 static void sw_write(int32_t off, int sz)       /* bytes [off, off + sz) written */
 {
-    int k;
-    for (k = 0; k < SW_N; k++) if (g_sw[k].valid && g_sw[k].off < off + sz && off < g_sw[k].off + 4) g_sw[k].valid = 0;
+    int k, ns = off >= SW_NSB / 2;
+    for (k = 0; k < SW_N; k++)
+        if (g_sw[k].valid && ((g_sw[k].off < off + sz && off < g_sw[k].off + 4) || (g_sw[k].off >= SW_NSB / 2) != ns))
+            g_sw[k].valid = 0;
 }
 
 static int sw_new(int32_t off)
 {
-    int k = g_sw_next;
-    sw_write(off, 4);
-    g_sw_next = (g_sw_next + 1) % SW_N;
+    int k = g_sw_next, m;
+    for (m = 0; m < SW_N; m++) if (g_sw[m].valid && g_sw[m].off < off + 4 && off < g_sw[m].off + 4) g_sw[m].valid = 0;
+    for (m = 0; m < SW_N && g_sw[k].valid; m++) k = (k + 1) % SW_N;    /* a free entry first, else the oldest in turn */
+    if (m == SW_N) k = g_sw_next;
+    g_sw_next = (k + 1) % SW_N;
     g_sw[k].off = off;
     g_sw[k].valid = 1;
     g_sw[k].reg = 0;
     g_sw[k].val = 0;
+    g_sw[k].store = 0;
     g_sw[k].nr = ++g_sw_nr;
     return k;
 }
@@ -3757,24 +3789,93 @@ static void sw_guest(int32_t off, int r) { int k; if (g_no_sw) return; k = sw_ne
 
 /* guest register r goes onto the stack: copy in a free r28..r31 (survives changes of r), otherwise r itself */
 /* value in host register q went to stack slot off: copy in a free r28..r31 (0: none free) */
-static int sw_host(int32_t off, int q)
+/* the next copy register of r28..r31 in turn (entries that had their copy there are dropped); 0: none free */
+static int sw_host_reg(void)
 {
     int k, h;
     if (g_no_sw || g_sw_host_from > 31) return 0;
     h = g_sw_host_from + g_sw_host_next;
     g_sw_host_next = (g_sw_host_next + 1) % (32 - g_sw_host_from);
     for (k = 0; k < SW_N; k++) if (g_sw[k].valid && g_sw[k].kind == 'w' && g_sw[k].reg == h) g_sw[k].valid = 0;
-    e(MR(h, q));
+    if (g_sw_pre.valid && g_sw_pre.kind == 'w' && g_sw_pre.reg == h) g_sw_pre.valid = 0;
+    return h;
+}
+
+/* returns the entry + 1 (0: no copy register free) */
+static int sw_host(int32_t off, int q)
+{
+    int k, h = sw_host_reg();
+    if (!h) return 0;
+    if (h != q) e(MR(h, q));
     k = sw_new(off);
     g_sw[k].kind = 'w';
     g_sw[k].reg = (int8_t)h;
-    return 1;
+    return k + 1;
 }
 
 static void sw_guest_save(int32_t off, int r)
 {
     if (g_no_sw) return;
     if (!sw_host(off, R(r))) sw_guest(off, r);
+}
+
+/* the block's instructions and the current one (lookahead: is a slot read again?) */
+static const Insn *g_sw_blk;
+static int g_sw_i, g_sw_n;
+
+/* is [ebp+d] read again in the block before it is overwritten or ebp changes (from the current instruction on)? */
+static int sw_read_later(int32_t d)
+{
+    int j;
+    if (!g_sw_blk) return 1;
+    for (j = g_sw_i; j < g_sw_n; j++) {
+        const Insn *y = &g_sw_blk[j];
+        if (y->mem && y->base == EBP && y->index < 0 && !y->seg && (int32_t)y->disp == d)
+            return !((y->op == 0x89 || y->op == 0xc7) && y->opsz == 4);     /* a plain store overwrites it unread */
+        if (write_mask(y) >> EBP & 1) return 0;
+    }
+    return 0;
+}
+
+static int slot_reg(const Insn *b, int sz);
+static int g_sw_no_note;                /* the caller remembers the stored value itself (mov m,imm: a constant) */
+
+/* after a 32-bit store of host register val to the memory operand of b: a stack slot holds val. A guest register
+   that this instruction does not change is remembered as such; otherwise (a temporary, or xchg/xadd change it
+   afterwards) a copy goes into a free r28..r31 right after the store. */
+static void sw_store_note(const Insn *b, int val)
+{
+    int32_t off;
+    int x, k;
+    if (g_no_sw || g_no_sw2 || g_sw_no_note || !sw_slot(b, &off) || slot_reg(b, 4) >= 0) return;
+    for (x = 0; x < 8; x++)
+        if (R(x) == val && !(g_sw_wm >> x & 1)) {
+            k = sw_new(off);
+            g_sw[k].kind = 'g'; g_sw[k].reg = (int8_t)x; g_sw[k].store = 1;
+            return;
+        }
+    if ((k = sw_host(off, val)) > 0) g_sw[k - 1].store = 1;
+}
+
+static void sw_fetch(int k, int t);
+
+/* a 32-bit stack slot read (operand of an ALU instruction or read-modify-write): the remembered value into t */
+static int sw_load(const Insn *b, int t)
+{
+    int32_t off;
+    int k;
+    if (g_no_sw2 || !sw_slot(b, &off) || slot_reg(b, 4) >= 0) return 0;
+    if ((k = sw_find(off)) >= 0) { sw_fetch(k, t); return 1; }
+    if (g_sw_pre.valid && g_sw_pre.off == off) {      /* (sw_fetch with the saved entry) */
+        if (g_sw_pre.kind == 'k') load_imm(t, g_sw_pre.val);
+        else {
+            int q = g_sw_pre.kind == 'g' ? R(g_sw_pre.reg) : g_sw_pre.reg;
+            if (q != t) e(MR(t, q));
+        }
+        g_st_sw++;
+        return 1;
+    }
+    return 0;
 }
 
 /* value of slot k into host register t */
@@ -3795,8 +3896,13 @@ static void sw_pre_insn(const Insn *b, int interp, int verf)
     int32_t off;
     g_sw_aesp_ok = g_sw_esp_ok; g_sw_aesp = g_sw_esp;
     g_sw_aebp_ok = g_sw_ebp_ok; g_sw_aebp = g_sw_ebp;
+    g_sw_aebp_own = g_sw_ebp_own;
+    g_sw_wm = interp ? 0xff : write_mask(b);
+    if (interp || (g_sw_wm >> EBP & 1)) g_sw_ebp_own = 0;   /* (state after the instruction) */
+    g_sw_pre.valid = 0;
     if (verf == 5) return;                  /* direct math: no memory, esp unchanged (c_call flushes afterwards) */
     for (k = 0; k < SW_N; k++) if (g_sw[k].valid) { used = 1; if (g_sw[k].kind == 'g') guest = 1; }
+    if (used && !interp && !g_no_sw2 && b->mem && sw_slot(b, &off) && (k = sw_find(off)) >= 0) g_sw_pre = g_sw[k];
     if (used) {                           /* only then is the check worth it (translation stays fast) */
         /* memory: what the instruction can write is invalid */
         if (interp) sw_all_drop();
@@ -3808,9 +3914,15 @@ static void sw_pre_insn(const Insn *b, int interp, int verf)
             if (sw_slot(b, &off)) sw_write(off, write_size(b)); else sw_all_drop();
         }
         /* registers: entries with a changed guest register */
-        if (guest) {
-            uint8_t wm = interp ? 0xff : write_mask(b);
-            for (k = 0; k < SW_N; k++) if (g_sw[k].valid && g_sw[k].kind == 'g' && (wm >> g_sw[k].reg & 1)) g_sw[k].valid = 0;
+        if (guest) {                       /* a stored value moves to a copy register first (before this instruction) */
+            uint8_t wm = g_sw_wm;
+            for (k = 0; k < SW_N; k++)
+                if (g_sw[k].valid && g_sw[k].kind == 'g' && (wm >> g_sw[k].reg & 1)) {
+                    int h = g_sw[k].store && !interp &&
+                            (g_sw[k].off < SW_NSB / 2 || sw_read_later(g_sw[k].off - SW_NSB)) ? sw_host_reg() : 0;
+                    if (h) { e(MR(h, R(g_sw[k].reg))); g_sw[k].kind = 'w'; g_sw[k].reg = (int8_t)h; }
+                    else g_sw[k].valid = 0;
+                }
         }
     }
     (void)r;
@@ -5308,7 +5420,7 @@ static void gen(const Insn *b, int needs, int needs_cf)
             int c = slot_reg(b, 4);
             only_reg = c >= 0 && g_sl_wb_now;
             if (!only_reg) ea_pair(b, 1, &ra, &rb);
-            if (c >= 0) v = c; else { load_p(3, ra, rb, 4); v = 3; }
+            if (c >= 0) v = c; else { if (!sw_load(b, 3)) load_p(3, ra, rb, 4); v = 3; }
         } else v = R(b->rm);
         if (b->reg == 2) e(NOR(v, v, v));
         else {
@@ -5335,7 +5447,7 @@ static void gen(const Insn *b, int needs, int needs_cf)
         int32_t off;
         if (b->mem) {
             save_m(reg_src(b->reg, g, 4), b, g);
-            if (g == 4 && sw_slot(b, &off)) {                          /* stack slot now holds this register */
+            if (g == 4 && g_no_sw2 && sw_slot(b, &off)) {              /* stack slot now holds this register */
                 if (b->base == ESP && g_sw_arg_copy) sw_guest_save(off, b->reg);   /* argument: copy survives */
                 else sw_guest(off, b->reg);
             }
@@ -5398,7 +5510,9 @@ static void gen(const Insn *b, int needs, int needs_cf)
             else { e(LI(4, b->imm & (g == 1 ? 0xff : 0xffff))); reg_set(b->rm, g, 4); }
             return;
         }
+        g_sw_no_note = 1;
         save_m(imm_reg(g == 1 ? (b->imm & 0xff) : g == 2 ? (b->imm & 0xffff) : b->imm, 4), b, g);
+        g_sw_no_note = 0;
         {
             int32_t off;
             if (g == 4 && sw_slot(b, &off)) sw_const(off, b->imm);
@@ -6650,6 +6764,7 @@ static void after_call(void)
     fw_flush();
     sw_all_drop();
     g_sw_esp_ok = g_sw_ebp_ok = 0;
+    g_sw_ebp_own = 0;
     g_xm_ok = 0;
     for (k = 0; k < g_k_n; k++) load_imm(g_k_reg[k], g_k_val[k]);
     g_st_cont++;
@@ -7307,6 +7422,7 @@ static uint32_t *translate_block(uint32_t eip)
         }
         if (i == st_k + 1 && st_k >= 0 && !(g_careful & 4)) continue;
         fw_pre_insn(x, interp[i], traced[i]);   /* store forwarding: what x writes invalidates entries */
+        g_sw_blk = b; g_sw_i = i; g_sw_n = n;
         sw_pre_insn(x, interp[i], traced[i]);   /* stack forwarding: esp/ebp and remembered slots */
         {                                   /* mov r,s before a computation on r: the computation reads s (three operands) */
             int mz, mq;
@@ -8559,6 +8675,13 @@ static void cache_load(void)
         if (stat(g_vimage[j].path, &st) || (uint32_t)st.st_size != g_vimage[j].size || (uint32_t)st.st_mtime != g_vimage[j].mtime ||
             (uint32_t)st.st_ino != g_vimage[j].ino) {
             reason = g_vimage[j].path;
+            goto way;
+        }
+        /* the saved program must also be this one: a cache file named by ROSETTA_CACHE_FILE serves any program (openssl's
+           blocks were taken for gzip's code at the same addresses) */
+        if (g_vimage[j].type == 2 && (!g_prog_full[0] || stat(g_prog_full, &st) || (uint32_t)st.st_ino != g_vimage[j].ino ||
+                                      (uint32_t)st.st_size != g_vimage[j].size)) {
+            reason = "another program";
             goto way;
         }
     }

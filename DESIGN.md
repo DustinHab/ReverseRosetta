@@ -516,6 +516,26 @@ page). Running measurement series: `tests/measure_all.sh`.
   push/mov to stack slots are recorded as a constant, guest register or copy in a free register of r28-r31;
   pop/leave/mov loads fetch them without memory, the embedded `ret` disappears entirely if its slot provably holds
   the address.
+- *Stack slots of function bodies* (`ROSETTA_NO_SW2`): gcc's i386 code keeps most locals in `[ebp-d]` (seven
+  registers), and a block that starts after the prologue (a loop head, a jump target) did not know ebp relative to esp,
+  so none of its slots were forwarded; only `mov` loads were. Now (1) ebp that has not changed since the block head
+  gives slots of a second name space (`SW_NSB + d`; a write in one name space drops the entries of the other, since
+  esp and ebp may alias); (2) every 32-bit read of a slot uses the entry: ALU operands (`addl -0x88(%ebp),%eax`) and
+  the read of a read-modify-write (`xorl %ecx,-0x88(%ebp)`, inc, not, shifts, rotates; the entry of the instruction's
+  own operand is kept for its read before it is dropped as written); (3) every 32-bit store records its value
+  (`after_save`): a guest register as such, a temporary as a copy in a free r28-r31 right after the store; a stored
+  guest register that is about to change moves to a copy first, if the block reads the slot again before ebp changes
+  or a plain store overwrites it. Loads after stores to the same address stall the G4; OpenSSL's SHA-1 and DES, MD5
+  and gzip are C code of this kind. `tests/stack_fw.c` covers esp/ebp aliases, read-modify-write, xchg/xadd with a slot,
+  writes through pointers, 8/16-bit writes into a slot and a call that changes its argument slot. Measured (A/B,
+  processor time): openssl sha1 +13 %, aes-128-cbc +12 %, bzip2 -9 +5 %, gzip and md5 unchanged.
+- *128 instructions per superblock* (was 48; `ROSETTA_MAX_INSNS`): long straight code (SHA-1's unrolled rounds,
+  bzip2's sorting) left a block every 48 instructions, with the flags stored and the stack knowledge lost each time.
+  bzip2 -9 4.79 against 5.25 s, sha1 -7 %, aes -3 %, the others unchanged; cold and cached starts (Calculator, ls, perl,
+  python, openssl) unchanged.
+- Bug fixed: a translation cache named by `ROSETTA_CACHE_FILE` was taken for any program as long as the program that
+  wrote it was unchanged on disk (gzip ran openssl's blocks at the same addresses and crashed); the saved program must
+  now be the running one (inode and size).
 - *Conditions from stored flags* without a C helper, when the flag kind at run time is cmp/sub or logic (32 bit)
   (qsort: `jge` on a `jne`; bench_control_flow +9 %).
 - Bug fixed: `writes_reg` reported no written register for `mul/imul/div/idiv` (f6/f7 /4-7) and `not/neg r/m8`

@@ -425,6 +425,8 @@ void state_show(Cpu *c, const char *reason)
             (unsigned long long)c->insns);
     fprintf(stderr, "  last:");
     for (i = 16; i >= 1; i--) fprintf(stderr, " %08x", g_history[(g_history_pos - (unsigned)i) % HISTORY]);
+    fprintf(stderr, "\n  last instruction: ");
+    guest_where(stderr, g_history[(g_history_pos - 1u) % HISTORY], 1);
     fprintf(stderr, "\n");
     if (c->eip && (decode(c->eip, &b) || b.invalid)) {
         fprintf(stderr, "  instruction %s, bytes", insn_name(&b));
@@ -439,7 +441,8 @@ void state_show(Cpu *c, const char *reason)
         for (i = 0; i < 12 && !(bp & 3) && word_safe(bp + 4, &w); i++) {
             uint32_t a0 = 0, a1 = 0, a2 = 0;
             word_safe(bp + 8, &a0); word_safe(bp + 12, &a1); word_safe(bp + 16, &a2);
-            fprintf(stderr, "\n    %08x (%08x %08x %08x)", w, a0, a1, a2);
+            fprintf(stderr, "\n    %08x (%08x %08x %08x) ", w, a0, a1, a2);
+            guest_where(stderr, w, i == 0);
             if (!word_safe(bp, &next) || next <= bp) break;
             bp = next;
         }
