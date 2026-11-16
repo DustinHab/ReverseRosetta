@@ -247,7 +247,7 @@ static int ag_group(const uint8_t *p, uint32_t len, int to_host)
 typedef struct {
     vm_address_t copy, original; vm_size_t size; int original_release;
     uint32_t target, target_len;             /* result in shared memory: client address, length */
-    uint32_t mtyp, rtyp, glyphs;           /* requested metric and result kind, number of glyphs ('gary') */
+    uint32_t mtyp, rtyp, cfmt, glyphs;     /* requested metric, result kind and format, number of glyphs ('gary') */
 } AtsCopy;
 
 static void ag_swap(uint8_t *p, uint32_t len, int to_host, int depth, AtsCopy *ko)
@@ -261,8 +261,9 @@ static void ag_swap(uint8_t *p, uint32_t len, int to_host, int depth, AtsCopy *k
         uint32_t tag = read_u(a, to_host), g = read_u(a + 4, to_host), w = g & 0x3fffffff, k;
         uint32_t gross = 4 * w - (g >> 30), dl = gross > 8 ? gross - 8 : 0;
         words_swap(a, 8);
-        if (ko && to_host && dl >= 4 && (tag == K4('m', 't', 'y', 'p') || tag == K4('r', 't', 'y', 'p')))
-            *(tag == K4('m', 't', 'y', 'p') ? &ko->mtyp : &ko->rtyp) = read_u(d, 1);
+        if (ko && to_host && dl >= 4 && (tag == K4('m', 't', 'y', 'p') || tag == K4('r', 't', 'y', 'p') ||
+                                         tag == K4('c', 'f', 'm', 't')))
+            *(tag == K4('m', 't', 'y', 'p') ? &ko->mtyp : tag == K4('r', 't', 'y', 'p') ? &ko->rtyp : &ko->cfmt) = read_u(d, 1);
         if (tag == K4('g', 'a', 'r', 'y')) {
             if (ko && to_host) ko->glyphs = dl / 2;
             for (k = 0; k + 2 <= dl; k += 2) h_swap(d, k);
@@ -299,6 +300,41 @@ static void ofa_content(uint8_t *m, uint32_t n, int to_host)
     if (m[b + 3] && sz <= n - (b + 0x11)) ag_swap(m + b + 0x11, sz, to_host, 0, 0);   /* embedded */
 }
 
+/* ROSETTA_ATS_LOG=3: snapshot of the shared memory around the target before the request, changed ranges after it */
+static uint8_t *g_snap;
+static vm_address_t g_snap_addr;
+static vm_size_t g_snap_size;
+
+static void shm_snapshot(uint32_t target)
+{
+    vm_address_t a = target;
+    vm_size_t sz = 0;
+    vm_region_basic_info_data_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT;
+    mach_port_t obj;
+    free(g_snap); g_snap = 0;
+    if (vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS)
+        return;
+    if (a > target || sz > 0x400000 || !(g_snap = malloc(sz))) return;
+    memcpy(g_snap, (const void *)a, sz);
+    g_snap_addr = a; g_snap_size = sz;
+}
+
+static void shm_diff(void)
+{
+    uint32_t o, start = 0, in = 0;
+    if (!g_snap) return;
+    fprintf(stderr, "  [shm] region %08x+%x changed:", (uint32_t)g_snap_addr, (uint32_t)g_snap_size);
+    for (o = 0; o + 4 <= g_snap_size; o += 4) {
+        int ch = memcmp(g_snap + o, (const uint8_t *)g_snap_addr + o, 4) != 0;
+        if (ch && !in) { start = o; in = 1; }
+        if (!ch && in) { fprintf(stderr, " %x-%x", start, o); in = 0; }
+    }
+    if (in) fprintf(stderr, " %x-%x", start, o);
+    fprintf(stderr, "\n");
+    free(g_snap); g_snap = 0;
+}
+
 static void ofa_request(uint8_t *m, uint32_t n, AtsCopy *k)
 {
     ofa_content(m, n, 1);
@@ -314,6 +350,7 @@ static void ofa_request(uint8_t *m, uint32_t n, AtsCopy *k)
         k->copy = fresh; k->original = addr; k->size = sz;
         k->original_release = e[8];        /* deallocate: the kernel frees the copy, rosetta the original */
     }
+    if (g_ats_log > 2 && k->target) shm_snapshot(k->target);
 }
 
 /* after mach_msg: free the copy or (with deallocate and a successful send) the original */
@@ -339,32 +376,46 @@ static void ofa_reply(uint8_t *m, uint32_t n, AtsCopy *k)
     }
     /* result in the client's shared memory ('dest' = 'shmo'): the server has written it there in its byte order.
        Metrics per glyph ('mtyp'): 'mfrc' 24 bytes of Fixed values; 'mrdr' 36 bytes {Fixed advance x, y,
-       origin x, y; u16 height, width; Fixed x 4}. Glyph paths ('rtyp' = 'path'): 32-bit values. */
+       origin x, y; u16 height, width; Fixed left bearing, top, right bearing, 0}. Glyph paths ('rtyp' = 'path',
+       format 'gxpt': QuickDraw GX paths, contour count, then per contour point count, control bit words, Fixed
+       points): 32-bit values. Bitmaps of a bitmap strike ('rtyp' = 'bmap', format 'cfmt' = 'mtbm', no 'mtyp'):
+       per glyph the 36 bytes of 'mrdr' followed by the image, height rows of (width + 7) / 8 bytes (one bit per
+       pixel), padded to an even length; the next glyph follows directly (2-byte aligned). The image bytes stay as
+       they are. */
     if (k->target && k->target_len && k->target_len <= 0x100000 && ((mach_msg_header_t *)m)->msgh_id == 0) {
         uint8_t *p = (uint8_t *)(uintptr_t)k->target;
         uint32_t o = 0, i;
         static uint32_t reported[4];
+        if (g_ats_log > 2) shm_diff();
         if (g_ats_log > 0) {
             fprintf(stderr, "  [target] %08x+%x:", k->target, k->target_len);
-            for (i = 0; i + 4 <= k->target_len && i < 256; i += 4) fprintf(stderr, " %08x", *(uint32_t *)(uintptr_t)(k->target + i));
+            for (i = 0; i + 4 <= k->target_len && i < (g_ats_log > 1 ? 4096u : 256u); i += 4) fprintf(stderr, " %08x", *(uint32_t *)(uintptr_t)(k->target + i));
             fprintf(stderr, "\n");
         }
-        if (k->mtyp == K4('m', 'r', 'd', 'r'))
-            for (i = 0; i < k->glyphs && o + 0x24 <= k->target_len; i++, o += 0x24) {
-                words_swap(p + o, 0x10);
-                h_swap(p + o, 0x10); h_swap(p + o, 0x12);
-                words_swap(p + o + 0x14, 0x10);
+        int images = k->rtyp == K4('b', 'm', 'a', 'p') && k->cfmt == K4('m', 't', 'b', 'm') && !k->mtyp;
+        if (k->mtyp == K4('m', 'r', 'd', 'r') || images)
+            for (i = 0; i < k->glyphs && o + 0x24 <= k->target_len; i++) {
+                uint8_t *r = p + o;
+                uint32_t height = r[0x10] << 8 | r[0x11], width = r[0x12] << 8 | r[0x13];
+                uint32_t n = images ? height * ((width + 7) / 8) : 0;      /* image bytes behind the header */
+                words_swap(r, 0x10);
+                h_swap(r, 0x10); h_swap(r, 0x12);
+                words_swap(r + 0x14, 0x10);
+                o += 0x24 + n + (n & 1);
             }
-        for (i = 0; i < 2; i++) {
-            uint32_t kind = i ? k->rtyp : k->mtyp;
-            if (!kind || kind == K4('m', 'r', 'd', 'r') || kind == K4('m', 'f', 'r', 'c') || kind == K4('p', 'a', 't', 'h')) continue;
+        for (i = 0; i < 3; i++) {
+            uint32_t kind = i == 0 ? k->mtyp : i == 1 ? k->rtyp : k->cfmt;
+            if (!kind || kind == K4('m', 'r', 'd', 'r') || kind == K4('m', 'f', 'r', 'c') || kind == K4('p', 'a', 't', 'h') ||
+                kind == K4('m', 't', 'b', 'm') || kind == K4('g', 'x', 'p', 't') ||
+                (kind == K4('b', 'm', 'a', 'p') && (images || k->mtyp == K4('m', 'r', 'd', 'r'))))
+                continue;
             if (reported[0] != kind && reported[1] != kind && reported[2] != kind && reported[3] != kind) {
                 fprintf(stderr, "rosetta: ATS result kind '%c%c%c%c' only converted word by word\n",
                         kind >> 24, (kind >> 16) & 0xff, (kind >> 8) & 0xff, kind & 0xff);
                 reported[kind % 4] = kind;
             }
         }
-        ag_swap(p + o, k->target_len - o, 0, 0, 0);
+        if (!images && o < k->target_len) ag_swap(p + o, k->target_len - o, 0, 0, 0);
     }
 }
 
@@ -441,7 +492,7 @@ static void ats_reply(uint8_t *m, uint32_t n, uint32_t type, AtsCopy *k)
 static void ats_show(const char *was, const uint8_t *m, uint32_t n, int guest)
 {
     uint32_t i;
-    if (g_ats_log < 0) g_ats_log = getenv("ROSETTA_ATS_LOG") != 0;
+    if (g_ats_log < 0) g_ats_log = getenv("ROSETTA_ATS_LOG") ? atoi(getenv("ROSETTA_ATS_LOG")) : 0;
     if (!g_ats_log) return;
     fprintf(stderr, "[ats %s] id %d size %u:", was, (int32_t)(guest ? swap32(*(const uint32_t *)(m + 20)) : *(const uint32_t *)(m + 20)), n);
     for (i = 24; i + 4 <= n && i < 24 + 4 * 48; i += 4) fprintf(stderr, " %08x", *(const uint32_t *)(m + i));
@@ -456,7 +507,7 @@ static void ats_show(const char *was, const uint8_t *m, uint32_t n, int guest)
             if (e[11] != DESC_OOL && e[11] != DESC_OOL_VOLATILE) continue;
             if (addr == 0 || sz > 0x100000) continue;
             fprintf(stderr, "  [ool %u] %08x+%x:", d, addr, sz);
-            for (k = 0; k + 4 <= sz && k < 256; k += 4) fprintf(stderr, " %08x", *(const uint32_t *)(uintptr_t)(addr + k));
+            for (k = 0; k + 4 <= sz && k < (g_ats_log > 1 ? 4096u : 256u); k += 4) fprintf(stderr, " %08x", *(const uint32_t *)(uintptr_t)(addr + k));
             fprintf(stderr, "\n");
         }
     }

@@ -1,8 +1,10 @@
-/* fonts.c - font metrics via CoreText/ATS (stage 5): glyphs, advances, bounding boxes, paths. Needs the ATSServer
-   of the login session (tests/in_session.sh); the Intel version under rosetta must print the same as the PowerPC
-   version (rosetta converts the ATS messages). */
+/* fonts.c - font metrics via CoreText/ATS (stage 5): glyphs, advances, bounding boxes, paths, and small text drawn
+   without antialiasing (bitmap strikes: the font server sends metrics and a 1-bit image per glyph). Needs the
+   ATSServer of the login session (tests/in_session.sh); the Intel version under rosetta must print the same as the
+   PowerPC version (rosetta converts the ATS messages). */
 #include <ApplicationServices/ApplicationServices.h>
 #include <stdio.h>
+#include <string.h>
 
 static void tally(void *info, const CGPathElement *e)
 {
@@ -43,10 +45,37 @@ static void font(CFStringRef name, CGFloat size)
     CFRelease(f);
 }
 
+/* text in a gray bitmap, printed row by row: # dark, + gray, . white */
+static void bitmap(const char *name, CGFloat size, const char *text)
+{
+    enum { W = 100, H = 16 };
+    static unsigned char px[W * H];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
+    CGContextRef c = CGBitmapContextCreate(px, W, H, 8, W, cs, kCGImageAlphaNone);
+    int x, y;
+    memset(px, 255, sizeof px);
+    CGContextSetGrayFillColor(c, 0, 1);
+    CGContextSetShouldAntialias(c, false);
+    CGContextSelectFont(c, name, size, kCGEncodingMacRoman);
+    CGContextShowTextAtPoint(c, 1, 4, text, strlen(text));
+    CGContextFlush(c);
+    printf("%s %.0f without antialiasing:\n", name, (double)size);
+    for (y = 0; y < H; y++) {
+        for (x = 0; x < W; x++) putchar(px[y * W + x] < 96 ? '#' : px[y * W + x] < 224 ? '+' : '.');
+        putchar('\n');
+    }
+    CGContextRelease(c);
+    CGColorSpaceRelease(cs);
+}
+
 int main(void)
 {
     font(CFSTR("LucidaGrande"), 13.0);
     font(CFSTR("Helvetica-Bold"), 24.0);
     font(CFSTR("Times-Roman"), 9.5);
+    bitmap("Monaco", 10.0, "Info Log 0127 gQ");
+    bitmap("Monaco", 9.0, "Info Log 0127 gQ");
+    bitmap("Geneva", 9.0, "Info Log 0127 gQ");
+    bitmap("Geneva", 12.0, "mWM%@ wide");
     return 0;
 }

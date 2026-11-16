@@ -146,7 +146,8 @@ is filled (4.7 s at the very first start), the native one 0.66 s.
   over HTTP with CSS, JavaScript and images (HTTPS to current servers fails on 10.5 natively too). Programs open
   documents and URLs in other applications through LaunchServices (a game's Read Me opens in TextEdit), with the
   quarantine labels of downloaded files read and written as natively. Text rendering goes through the system's
-  PowerPC font server; font metrics, glyph outlines and paths are identical to a native build (`tests/fonts.c`).
+  PowerPC font server; font metrics, glyph outlines, paths and the bitmap glyphs of small text without antialiasing
+  are identical to a native build (`tests/fonts.c`).
 - Installed universal applications through their i386 part (`tests/app_survey.sh`, `tools/apps_i386.sh`): of the 44 on
   the test machine, 38 open their windows within 40 seconds, among them Keynote, Pages and Numbers ('09), Xcode 3.1,
   Interface Builder's sibling tools (Dashcode, Instruments, Quartz Composer, Shark, FileMerge, PackageMaker, Icon
@@ -310,9 +311,9 @@ tools/stubs_rebuild.sh                 # all stub libraries for all programs at 
 build/rosetta intel/apps/Calculator.app/Contents/MacOS/Calculator
 ```
 
-Stub libraries stand in for i386 libraries that are neither in the update nor in the system (CoreVideo, QuickTime,
-QTKit, SpeechRecognition ...). Their functions report `rosetta-stub: NAME missing` on the first call and return an
-error code.
+Stub libraries stand in for i386 libraries that are neither in the update nor in the system (SpeechRecognition,
+Tcl, OpenDirectory ...; QuickTime, QTKit and CoreVideo until `tools/intel_quicktime.sh` has replaced them). Their
+functions report `rosetta-stub: NAME missing` on the first call and return an error code.
 
 ### Environment variables
 
@@ -329,7 +330,7 @@ error code.
 | `ROSETTA_HOST_CPU=1` | show the guest the real PowerPC processor instead of the Intel one |
 | `ROSETTA_STATS=1` | translator counters and times at exit; at the first idle moment processor time, page faults, system calls, Mach messages by id and interpreted opcodes of the startup |
 | `ROSETTA_LOG=1` | log of system calls and Mach traps, with paths and service names (`=2`: with time and thread, `=3`: also the words of every Mach message) |
-| `ROSETTA_ATS_LOG=1` | every message to the font server, in the server's byte order |
+| `ROSETTA_ATS_LOG=1` | every message to the font server, in the server's byte order (`2`: longer dumps, `3`: changed shared memory) |
 | `ROSETTA_HPROFILE=FILE` | sampling profile of the translator and the guest (`ROSETTA_HPROFILE_CPU=1`: processor time) |
 | `ROSETTA_STATE=1` | `kill -USR2` prints where every guest thread is (for programs that hang) |
 | `ROSETTA_CRASH_STDERR=1` | crash details on stderr instead of `~/Library/Logs/rosetta/PROGRAM-PID.txt` |
@@ -376,9 +377,9 @@ well.
 - Multiprocessor Macs (dual G4, dual and quad G5) are untested. The handshake between the watchdog thread and
   running translated code assumes a single CPU and uses no memory barriers; rare crashes or hangs are possible there.
 - Accessibility (System Events, assistive devices) does not see the windows of translated programs.
-- Frameworks that the 10.5.8 update does not contain as i386 (QuickTime, QTKit, CoreVideo, Tcl, OpenDirectory ...)
-  are stubs; features that need them do not work. Their functions report `rosetta-stub: NAME missing` once and return
-  an error code, their Objective-C classes exist with the right superclass and answer unknown messages with nil
+- Frameworks that neither the 10.5.8 update nor the QuickTime 7.6.4 package contain as i386 (Tcl, OpenDirectory,
+  SpeechRecognition ...) are stubs; features that need them do not work. Their functions report
+  `rosetta-stub: NAME missing` once and return an error code, their Objective-C classes exist with the right superclass and answer unknown messages with nil
   (`tools/sdk_stubs_all.sh`, `tools/app_stubs.sh`, `tools/stubs_rebuild_all.sh`). Calculator's engine is the exception: it runs as the native
   PowerPC function.
 - Programs with windows start slowly the first two times (see the table under Performance). With the translation

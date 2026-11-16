@@ -775,15 +775,21 @@ bootstrap look_up reply for `com.apple.FontObjectsServer`):
   memory stays untouched; deallocate semantics emulated).
 - Results in the client's shared memory ('dest' = 'shmo'): the server writes them there in its byte order; rosetta
   swaps them after the reply according to the result kind: 'mfrc' (24 bytes Fixed), 'mrdr' (36 bytes, two 16-bit
-  fields height/width at +0x10), 'path' (words). rosetta reports other kinds once.
+  fields height/width at +0x10), 'path' with format 'gxpt' (QuickDraw GX paths: words). Small text without
+  antialiasing in a font with bitmap strikes (Monaco, Geneva) asks for 'bmap' with format 'mtbm': per glyph the 36
+  bytes of 'mrdr' and then the image, height rows of (width + 7) / 8 bytes, padded to an even length, the next glyph
+  directly behind it at a 2-byte boundary. Only the headers are swapped; swapping the whole range word by word had
+  cut off the top rows of every glyph. rosetta reports other kinds and formats once.
 - Patch 4 from the preparatory work (forcing run-time byte swapping) has been reverted: no longer needed.
 
 Result: Calculator.app (Intel) draws windows and text completely; `tests/fonts.c` (CoreText: metrics, glyphs,
-advances, outlines, paths for three fonts) gives the same output under rosetta as native (test suite, needs the login
-session). Debugging: `ROSETTA_ATS_LOG=1` shows every message in server byte order with OOL and destination buffers
-(`tests/ats_trace.sh`, `ats_sequence.sh`, `ats_dest.sh`, `ats_dest_types.sh`); guest crashes now show the stack and
-the ebp chain with arguments. Open: requests with embedded structures (0x02, 0x0a, 0x12, 0x14, 0x18, 0x1b) and
-bitmap results. GetFSRefForFileToken (0x09) was solved later, see "Compatibility and everyday use".
+advances, outlines, paths for three fonts; text without antialiasing in Monaco 9/10 and Geneva 9/12) gives the
+same output under rosetta as native (test suite, needs the login session). Debugging: `ROSETTA_ATS_LOG=1` shows
+every message in server byte order with OOL and destination buffers (the first 256 bytes; `=2` up to 4 KB; `=3` also
+the ranges of the shared memory that the server changed while answering) (`tests/ats_trace.sh`, `ats_sequence.sh`,
+`ats_dest.sh`, `ats_dest_types.sh`); guest crashes now show the stack and the ebp chain with arguments. Open:
+requests with embedded structures (0x02, 0x0a, 0x12, 0x14, 0x18, 0x1b). Bitmap results were solved on 16 November
+2026 (see above). GetFSRefForFileToken (0x09) was solved later, see "Compatibility and everyday use".
 
 **Transmission 2.42** (screenshot `docs/transmission-on-ibook-g4.png`). Last version for Leopard, official download
 from github.com/transmission/transmission-releases (4089162 bytes, MD5 2b2ab8cc42b96242a1bc7470c5a20123), main
