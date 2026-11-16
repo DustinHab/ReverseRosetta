@@ -358,6 +358,7 @@ static struct {
     void *(*RetainPBuffer)(void *);
     void (*ReleasePBuffer)(void *);
     unsigned (*GetPBufferRetainCount)(void *);
+    int (*SetPBufferVolatileState)(void *, int *);   /* private (Quartz Composer: purgeable textures) */
     const char *(*ErrorString)(int);
     void (*GetVersion)(int *, int *);
     int (*SetOption)(int, int);
@@ -526,8 +527,8 @@ static void gl_load(void)
     SYM(CopyContext); SYM(SetOffScreen); SYM(GetOffScreen); SYM(SetFullScreen); SYM(SetFullScreenOnDisplay);
     SYM(QueryRendererInfo); SYM(DescribeRenderer); SYM(DestroyRendererInfo); SYM(CreatePBuffer); SYM(DestroyPBuffer);
     SYM(DescribePBuffer); SYM(SetPBuffer); SYM(GetPBuffer); SYM(TexImagePBuffer); SYM(RetainPBuffer);
-    SYM(ReleasePBuffer); SYM(GetPBufferRetainCount); SYM(ErrorString); SYM(GetVersion); SYM(SetOption);
-    SYM(GetOption); SYM(LockContext); SYM(UnlockContext);
+    SYM(ReleasePBuffer); SYM(GetPBufferRetainCount); SYM(SetPBufferVolatileState); SYM(ErrorString);
+    SYM(GetVersion); SYM(SetOption); SYM(GetOption); SYM(LockContext); SYM(UnlockContext);
     cg = dlopen("/System/Library/Frameworks/ApplicationServices.framework/Frameworks/CoreGraphics.framework/CoreGraphics",
                 RTLD_LAZY | RTLD_LOCAL);
     if (cg) *(void **)&H.cgs_default = dlsym(cg, "_CGSDefaultConnection");
@@ -911,6 +912,15 @@ static int c_TexImagePBuffer(Cpu *c) { CTX(0); RET(H.TexImagePBuffer(p->host, AP
 static int c_RetainPBuffer(Cpu *c) { RET(gl_ready() ? (uintptr_t)H.RetainPBuffer(AP(0)) : 0); }
 static int c_ReleasePBuffer(Cpu *c) { if (gl_ready()) H.ReleasePBuffer(AP(0)); RET(0); }
 static int c_GetPBufferRetainCount(Cpu *c) { RET(gl_ready() ? H.GetPBufferRetainCount(AP(0)) : 0); }
+/* state: in 0 or 1 (purgeable), out what the accelerator reports (IOAccelSurfaceControl) */
+static int c_SetPBufferVolatileState(Cpu *c)
+{
+    int s = A(1) ? (int)ld32(A(1)) : 0, err;
+    if (!gl_ready() || !H.SetPBufferVolatileState) RET(kCGLBadCodeModule);
+    err = H.SetPBufferVolatileState(AP(0), A(1) ? &s : 0);
+    out32(A(1), (uint32_t)s);
+    RET(err);
+}
 static int c_ErrorString(Cpu *c) { RET(gl_ready() ? (uintptr_t)H.ErrorString((int)A(0)) : (uintptr_t)"no OpenGL"); }
 static int c_GetVersion(Cpu *c)
 {
@@ -948,7 +958,8 @@ static const struct { const char *name; Stub fn; } g_cgl[] = {
     C(Disable), C(IsEnabled), C(SetVirtualScreen), C(GetVirtualScreen), C(CopyContext), C(SetOffScreen),
     C(GetOffScreen), C(SetFullScreen), C(SetFullScreenOnDisplay), C(QueryRendererInfo), C(DescribeRenderer),
     C(DestroyRendererInfo), C(CreatePBuffer), C(DestroyPBuffer), C(DescribePBuffer), C(SetPBuffer), C(GetPBuffer),
-    C(TexImagePBuffer), C(RetainPBuffer), C(ReleasePBuffer), C(GetPBufferRetainCount), C(ErrorString), C(GetVersion),
+    C(TexImagePBuffer), C(RetainPBuffer), C(ReleasePBuffer), C(GetPBufferRetainCount), C(SetPBufferVolatileState),
+    C(ErrorString), C(GetVersion),
     C(SetOption), C(GetOption), C(LockContext), C(UnlockContext),
 };
 #undef C
