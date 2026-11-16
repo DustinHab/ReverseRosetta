@@ -567,6 +567,10 @@ page). Running measurement series: `tests/measure_all.sh`.
   THREAD_TIME_CONSTRAINT_POLICY becomes THREAD_EXTENDED_POLICY with timeshare, thread_policy (3616) with POLICY_RR/FIFO
   becomes POLICY_TIMESHARE; `ROSETTA_REALTIME=1` passes them on. Afterwards `tests/quicktime.c` decodes two H.264
   movies with the same mean colours as natively.
+- QuickTime Player (i386) aborted with "invalid handle passed to dlsym()": it dlopens Foundation by its short path
+  (Foundation.framework/Foundation), and the root had no top-level links for frameworks whose version is not A
+  (Foundation and AppKit: C, Message: B, Tcl/Tk: 8.4), so the PowerPC file was found. `intel_framework_links.sh` now
+  links Versions/Current to the one version that has the binary. QuickTime Player then shows its window.
 - *Conditions from stored flags* without a C helper, when the flag kind at run time is cmp/sub or logic (32 bit)
   (qsort: `jge` on a `jne`; bench_control_flow +9 %).
 - Bug fixed: `writes_reg` reported no written register for `mul/imul/div/idiv` (f6/f7 /4-7) and `not/neg r/m8`

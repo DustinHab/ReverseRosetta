@@ -152,7 +152,8 @@ the native PowerPC build. At startup the translated Calculator uses 1.7 s of pro
   that point.
 - OpenAL (games' sound) through the system's PowerPC OpenAL (`tests/openal.c` gives the same output as natively).
 - QuickTime through its own i386 framework from Apple's QuickTime 7.6.4 for Leopard (see Setup): movies open, and
-  H.264 frames decode to the same pixels as natively (`tests/quicktime.c`). Its codecs use MMX, which runs in the
+  H.264 frames decode to the same pixels as natively (`tests/quicktime.c`); QuickTime Player's own i386 build opens its
+  window, and the QuickTime messages of Cinebench, Keynote and Numbers are gone. Its codecs use MMX, which runs in the
   interpreter (correct, `tests/mmx_ops.c` against a real x86 processor, but slow for now).
 - x87, SSE and SSE2: scalar, packed double, packed integer and packed float (AltiVec), including Apple's Intel
   vDSP/vForce code and ImageIO's image decoders.
