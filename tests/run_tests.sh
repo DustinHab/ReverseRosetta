@@ -115,8 +115,9 @@ t_qt()    { sh ../tests/with_timeout.sh 180 ./rosetta ./quicktime $QTM; }
 r_qt()    { ./quicktime.ppc $QTM; }
 t_csz()   { ROSETTA_THRESHOLD=1 ./rosetta ./cond_sizes; }
 r_csz()   { ROSETTA_INTERP=1 ./rosetta ./cond_sizes; }
-t_sfw()   { ROSETTA_THRESHOLD=1 ./rosetta ./stack_fw; ROSETTA_NO_SLOTS=1 ROSETTA_THRESHOLD=1 ./rosetta ./stack_fw; }   # (loop slots take the loops otherwise)
-r_sfw()   { ROSETTA_INTERP=1 ./rosetta ./stack_fw; ROSETTA_INTERP=1 ./rosetta ./stack_fw; }
+t_sfw()   { ROSETTA_THRESHOLD=1 ./rosetta ./stack_fw; ROSETTA_NO_SLOTS=1 ROSETTA_THRESHOLD=1 ./rosetta ./stack_fw   # (loop slots take the loops otherwise)
+            ROSETTA_DEAD=1 ROSETTA_DEAD_WINDOW=100,100 ROSETTA_NO_SLOTS=1 ROSETTA_THRESHOLD=1 ./rosetta ./stack_fw; }   # dead stores, written late
+r_sfw()   { ROSETTA_INTERP=1 ./rosetta ./stack_fw; ROSETTA_INTERP=1 ./rosetta ./stack_fw; ROSETTA_INTERP=1 ./rosetta ./stack_fw; }
 same raw_arith t_raw r_raw
 same "64-bit shifts, shld/shrd with flags" t_shf r_shf
 same "cmpsb (translated against interpreter)" t_cmpsb r_cmpsb
@@ -125,7 +126,7 @@ same "incw, byte and word shifts in memory, movw (against interpreter)" t_m16 r_
 same "or/and/xor of byte and word registers with constants (against interpreter)" t_nar r_nar
 same "stack variables of a loop in registers, C calls in the block (against interpreter)" t_lsl r_lsl
 same "conditions of 8/16/32-bit cmp and test across blocks (against interpreter)" t_csz r_csz
-same "stack slots forwarded in a block: esp/ebp aliases, read-modify-write, xchg (against interpreter)" t_sfw r_sfw
+same "stack slots forwarded in a block: esp/ebp aliases, read-modify-write in place, reloads, xchg, dead stores (against interpreter)" t_sfw r_sfw
 same "OpenAL: devices, sources, buffers, playing (silent), against native" t_al r_al
 same "MMX: 69 operations on mm registers, against a real x86 processor" t_mmx r_mmx
 same "text encodings: CFString and TEC (converters from the system's CarbonCore), against native" t_te r_te

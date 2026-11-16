@@ -529,6 +529,24 @@ page). Running measurement series: `tests/measure_all.sh`.
   and gzip are C code of this kind. `tests/stack_fw.c` covers esp/ebp aliases, read-modify-write, xchg/xadd with a slot,
   writes through pointers, 8/16-bit writes into a slot and a call that changes its argument slot. Measured (A/B,
   processor time): openssl sha1 +13 %, aes-128-cbc +12 %, bzip2 -9 +5 %, gzip and md5 unchanged.
+- *Slot copies used in place* (`ROSETTA_NO_INPLACE`): a read-modify-write of a slot whose value is in a copy register
+  computes in that register (`xorl %eax,0x94(%ebp)`: `xor r28,r28,r14; stwbrx` instead of `mr r3,r28; xor r5,r3,r14;
+  stwbrx; mr r29,r5`), and the register stays the slot's copy; cmp/test and ALU operands read the copy register directly
+  instead of through `mr` into r3/r4, and need no address then. The SHA-1 loop of openssl: 6490 PowerPC instructions
+  for its 28 blocks before, 5959 after.
+- *Load copies* (`ROSETTA_NO_LOADCOPY`): a slot loaded into a guest register is remembered as that register; when the
+  register changes, the value moves to a copy register if the block reads the slot again. gcc reloads pointers from
+  the frame for every byte (`movl -0x1fc(%ebp),%eax; movzbl 1(%eax),%eax`, again). Both together: openssl sha1 over
+  40 MB 1.24 s against 1.10 s (native 0.43 s), md5 over 40 MB -3 %, bzip2 -9 -1 %, the rest of the realworld table
+  unchanged.
+- *Dead stores* (`ROSETTA_DEAD=1`, off): a store to `[ebp+d]` that a later instruction of the block overwrites entirely
+  is left out, the entry is marked dirty and written after all (`li r0,d; stwbrx`) if it has to leave the table first.
+  A strict lookahead (`sw_killer`: no exit, merge point, interpreter, call, div or memory access other than other
+  `[ebp+d']` slots in between, at most 8 instructions and one other slot write) keeps the window clean; every place
+  that drops an entry writes a dirty one first. SHA-1 loses three of its four stores per round (5766 instead of 5959
+  instructions), but is not faster: stores run beside the dependency chain on the G4, and with long windows (up to 70
+  instructions) the late write lands just before a reload of the slot (2 % slower). Off by default; `tests/stack_fw.c`
+  covers it with `ROSETTA_DEAD_WINDOW=100,100` (late writes).
 - *128 instructions per superblock* (was 48; `ROSETTA_MAX_INSNS`): long straight code (SHA-1's unrolled rounds,
   bzip2's sorting) left a block every 48 instructions, with the flags stored and the stack knowledge lost each time.
   bzip2 -9 4.79 against 5.25 s, sha1 -7 %, aes -3 %, the others unchanged; cold and cached starts (Calculator, ls, perl,
