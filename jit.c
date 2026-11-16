@@ -1140,6 +1140,8 @@ static int classify(const Insn *b, uint8_t *reads, uint8_t *writes, int *kind)
     case OP_0F | 0x18: case OP_0F | 0x19: case OP_0F | 0x1a: case OP_0F | 0x1b:
     case OP_0F | 0x1c: case OP_0F | 0x1d: case OP_0F | 0x1e: case OP_0F | 0x1f:
         return 1;
+    case OP_0F | 0x77:                      /* emms: the mm registers are separate from the x87 stack, nothing to do */
+        return !b->p66 && !b->rep;
     case OP_0F | 0x40: case OP_0F | 0x41: case OP_0F | 0x42: case OP_0F | 0x43:
     case OP_0F | 0x44: case OP_0F | 0x45: case OP_0F | 0x46: case OP_0F | 0x47:
     case OP_0F | 0x48: case OP_0F | 0x49: case OP_0F | 0x4a: case OP_0F | 0x4b:
@@ -5596,6 +5598,7 @@ static void gen(const Insn *b, int needs, int needs_cf)
         return;
     case OP_0F | 0x18: case OP_0F | 0x19: case OP_0F | 0x1a: case OP_0F | 0x1b:
     case OP_0F | 0x1c: case OP_0F | 0x1d: case OP_0F | 0x1e: case OP_0F | 0x1f:
+    case OP_0F | 0x77:                      /* emms */
         return;
     case OP_0F | 0x40: case OP_0F | 0x41: case OP_0F | 0x42: case OP_0F | 0x43:
     case OP_0F | 0x44: case OP_0F | 0x45: case OP_0F | 0x46: case OP_0F | 0x47:
