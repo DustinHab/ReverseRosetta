@@ -6,7 +6,7 @@ passes system calls and Mach messages to the PowerPC kernel and system services.
 Apple's Rosetta, which ran PowerPC programs on Intel Macs.
 
 > **How fast?** Ordinary programs run at about two thirds to four fifths of the speed of their native PowerPC build on
-> a G4: gzip 68 %, bzip2 61 to 71 %, perl 67 to 71 %, sort 80 %, Python 97 %. Programs that run for a fraction of a
+> a G4: gzip 69 %, bzip2 63 to 72 %, perl 67 to 72 %, sort 80 %, Python 98 %. Programs that run for a fraction of a
 > second lose most at startup (openssl sha1 38 %), and the first starts of a program are slower while its code is
 > translated. Small computing kernels reach 62 to 103 %, OpenGL 80 to 110 %. Details and how it is measured below.
 
@@ -28,18 +28,18 @@ processor time (user and system) of the fastest of 3 runs. `first` is the first 
 
 | Program | Native | Translated, first run | Translated, cached | Speed vs. native |
 |---|---|---|---|---|
-| gzip -9 (4 MB of C headers) | 0.64 s | 0.98 s | 0.94 s | 68 % |
+| gzip -9 (4 MB of C headers) | 0.65 s | 0.98 s | 0.94 s | 69 % |
 | gzip -d | 0.05 s | 0.14 s | 0.10 s | 50 % |
-| bzip2 -9 | 2.86 s | 4.83 s | 4.69 s | 61 % |
-| bzip2 -d | 0.63 s | 0.96 s | 0.89 s | 71 % |
+| bzip2 -9 | 2.88 s | 4.68 s | 4.56 s | 63 % |
+| bzip2 -d | 0.63 s | 0.95 s | 0.88 s | 72 % |
 | sort | 0.39 s | 0.54 s | 0.49 s | 80 % |
 | grep -c (regular expression over a dictionary) | 0.06 s | 0.15 s | 0.09 s | 67 % |
 | md5 | 0.06 s | 0.12 s | 0.09 s | 67 % |
 | openssl sha1 | 0.05 s | 0.22 s | 0.13 s | 38 % |
-| openssl aes-128-cbc | 0.12 s | 0.37 s | 0.31 s | 39 % |
-| perl (hash, sort) | 0.61 s | 1.01 s | 0.86 s | 71 % |
+| openssl aes-128-cbc | 0.12 s | 0.37 s | 0.30 s | 40 % |
+| perl (hash, sort) | 0.61 s | 1.00 s | 0.85 s | 72 % |
 | perl (regular expression over words) | 0.35 s | 0.64 s | 0.52 s | 67 % |
-| python (loop, big integers) | 1.48 s | 1.51 s | 1.52 s | 97 % |
+| python (loop, big integers) | 1.48 s | 1.52 s | 1.51 s | 98 % |
 
 The short runs are coarse (processor time has a resolution of 10 ms). The same input ten times (40 MB), where startup
 no longer counts: openssl sha1 1.05 s against 0.43 s natively (41 %), aes-128-cbc 2.85 s against 1.11 s (39 %), md5

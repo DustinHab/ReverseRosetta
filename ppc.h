@@ -206,6 +206,7 @@
 #define MTCTR(s)        X_(s, 9, 0, 467, 0)
 #define MFCTR(d)        X_(d, 9, 0, 339, 0)
 #define MFCR(t)         X_(t, 0, 0, 19, 0)
+#define MCRF(d, s)      ((uint32_t)19 << 26 | (uint32_t)(d) << 23 | (uint32_t)(s) << 18)   /* CR field d = field s */
 #define MTCRF(s)        ((uint32_t)31 << 26 | (uint32_t)(s) << 21 | 0xffu << 12 | 144u << 1)
 
 #endif

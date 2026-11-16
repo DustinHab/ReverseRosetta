@@ -567,7 +567,17 @@ page). Running measurement series: `tests/measure_all.sh`.
   start within 100 (`path_reaches`; otherwise the target is an inner jump anyway): the jump's condition is negated
   and its target set to the instruction after it (the side exit), so all analyses see an ordinary forward exit. At
   most 6 checks and 2 inversions per block: unlimited, the lookahead made bzip2's translation 20 % longer.
-  gzip -9 1.09 s against 0.98 s (output identical), the other programs unchanged. `tests/taken_loop.c`: such a chain search and skipped long
+  gzip -9 1.09 s against 0.98 s (output identical), the other programs unchanged.
+- *Compare and reader merged across instructions* (`ROSETTA_NO_FAR`): gcc schedules a load or store between a compare
+  and its jump (`cmpl $0x21,%eax; movw %di,(%ecx,%eax,2); jg`). Merging needed adjacent instructions; otherwise the
+  compare kept its operands and kind in RE/RA/RB (three `mr`) and the jump compared again. Now a compare whose only
+  reader follows within 8 instructions that neither read nor write flags (and are no exit, merge point or
+  interpreted instruction) is merged all the same. If everything in between is an integer move, load or store
+  (`cr0_safe`), the condition simply stays in cr0; otherwise it moves to cr2 with `mcrf` (the generator uses cr0,
+  cr1, cr6 for AltiVec and cr7, never cr2; C code keeps cr2-cr4). `mcrf` is not free on the G4: with it in every case
+  perl (hash, sort) took 1.05 s against 1.01 s unmerged; as it is now 1.00 s. bzip2 -9 4.80 s against 4.67 s, sort
+  unchanged. `tests/far_fusion.c`: every condition code, setcc and cmov, x87 calls in between, against the
+  interpreter. `tests/taken_loop.c`: such a chain search and skipped long
   bodies with every kind of compare against the interpreter.
 - Bug fixed: a translation cache named by `ROSETTA_CACHE_FILE` was taken for any program as long as the program that
   wrote it was unchanged on disk (gzip ran openssl's blocks at the same addresses and crashed); the saved program must

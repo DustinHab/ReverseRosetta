@@ -173,6 +173,19 @@ static int g_loadcopy_dist = 16;      /* ROSETTA_LOADCOPY_DIST: ... unless it is
 static int g_no_narrowfw;             /* ROSETTA_NO_NARROWFW: 8/16-bit reads of a remembered slot go through memory */
 static int g_no_taken;                /* ROSETTA_NO_TAKEN: blocks follow only the fall-through of conditional jumps */
 static unsigned long g_st_taken;
+static int g_no_far;                  /* ROSETTA_NO_FAR: compare and reader merged only when adjacent */
+/* integer move, load or store whose code touches no CR field (between a merged compare and its reader) */
+static int cr0_safe(const Insn *y)
+{
+    int op = y->op;
+    if (y->rep || y->lock || (y->seg == 0x64 || y->seg == 0x65)) return 0;
+    if ((op >= 0x88 && op <= 0x8b) || op == 0x8d || ((op == 0xc6 || op == 0xc7) && y->reg == 0)) return 1;
+    if ((op >= 0x90 && op <= 0x99) || (op >= 0xb0 && op <= 0xbf) || (op >= 0x50 && op <= 0x5f)) return 1;
+    if (op == (OP_0F | 0xb6) || op == (OP_0F | 0xb7) || op == (OP_0F | 0xbe) || op == (OP_0F | 0xbf)) return 1;
+    if (op >= (OP_0F | 0xc8) && op <= (OP_0F | 0xcf)) return 1;
+    return op == 0xf7 && y->reg == 2;      /* not */
+}
+static unsigned long g_st_fusion_far;
 static int g_sw_skip, g_sw_skipped;   /* dead store: leave out the next 32-bit store (save_p) / it was left out */
 static int g_no_dead;                 /* without ROSETTA_DEAD=1 every store to a stack slot is done at once: leaving
                                          out dead ones removes instructions but gains nothing on the G4 (stores run
@@ -795,6 +808,7 @@ static int jit_create(void)
     if (getenv("ROSETTA_LOADCOPY_DIST")) g_loadcopy_dist = atoi(getenv("ROSETTA_LOADCOPY_DIST"));
     g_no_narrowfw = getenv("ROSETTA_NO_NARROWFW") != 0;
     g_no_taken = getenv("ROSETTA_NO_TAKEN") != 0;
+    g_no_far = getenv("ROSETTA_NO_FAR") != 0;
     g_no_dead = !getenv("ROSETTA_DEAD");   /* off: no measurable gain (sha1 1.10 s against 1.11 s, realworld equal) */
     g_dead_log = getenv("ROSETTA_DEAD_LOG") != 0;
     if (getenv("ROSETTA_DEAD_WINDOW")) sscanf(getenv("ROSETTA_DEAD_WINDOW"), "%d,%d", &g_dead_window, &g_dead_writes);
@@ -7906,6 +7920,33 @@ static uint32_t *translate_block(uint32_t eip)
             g_st_fusion++;
             continue;
         }
+        /* The only reader comes a few instructions later, with nothing in between that reads or writes flags (gcc
+           schedules a load or store between cmp and jcc: cmpl $0x21,%eax; movw %di,(%ecx,%eax,2); jg). Merged all the
+           same, the condition moved to cr2 (mcrf): no instruction of the generator uses cr2 and C code keeps it.
+           Otherwise the flags went to RE/RA/RB (three mr) and the reader compared again. */
+        if (!g_no_fusion && !g_no_far && kinds[i] == CONT && i + 2 < n) {
+            int j = i + 1, cr0_kept = !g_vl_reg;
+            while (j < n && j <= i + 8 && kinds[j] == CONT && !interp[j] && !traced[j] && !inner_target[j] &&
+                   !reads[j] && !writes[j] && j != st_k && j != st_k + 1) {
+                if (!cr0_safe(&b[j])) cr0_kept = 0;
+                j++;
+            }
+            if (j > i + 1 && j < n && !interp[j] && !inner_target[j] && (k = consumer(&b[j])) >= 0 &&
+                afterwards[j] == 0 && !(cond_mask(k) & ~writes[i]) && !(kinds[j] == JUMP_COND && target_needs[j]) &&
+                fusion(x, k, &g_ahead[0])) {
+                /* moves, loads and stores in between leave CR alone: the condition stays in cr0; otherwise it moves
+                   to cr2 (mcrf costs the G4 more than it looks: with it in every case perl took 1.05 s against 1.00) */
+                if (g_ahead[0].bit >= 0 && (!cr0_kept || g_ahead[0].bit >= 4)) {
+                    e(MCRF(2, g_ahead[0].bit / 4));
+                    g_ahead[0].bit = 8 + g_ahead[0].bit % 4;
+                }
+                g_ahead_n = 1; g_ahead_i = 0;
+                g_ahead_data = x->mem;
+                fs.kind = -2;
+                g_st_fusion_far++;
+                continue;
+            }
+        }
         switch (kinds[i]) {
         case CONT:
             g_afterwards_now = afterwards[i];
@@ -9928,9 +9969,9 @@ void jit_stats(void)
                 (double)g_cache_time * tb.numer / tb.denom / 1e6, g_cache_error, g_st_expected, g_st_inval_cache);
     }
     fprintf(stderr,"rosetta: %lu blocks with %lu instructions translated, %lu chained (%lu direct), %lu fused, "
-            "%lu page exits, %lu stack slots, %lu floating point (%lu loops, %lu packed), %lu x87, %lu direct (x87/SSE), %lu interpreted in block, %lu interpreted, %lu invalid, %lu flushes, %lu table misses, %lu inline caches, %lu stubs, %lu constants (%lu blocks with guard, %lu failed, %lu masks), %lu loops with prefetch (%lu streams, %lu faults), %lu mov saved, %lu forwarded, %lu calls inlined (%lu predicted, %lu wrong), %lu stack values forwarded (%lu ret without check, %lu dead stores, %lu written later), %lu math calls direct, %lu switch tables, %lu taken branches followed, cache %lu KB\n", g_st_blocks,
+            "%lu page exits, %lu stack slots, %lu floating point (%lu loops, %lu packed), %lu x87, %lu direct (x87/SSE), %lu interpreted in block, %lu interpreted, %lu invalid, %lu flushes, %lu table misses, %lu inline caches, %lu stubs, %lu constants (%lu blocks with guard, %lu failed, %lu masks), %lu loops with prefetch (%lu streams, %lu faults), %lu mov saved, %lu forwarded, %lu calls inlined (%lu predicted, %lu wrong), %lu stack values forwarded (%lu ret without check, %lu dead stores, %lu written later), %lu math calls direct, %lu switch tables, %lu taken branches followed, %lu compares merged across instructions, cache %lu KB\n", g_st_blocks,
             g_st_insns, g_st_linked, g_st_direct, g_st_fusion, g_st_pages, g_st_slots, g_st_fp, g_st_fp_loops, g_st_pd, g_st_x87, g_st_fp_direct, g_st_inline, g_st_interp, g_st_invalid,
-            g_st_flushes, g_st_table_miss, g_st_ic, g_st_stubs, g_st_const, g_st_watchdog, g_st_watchdog_miss, g_st_masks, g_st_prefetch, g_st_vl_streams, g_st_vl_error, g_st_mov, g_st_fw, g_st_embed, g_st_before, g_st_before_miss, g_st_sw, g_st_sw_ret, g_st_dead, g_st_dead_flush, g_st_math_direct, g_st_jumptab, g_st_taken, (unsigned long)((uint8_t *)g_free - (uint8_t *)g_cache) / 1024);
+            g_st_flushes, g_st_table_miss, g_st_ic, g_st_stubs, g_st_const, g_st_watchdog, g_st_watchdog_miss, g_st_masks, g_st_prefetch, g_st_vl_streams, g_st_vl_error, g_st_mov, g_st_fw, g_st_embed, g_st_before, g_st_before_miss, g_st_sw, g_st_sw_ret, g_st_dead, g_st_dead_flush, g_st_math_direct, g_st_jumptab, g_st_taken, g_st_fusion_far, (unsigned long)((uint8_t *)g_free - (uint8_t *)g_cache) / 1024);
     {
         int i, k, best;
         {
