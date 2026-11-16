@@ -85,11 +85,12 @@ static mach_port_t g_ats_port;              /* send right to the font server (0:
 static int g_ats_log = -1;
 
 enum { F_END, F_W, F_H, F_D, F_COUNT };
-typedef struct { uint8_t kind, n; uint16_t o; } AtsField;
+typedef struct { uint8_t kind; uint16_t n, o; } AtsField;
 #define D(o) {F_D, 1, o}                    /* 64 bit (addresses in the server: mach_vm_address_t) */
 #define W(o) {F_W, 1, o}                    /* 32 bit */
 #define WN(o, n) {F_W, n, o}                /* n words in a row */
 #define H(o) {F_H, 1, o}                    /* 16 bit */
+#define HN(o, n) {F_H, n, o}                /* n 16-bit values in a row */
 #define COUNT(o, n) {F_COUNT, n, o}         /* word at o: count (at most n) of the words from o + 4 */
 #define LIST_END {F_END, 0, 0}
 typedef struct {
@@ -104,14 +105,18 @@ typedef struct {
 static const AtsType g_ats_types[0x2c] = {
     [0x00] = { "Rendezvous", { W(0x34), H(0x38), W(0x3c), LIST_END }, { W(0x34), H(0x38), W(0x3c), LIST_END }, 0 },
     [0x01] = { "Sync", { LIST_END }, { LIST_END }, 0 },
-    [0x02] = { "SynthesizeTables", { W(0x18), W(0x1c), LIST_END }, { LIST_END }, 1 },
+    /* font at 0x18, then a count and as many table tags; reply: sync block */
+    [0x02] = { "SynthesizeTables", { W(0x18), COUNT(0x1c, 32), LIST_END }, { LIST_END }, 0 },
+    /* request: u16 at 0x18, options at 0x1c, path from 0x20 (0x1e: a second string from 0x220); reply: sync block,
+       container at 0x124 (read off _SendActivateFontsMessage) */
+    [0x03] = { "ActivateFonts", { H(0x18), W(0x1c), LIST_END }, { W(0x124), LIST_END }, 0 },
     [0x05] = { "ActivateFontsFromMemory", { H(0x28), W(0x2c), W(0x30), LIST_END }, { W(0x124), LIST_END }, 0 },
     [0x06] = { "DeactivateFontsInContainer", { H(0x18), W(0x1c), W(0x20), LIST_END }, { LIST_END }, 0 },
     [0x07] = { "GetContainerMapping", { W(0x18), LIST_END }, { W(0x1c), W(0x20), LIST_END }, 0 },
     [0x08] = { "GetAnnexData", { W(0x18), W(0x1c), LIST_END }, { W(0x1c), W(0x20), W(0x28), LIST_END }, 0 },
     /* reply: a flattened FSRef from 0x18; ats_reply turns it into the path of the file (ats_fsref_path) */
     [0x09] = { "GetFSRefForFileToken", { H(0x18), LIST_END }, { LIST_END }, 0 },
-    [0x0a] = { "ResolveFileToken", { H(0x18), H(0x1a), LIST_END }, { H(0x18), LIST_END }, 1 },
+    [0x0a] = { "ResolveFileToken", { H(0x18), H(0x1a), LIST_END }, { H(0x18), LIST_END }, 0 },   /* path from 0x1c */
     [0x0b] = { "ComputeFontSpecs", { W(0x18), LIST_END }, { LIST_END }, 0 },
     [0x0c] = { "MarkFontAsBad", { W(0x18), W(0x1c), LIST_END }, { LIST_END }, 0 },
     [0x0d] = { "Notify", { LIST_END }, { LIST_END }, 0 },
@@ -119,15 +124,18 @@ static const AtsType g_ats_types[0x2c] = {
     [0x10] = { "Notify", { LIST_END }, { LIST_END }, 0 },
     [0x12] = { "AddToFontNamesCache", { LIST_END }, { LIST_END }, 1 },
     [0x13] = { "FindUnicodeEncoding", { W(0x18), LIST_END }, { LIST_END }, 0 },
-    [0x14] = { "GetFCacheData", { H(0x18), H(0x1a), W(0x1c), W(0x20), LIST_END }, { W(0x18), LIST_END }, 1 },
+    /* reply: see fcache_reply */
+    [0x14] = { "GetFCacheData", { H(0x18), H(0x1a), W(0x1c), W(0x20), LIST_END }, { W(0x18), LIST_END }, 0 },
     [0x15] = { "MapSharedMemory", { W(0x34), D(0x38), W(0x40), LIST_END }, { D(0x38), LIST_END }, 0 },
     [0x16] = { "FindFontIDFromName", { H(0x18), COUNT(0x1c, 20), WN(0x70, 5), LIST_END }, { WN(0x124, 6), LIST_END }, 0 },
     [0x17] = { "StandardFontDirectories", { LIST_END }, { W(0x1c), W(0x20), LIST_END }, 0 },
     [0x18] = { "QueryPort", { LIST_END }, { LIST_END }, 1 },
     [0x1a] = { "SynthesizeFontFamilyResources", { H(0x18), W(0x1c), LIST_END }, { W(0x1c), W(0x20), LIST_END }, 0 },
-    [0x1b] = { "GetPSFontEncoding", { W(0x18), LIST_END }, { LIST_END }, 1 },
+    /* reply: a byte at 0x18, the 256 16-bit entries of the encoding from 0x1a (ATSFontGetEncoding) */
+    [0x1b] = { "GetPSFontEncoding", { W(0x18), LIST_END }, { HN(0x1a, 256), LIST_END }, 0 },
     [0x1c] = { "EnableFont", { W(0x1c), W(0x20), LIST_END }, { LIST_END }, 0 },
     [0x1d] = { "FODBDump", { H(0x18), LIST_END }, { LIST_END }, 0 },
+    [0x1e] = { "ActivateFonts", { H(0x18), W(0x1c), LIST_END }, { W(0x124), LIST_END }, 0 },
     [0x1f] = { "OFAStream", { LIST_END }, { LIST_END }, 0, 1 },
     [0x20] = { "OFAStrike", { LIST_END }, { LIST_END }, 0, 1 },
     [0x21] = { "OFAGeneral", { LIST_END }, { LIST_END }, 0, 1 },
@@ -161,7 +169,7 @@ static inline void d_swap(uint8_t *p, uint32_t o)
 
 static uint32_t field_end(const AtsField *f)
 {
-    return f->o + (f->kind == F_H ? 2 : f->kind == F_D ? 8 * f->n : f->kind == F_COUNT ? 4 + 4 * f->n : 4 * f->n);
+    return f->o + (f->kind == F_H ? 2 * f->n : f->kind == F_D ? 8 * f->n : f->kind == F_COUNT ? 4 + 4 * f->n : 4 * f->n);
 }
 
 /* Swap fields; start: start of content, end: message size. to_host: the fields are in guest byte order.
@@ -174,7 +182,7 @@ static void ats_fields(uint8_t *m, uint32_t start, uint32_t end, const AtsField 
         if (f->o < start) continue;
         for (g = skip; g && g->kind != F_END; g++) if (f->o < field_end(g) && g->o < e) break;
         if (g && g->kind != F_END) continue;
-        if (f->kind == F_H) { if (f->o + 2 <= end) h_swap(m, f->o); continue; }
+        if (f->kind == F_H) { for (k = 0; k < f->n && f->o + 2 * k + 2 <= end; k++) h_swap(m, f->o + 2 * k); continue; }
         if (f->kind == F_D) { for (k = 0; k < f->n && f->o + 8 * k + 8 <= end; k++) d_swap(m, f->o + 8 * k); continue; }
         if (f->kind == F_W) { for (k = 0; k < f->n && f->o + 4 * k + 4 <= end; k++) w_swap_u(m, f->o + 4 * k); continue; }
         if (f->o + 4 > end) continue;
@@ -461,6 +469,23 @@ static void ats_fsref_path(uint8_t *m, uint32_t n)
     memcpy(m + 0x18, path, len + 1);
 }
 
+/* GetFCacheData (0x14) reply: complex, one OOL region per cache file; _SendGetFCacheDataMessage reads the descriptor
+   count at 0x18 and address and size of each descriptor (msg_swap has converted them), then one word behind the
+   descriptors and one 16-bit value per region. */
+static void fcache_reply(uint8_t *m, uint32_t n)
+{
+    uint32_t cnt, o, i, end = n < ATS_SIZE ? n : 0x6c0;
+    if (!(((mach_msg_header_t *)m)->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {   /* no regions: only the count and the word */
+        if (*(uint32_t *)(m + 0x18) == 0) w_swap(m, 0x1c);
+        return;
+    }
+    cnt = *(uint32_t *)(m + 0x18);
+    o = 0x1c + 12 * cnt;
+    if (cnt > 32 || o + 4 + 2 * cnt > end) return;
+    w_swap_u(m, o);
+    for (o += 4, i = 0; i < cnt; i++, o += 2) h_swap(m, o);
+}
+
 /* reply (header already in host byte order, content in server byte order) to guest byte order. typ: type of the
    request. The server replies in the buffer of the request; what it does not overwrite is still in its byte order
    and is swapped back as well. */
@@ -481,6 +506,7 @@ static void ats_reply(uint8_t *m, uint32_t n, uint32_t type, AtsCopy *k)
     }
     if (t && t->ofa && !is_sync) ofa_reply(m, n, k);
     else if (type == 9 && !is_sync && ((mach_msg_header_t *)m)->msgh_id == 0) ats_fsref_path(m, n);
+    else if (type == 0x14 && !is_sync && ((mach_msg_header_t *)m)->msgh_id == 0 && n >= 0x20) fcache_reply(m, n);
     else if (t) {
         ats_fields(m, start, n, t->reply, 0, 0);
         ats_fields(m, start, n, t->request, 0, t->reply);

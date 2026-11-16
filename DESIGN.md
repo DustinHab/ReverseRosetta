@@ -768,6 +768,12 @@ bootstrap look_up reply for `com.apple.FontObjectsServer`):
   byte 0x40.
 - MapSharedMemory (0x15): 64-bit server address at 0x38. Errors here made the server stack up mappings per client
   until it reported -108 (at most 10).
+- ActivateFonts (0x03, and 0x1e with a second string): a program activates a font file of its own (Pages:
+  `invisible_glyphs.ttf` of its word processing framework). Request: 16-bit value at 0x18, options at 0x1c, path
+  from 0x20; reply: sync block and the new container at 0x124. Raw, the container was in the server's byte order,
+  the program found no fonts in it, and Pages failed in `CGFontGetGlyphAdvances` and an assertion.
+- GetFCacheData (0x14): a complex reply with one OOL region per font cache file; the client takes address and size
+  from the descriptors themselves, then one word behind them and one 16-bit value per region.
 - OFA messages (glyphs, 0x1f-0x21): content behind the descriptors (the count word at 0x18 is present even without
   the COMPLEX bit), data as attribute groups {type, length, check value, count; attributes ID, size in words with
   padding bytes in the top 2 bits}. rosetta walks them recursively: words, except 'gary' (glyph numbers, 16 bit) and
@@ -788,8 +794,8 @@ same output under rosetta as native (test suite, needs the login session). Debug
 every message in server byte order with OOL and destination buffers (the first 256 bytes; `=2` up to 4 KB; `=3` also
 the ranges of the shared memory that the server changed while answering) (`tests/ats_trace.sh`, `ats_sequence.sh`,
 `ats_dest.sh`, `ats_dest_types.sh`); guest crashes now show the stack and the ebp chain with arguments. Open:
-requests with embedded structures (0x02, 0x0a, 0x12, 0x14, 0x18, 0x1b). Bitmap results were solved on 16 November
-2026 (see above). GetFSRefForFileToken (0x09) was solved later, see "Compatibility and everyday use".
+requests with embedded structures (0x02, 0x0a, 0x12, 0x18, 0x1b). Bitmap results, ActivateFonts and GetFCacheData
+were solved on 16 November 2026 (see above). GetFSRefForFileToken (0x09) was solved later, see "Compatibility and everyday use".
 
 **Transmission 2.42** (screenshot `docs/transmission-on-ibook-g4.png`). Last version for Leopard, official download
 from github.com/transmission/transmission-releases (4089162 bytes, MD5 2b2ab8cc42b96242a1bc7470c5a20123), main

@@ -3,6 +3,7 @@
    ATSServer of the login session (tests/in_session.sh); the Intel version under rosetta must print the same as the
    PowerPC version (rosetta converts the ATS messages). */
 #include <ApplicationServices/ApplicationServices.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -68,6 +69,25 @@ static void bitmap(const char *name, CGFloat size, const char *text)
     CGColorSpaceRelease(cs);
 }
 
+/* the font's 256-entry encoding from the font server (ATSFontGetEncoding: GetPSFontEncoding, 0x1b), as 16-bit values */
+static void encoding(CFStringRef ps)
+{
+    typedef OSStatus (*Get)(ATSFontRef, uint16_t *);
+    Get get = (Get)dlsym(RTLD_DEFAULT, "ATSFontGetEncoding");
+    ATSFontRef f = ATSFontFindFromPostScriptName(ps, kATSOptionFlagsDefault);
+    uint16_t e[256];
+    char n[64];
+    int i;
+    OSStatus r;
+    CFStringGetCString(ps, n, sizeof n, kCFStringEncodingUTF8);
+    if (!get) { printf("%s encoding: no ATSFontGetEncoding\n", n); return; }
+    memset(e, 0, sizeof e);
+    r = get(f, e);
+    printf("%s encoding: %d", n, (int)r);
+    for (i = 0; i < 256; i += 17) printf(" %02x:%04x", i, e[i]);
+    printf("\n");
+}
+
 int main(void)
 {
     font(CFSTR("LucidaGrande"), 13.0);
@@ -77,5 +97,8 @@ int main(void)
     bitmap("Monaco", 9.0, "Info Log 0127 gQ");
     bitmap("Geneva", 9.0, "Info Log 0127 gQ");
     bitmap("Geneva", 12.0, "mWM%@ wide");
+    encoding(CFSTR("Helvetica"));
+    encoding(CFSTR("Times-Roman"));
+    encoding(CFSTR("Symbol"));
     return 0;
 }
