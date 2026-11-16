@@ -562,11 +562,12 @@ page). Running measurement series: `tests/measure_all.sh`.
   longest_match: `cmpb (%edx,%esi),%al; jne 290e` (most chain entries fail at the first byte), at 290e the next chain
   entry and `jne 27f1` back to the loop head; the fall-through compares further bytes and ends in an inner loop
   (`jmp 2833`). As two blocks every iteration left both (exit stub, flags, stack knowledge lost, the frame slots
-  0xd8/0xe0/0xe8/0xf3 loaded anew). Now the collector follows the taken branch if it leads back to the block start
-  within 20 instructions and the block's own fall-through path reaches neither the target nor the start within 100
-  (`path_reaches`; otherwise the target is an inner jump anyway): the jump's condition is negated and its target set
-  to the instruction after it (the side exit), so all analyses see an ordinary forward exit. At most two per block.
-  gzip -9 1.09 s against 0.99 s (output identical). `tests/taken_loop.c`: such a chain search and skipped long
+  0xd8/0xe0/0xe8/0xf3 loaded anew). Now the collector follows the taken branch of a forward jump if it leads back to
+  the block start within 12 instructions and the block's own fall-through path reaches neither the target nor the
+  start within 100 (`path_reaches`; otherwise the target is an inner jump anyway): the jump's condition is negated
+  and its target set to the instruction after it (the side exit), so all analyses see an ordinary forward exit. At
+  most 6 checks and 2 inversions per block: unlimited, the lookahead made bzip2's translation 20 % longer.
+  gzip -9 1.09 s against 0.98 s (output identical), the other programs unchanged. `tests/taken_loop.c`: such a chain search and skipped long
   bodies with every kind of compare against the interpreter.
 - Bug fixed: a translation cache named by `ROSETTA_CACHE_FILE` was taken for any program as long as the program that
   wrote it was unchanged on disk (gzip ran openssl's blocks at the same addresses and crashed); the saved program must
