@@ -26,6 +26,11 @@ for A in "$@"; do
     while [ $i -lt $T ] && kill -0 $p 2>/dev/null; do sleep 1; i=$((i + 1)); done
     if kill -0 $p 2>/dev/null; then
         w=$("$R/tools/window_list" $p 2>/dev/null | awk '/^WINDOW/ && $8 > 40 && $9 > 40 { n++; if (!g) g = $6 " " $7 " " $8 " " $9 } END { print n + 0 "|" g }')
+        if [ "${w%%|*}" = 0 ]; then     # panels that hide while the program is in the background (Interface Builder)
+            osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $p) to true" > /dev/null 2>&1
+            sleep 5
+            w=$("$R/tools/window_list" $p 2>/dev/null | awk '/^WINDOW/ && $8 > 40 && $9 > 40 { n++; if (!g) g = $6 " " $7 " " $8 " " $9 } END { print n + 0 "|" g }')
+        fi
         cpu=$(ps -o time= -p $p | tr -d ' ')
         state=running
         g=${w#*|}
