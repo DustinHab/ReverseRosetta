@@ -153,10 +153,11 @@ is filled (4.7 s at the very first start), the native one 0.66 s.
   quarantine labels of downloaded files read and written as natively. Text rendering goes through the system's
   PowerPC font server; font metrics, glyph outlines, paths and the bitmap glyphs of small text without antialiasing
   are identical to a native build (`tests/fonts.c`).
-- Installed universal applications through their i386 part (`tests/app_survey.sh`, `tools/apps_i386.sh`): of the 44 on
-  the test machine, 38 open their windows within 40 seconds, among them Keynote, Pages and Numbers ('09), Xcode 3.1,
-  Interface Builder's sibling tools (Dashcode, Instruments, Quartz Composer, Shark, FileMerge, PackageMaker, Icon
-  Composer), BigTop, Cinebench R10, SheepShaver and The Unarchiver; 4 more run without a window of their own, and The
+- Installed universal applications through their i386 part (`tests/app_survey.sh`, `tools/apps_i386.sh`): all 49 on
+  the test machine behave as their native builds. 45 open their windows within 40 seconds, among them Keynote, Pages
+  and Numbers ('09), Xcode 3.1, Interface Builder, Dashcode, Instruments, Quartz Composer, Shark, FileMerge,
+  PackageMaker, Icon Composer, Mail, BigTop, Cinebench R10, SheepShaver, The Unarchiver and The Sims 2 Body Shop (its
+  licence dialog); MallocDebug, OpenGL Driver Monitor and Saturn open no window at launch, natively neither, and The
   Sims 2's Read Me opens its document in TextEdit and quits, as it does natively. Objective-C
   garbage collection (Xcode) and JavaScriptCore work. Frameworks that the 10.5.8 update has no i386 version of are stub
   libraries with real Objective-C classes (see Limitations); an application that needs one of them for real fails at
