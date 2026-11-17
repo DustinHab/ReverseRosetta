@@ -237,7 +237,7 @@ vImage_Error vImageScale_Planar8(const vImage_Buffer *src, const vImage_Buffer *
 }
 
 /* source pixel (x, y) with edge handling: extend or background (0: outside) */
-static const uint8_t *src(const vImage_Buffer *src, long x, long y, int n, vImage_Flags flags)
+static const uint8_t *src_at(const vImage_Buffer *src, long x, long y, int n, vImage_Flags flags)
 {
     if (x < 0 || y < 0 || x >= (long)src->width || y >= (long)src->height) {
         if (!(flags & kvImageEdgeExtend)) return 0;
@@ -266,7 +266,7 @@ vImage_Error vImageConvolve_Planar8(const vImage_Buffer *src, const vImage_Buffe
             long s = 0, v;
             for (i = 0; i < kernel_height; i++)
                 for (j = 0; j < kernel_width; j++) {
-                    const uint8_t *q = src(src, (long)(x + srcOffsetToROI_X + j) - kernel_width / 2,
+                    const uint8_t *q = src_at(src, (long)(x + srcOffsetToROI_X + j) - kernel_width / 2,
                                               (long)(y + srcOffsetToROI_Y + i) - kernel_height / 2, 1, flags);
                     s += (long)kernel[i * kernel_width + j] * (q ? *q : backgroundColor);
                 }
@@ -295,7 +295,7 @@ vImage_Error vImageTentConvolve_ARGB8888(const vImage_Buffer *src, const vImage_
             for (i = -hh; i <= hh; i++)
                 for (j = -hb; j <= hb; j++) {
                     long w = (hh + 1 - labs(i)) * (hb + 1 - labs(j));
-                    const uint8_t *q = src(src, (long)(x + srcOffsetToROI_X) + j, (long)(y + srcOffsetToROI_Y) + i, 4, flags);
+                    const uint8_t *q = src_at(src, (long)(x + srcOffsetToROI_X) + j, (long)(y + srcOffsetToROI_Y) + i, 4, flags);
                     for (k = 0; k < 4; k++) s[k] += w * (q ? q[k] : backgroundColor[k]);
                     sum += w;
                 }

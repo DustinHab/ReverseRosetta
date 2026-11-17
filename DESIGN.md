@@ -769,7 +769,15 @@ itself), events, timers and drawing work.
 **What was needed:**
 - Replacement libraries (`tools/intel_replacements.sh`, C for i386, translated by rosetta): vImage (15 functions that
   libraries in the root import; premultiplication exact, scaling bilinear), libBLAS (6 float routines), libLAPACK (2
-  routines report an error). The Combo Update did not update them, but Accelerate/vecLib load them.
+  routines report an error). The Combo Update did not update them, but Accelerate/vecLib load them. MLTEFile.bundle
+  (`tools/replacements/mltefile.m`, Objective-C): MLTE's plug-in that reads and writes RTF/RTFD with Cocoa's text
+  system; the PowerPC Mac's bundle has no i386 part, so `TXNSetDataFromCFURLRef` with an RTF file failed (-4960,
+  coreFoundationUnknownErr) in every Intel program. The Sims 2 Body Shop ended at startup: its licence dialog loads
+  the licence text (RTF) into an HITextView and quits when that fails. The five functions (`MLTEFile_ReadRTFDoc`,
+  `...ReadRTFData`, `...ReadRTFDData`, `...WriteRTFDoc`, `...FlattenRTFDoc`) and the attribute runs they exchange
+  with HIToolbox (one dictionary per run: Location, Length, FontName, PointSize, FontTraits, colours as three floats,
+  Underline, Alignment, TabStops, Kern, Ligature, attachments) follow the PowerPC bundle's code; `tests/mlte_rtf.c`
+  reads a styled RTF file, flattens it and reads it again, the same as natively.
 - Stub libraries (`tools/intel_stubs.sh PATH...`, `app_stubs.sh NAME`): for every missing i386 library (CoreVideo,
   SpeechRecognition, CarbonSound, SecurityHI, InstallServer, SpeechObjects, Calculate) one with the install name and
   the versions the clients expect; functions report "missing" on the first call and return an error code, keys bound

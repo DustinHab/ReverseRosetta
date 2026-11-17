@@ -248,7 +248,7 @@ part of this repository.
    tools/intel_root.sh            # thin i386 copies of every Mach-O file of the update
    tools/intel_links.sh           # symbolic links of the framework bundles
    tools/intel_prune.sh           # remove what the system already provides as i386 (libSystem, libobjc, dyld)
-   tools/intel_replacements.sh    # vImage, libBLAS, libLAPACK replacements (missing from the update)
+   tools/intel_replacements.sh    # vImage, libBLAS, libLAPACK, MLTEFile replacements (missing from the update)
    tools/intel_umbrellas.sh       # umbrella frameworks (CoreServices, ApplicationServices, Carbon, Cocoa)
    tools/intel_rebase.sh          # fixed load addresses for all i386 libraries
    tools/intel_prebind.sh         # prebinding (binding in dyld for Foundation: 14.3 ms -> 1.8 ms)
@@ -400,8 +400,6 @@ well.
 - CoreAudio properties that carry pointers (value translations such as device by UID) are not bridged and report
   kAudioHardwareUnknownPropertyError; names and UIDs (CFString) are.
 - expect and tclsh need Tcl.framework, which has no i386 version on a PowerPC system (the Intel root has a stub).
-- The Sims 2 Body Shop asks for its licence agreement on the first start and loads the text through
-  MLTEFile.bundle, which exists only for PowerPC; the dialog fails and the program quits.
 - Programs that need a setuid helper in their bundle (Activity Monitor's pmTool) do not work: the copy in
   `intel/apps` is not setuid, and an i386 helper could not run with root rights through rosetta anyway.
 - Packed float instructions give the PowerPC default NaN (positive) where Intel processors give a negative one.

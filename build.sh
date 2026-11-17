@@ -25,6 +25,8 @@ if [ "$1" = tests ] && [ -d "$Q/tests" ]; then
               gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" $V/libvDSP.dylib $V/libvMisc.dylib ;;   # Intel vecLib
       graphics*|fonts) gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" -framework ApplicationServices
           gcc-4.2 -arch ppc -mcpu=7450 -O2 -o "$B/$n.ppc" "$t" -framework ApplicationServices ;;   # tests/in_session.sh
+      mlte_rtf) gcc-4.2 -arch i386 -O2 -isysroot $S -o "$B/$n" "$t" -framework Carbon
+          gcc-4.2 -arch ppc -mcpu=7450 -O2 -o "$B/$n.ppc" "$t" -framework Carbon ;;   # MLTE with RTF (MLTEFile plug-in)
       calculate) C=System/Library/PrivateFrameworks/Calculate.framework/Versions/A/Calculate   # private engine
           [ -f "$Q/intel/root/$C" ] && gcc-4.2 -arch i386 -O1 -o "$B/$n" "$t" "$Q/intel/root/$C"   # (stub library)
           gcc-4.2 -arch ppc -O1 -o "$B/$n.ppc" "$t" "/$C" ;;
