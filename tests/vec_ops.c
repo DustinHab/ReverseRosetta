@@ -122,6 +122,9 @@ static void pairs(void)
             mix(k++, "psrad xmm", _mm_sra_epi32(a, c32));
             mix(k++, "psrlw any", _mm_srl_epi16(a, b));             /* all 64 bits of the count */
             mix(k++, "psraw any", _mm_sra_epi16(a, b));
+            mix(k++, "paddq", _mm_add_epi64(a, b));
+            mix(k++, "psubq", _mm_sub_epi64(a, b));
+            mix(k++, "pmuludq", _mm_mul_epu32(a, b));
             mix_ps(k++, "addps", _mm_add_ps(x, y));
             mix_ps(k++, "subps", _mm_sub_ps(x, y));
             mix_ps(k++, "mulps", _mm_mul_ps(x, y));

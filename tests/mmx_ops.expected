@@ -58,6 +58,9 @@ pmaxub       30f8f31511cc9df5
 pminsw       389b013af0a8eb2b
 pmaxsw       6ebc23a19f5decef
 psadbw       c593cbe6cf6e5ffb
+paddq        68011cb2ce64503b
+psubq        df8cefeea790350e
+pmuludq      c48d5c57457ca14e
 pshufw 1b    ca097ba194dd04a4
 pshufw e4    76674853a7789363
 pshufw 5c    058446d536512527

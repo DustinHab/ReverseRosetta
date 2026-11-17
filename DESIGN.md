@@ -1132,8 +1132,9 @@ even when it had a handler (crash reporters, runtimes that recover from faults).
   with -0 (one rounding), minps/maxps vcmpgtfp and vsel (d < s ? d : s, exact for NaN and -0), cvtps2dq vrfin and
   vctsxs with the out-of-range lanes set to 0x80000000, 64-bit shifts through two words in GPRs (no 64-bit
   elements). AltiVec runs in Java mode (VSCR.NJ = 0, set per guest thread; Mac OS X starts threads with NJ = 1,
-  which flushes denormals to zero). Divide and square root of packed floats, paddq/psubq/pmuludq and 64-bit shifts
-  by a register count still go to C. Shifts of 16- and 32-bit lanes by a register count (17 Nov): the count's two
+  which flushes denormals to zero). Divide and square root of packed floats and 64-bit shifts by a register count
+  still go to C; paddq/psubq/pmuludq (17 Nov) go through r3..r6 per 64-bit lane (addc/adde, subfc/subfe,
+  mullw/mulhwu). Shifts of 16- and 32-bit lanes by a register count (17 Nov): the count's two
   words into GPRs, the out-of-range case computed without branches (subfic/subfe, cntlzw), the count splatted
   through Cpu.sse_tmp (vsplth/vspltw), a keep mask zeroes the lanes for srl/sll, sra takes width - 1 (vec_ops: counts
   0..31, 0..63 and all 64 bits). The vperm patterns built at translation time live in a pool that is

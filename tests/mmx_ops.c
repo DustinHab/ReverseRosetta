@@ -6,6 +6,7 @@
 #include <string.h>
 #include <mmintrin.h>
 #include <xmmintrin.h>
+#include <emmintrin.h>                  /* paddq, psubq, pmuludq on mm (SSE2) */
 
 static const unsigned long long g_v[] = {
     0ull, 1ull, 0xffffffffffffffffull, 0x8000000000000000ull, 0x7fffffffffffffffull, 0x0123456789abcdefull,
@@ -70,6 +71,7 @@ int main(void)
     BIN("pminub", _mm_min_pu8(a, b)); BIN("pmaxub", _mm_max_pu8(a, b));
     BIN("pminsw", _mm_min_pi16(a, b)); BIN("pmaxsw", _mm_max_pi16(a, b));
     BIN("psadbw", _mm_sad_pu8(a, b));
+    BIN("paddq", _mm_add_si64(a, b)); BIN("psubq", _mm_sub_si64(a, b)); BIN("pmuludq", _mm_mul_su32(a, b));
     UN("pshufw 1b", _mm_shuffle_pi16(a, 0x1b)); UN("pshufw e4", _mm_shuffle_pi16(a, 0xe4));
     UN("pshufw 5c", _mm_shuffle_pi16(a, 0x5c));
     {                                   /* results in general registers (Apple's gcc-4.2 fails on them inside mk()) */

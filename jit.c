@@ -1118,6 +1118,7 @@ static int mmx_can(const Insn *b)
     case 0x71: case 0x72: return !b->mem && (b->reg == 2 || b->reg == 4 || b->reg == 6);
     case 0x73: return !b->mem && (b->reg == 2 || b->reg == 6);         /* psrlq, psllq */
     case 0xd1: case 0xd2: case 0xe1: case 0xe2: case 0xf1: case 0xf2:  /* shifts by mm/m64 */
+    case 0xd4: case 0xfb: case 0xf4:                                   /* paddq, psubq, pmuludq */
         return 1;
     case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: case 0x67:
     case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x74: case 0x75: case 0x76:
@@ -1163,6 +1164,7 @@ static int sse_can(const Insn *b)
     case 0xed: case 0xee: case 0xef: case 0xf5: case 0xf6: case 0xf8: case 0xf9: case 0xfa: case 0xfc:
     case 0xfd: case 0xfe:                   /* add/sub (also saturating), mul, min/max, avg, sad, logic */
     case 0xd1: case 0xd2: case 0xe1: case 0xe2: case 0xf1: case 0xf2:  /* shifts by xmm/m128 */
+    case 0xd4: case 0xfb: case 0xf4:                                   /* paddq, psubq, pmuludq */
         return p;
     }
     return 0;
@@ -3170,6 +3172,23 @@ static void gen_sse_on(const Insn *b)
         e(VPERM(0, 1, 1, 2));
         vx_store(0, b->reg);
         return;
+    case 0xd4: case 0xfb: case 0xf4: {      /* paddq, psubq, pmuludq: 64-bit lanes through r3..r6 (AltiVec has none) */
+        int lanes = g_mmx ? 1 : 2, k, sa = b->mem ? ea_in(b) : RCPU;
+        for (k = 0; k < lanes; k++) {
+            int od = d + 8 * k, os = 8 * k + (b->mem ? 0 : xmm_off(b->rm));
+            e(LI(0, od)); e(LWBRX(3, RCPU, 0));
+            e(LI(0, os)); e(LWBRX(5, sa, 0));
+            if (op != 0xf4) {
+                e(LI(0, od + 4)); e(LWBRX(4, RCPU, 0));
+                e(LI(0, os + 4)); e(LWBRX(6, sa, 0));
+                if (op == 0xd4) { e(ADDC(3, 3, 5)); e(ADDE(4, 4, 6)); }
+                else { e(SUBFC(3, 5, 3)); e(SUBFE(4, 6, 4)); }
+            } else { e(MULHWU(4, 3, 5)); e(MULLW(3, 3, 5)); }     /* low words: 32 x 32 -> 64 unsigned */
+            e(LI(0, od)); e(STWBRX(3, RCPU, 0));
+            e(LI(0, od + 4)); e(STWBRX(4, RCPU, 0));
+        }
+        return;
+    }
     case 0xd1: case 0xd2: case 0xe1: case 0xe2: case 0xf1: case 0xf2: {
         /* shift 16/32-bit lanes by the low 64 bits of the source: psrlw/d, psraw/d, psllw/d. A count beyond the lane
            width: srl/sll give 0, sra the sign (count = width - 1) */
