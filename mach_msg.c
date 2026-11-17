@@ -122,7 +122,11 @@ static const AtsType g_ats_types[0x2c] = {
     [0x0d] = { "Notify", { LIST_END }, { LIST_END }, 0 },
     [0x0e] = { "ScanFontDirectories", { H(0x18), H(0x1a), LIST_END }, { W(0x124), LIST_END }, 0 },
     [0x10] = { "Notify", { LIST_END }, { LIST_END }, 0 },
-    [0x12] = { "AddToFontNamesCache", { LIST_END }, { LIST_END }, 1 },
+    /* key 0x18..0x2b (font, name code, ...) already in the server's byte order: the Intel client converts it itself
+       when the rendezvous reported the other byte order (font 0x00010026 = Lucida Grande arrives as 00 01 00 26);
+       three flag bytes 0x2c..0x2e, name length at 0x30, name from 0x34 (read off _SendAddToFontNamesCacheMessage);
+       reply: sync block. Firefox 16 adds the names of Lucida Grande's font features. */
+    [0x12] = { "AddToFontNamesCache", { W(0x30), LIST_END }, { LIST_END }, 0 },
     [0x13] = { "FindUnicodeEncoding", { W(0x18), LIST_END }, { LIST_END }, 0 },
     /* reply: see fcache_reply */
     [0x14] = { "GetFCacheData", { H(0x18), H(0x1a), W(0x1c), W(0x20), LIST_END }, { W(0x18), LIST_END }, 0 },
