@@ -1,0 +1,6 @@
+whole file mapped: yes, byte 0x5000 03
+part mapped at the same place: yes
+written after mprotect, checksum 722576c7
+task_set_exception_ports: 0
+munmap with ebp into nothing: 0
+done

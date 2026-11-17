@@ -823,6 +823,21 @@ void mach_trap(Cpu *c, int n, uint32_t base)
         /* vm_protect (3803) on the own task with write access: make shared-mapped file ranges private first */
         if (id == 3803 && ld32(m + 8) == mach_task_self() && arg(2) >= 48 && (ld32(m + 44) & VM_PROT_WRITE))
             sys_make_private(ld32(m + 32), ld32(m + 36));
+        if (id == 4802 && ld32(m + 8) == mach_task_self() && arg(2) >= 56 && (ld32(m + 52) & VM_PROT_WRITE))
+            sys_make_private(ld32(m + 32), ld32(m + 40));        /* mach_vm_protect: 64-bit address and size */
+        /* task_/thread_set_exception_ports, task_/thread_swap_exception_ports (Breakpad: Firefox, Camino): the kernel
+           would send the faults of the translator itself (read probes, its own reads of guest memory) as Mach messages
+           to a guest thread and stop the faulting thread until the reply; that guest thread waits for the thread lock
+           the stopped one holds. The handlers could not use PowerPC thread states anyway; guest faults reach the guest
+           as signals (main.c memfault, sys_fault). The mask becomes 0: the kernel replies normally, sets nothing. */
+        if ((id == 3413 || id == 3415 || id == 3613 || id == 3615) && arg(2) >= 52 &&
+            (id >= 3600 || ld32(m + 8) == mach_task_self()) && ld32(m + 48)) {
+            if (g_log) fprintf(stderr, "rosetta: exception ports of the guest (mask %x) not set: its faults arrive as signals\n",
+                               ld32(m + 48));
+            st32(m + 48, 0);
+        }
+        if (id == 3802 && ld32(m + 8) == mach_task_self() && arg(2) >= 40) sys_shared_forget(ld32(m + 32), ld32(m + 36));
+        if (id == 4801 && ld32(m + 8) == mach_task_self() && arg(2) >= 48) sys_shared_forget(ld32(m + 32), ld32(m + 40));
         /* freeing or protecting in the own task (vm_deallocate, vm_protect, mach_vm_deallocate/-protect): never in the
            host library range */
         if ((id == 3802 || id == 3803) && ld32(m + 8) == mach_task_self() && arg(2) >= 40)

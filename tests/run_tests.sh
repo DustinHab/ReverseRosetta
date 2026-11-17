@@ -120,6 +120,8 @@ t_sfw()   { ROSETTA_THRESHOLD=1 ./rosetta ./stack_fw; ROSETTA_NO_SLOTS=1 ROSETTA
 r_sfw()   { ROSETTA_INTERP=1 ./rosetta ./stack_fw; ROSETTA_INTERP=1 ./rosetta ./stack_fw; ROSETTA_INTERP=1 ./rosetta ./stack_fw; }
 t_tkl()   { ROSETTA_THRESHOLD=1 ./rosetta ./taken_loop; ROSETTA_NO_TAKEN=1 ROSETTA_THRESHOLD=1 ./rosetta ./taken_loop; }
 r_tkl()   { ROSETTA_INTERP=1 ./rosetta ./taken_loop; ROSETTA_INTERP=1 ./rosetta ./taken_loop; }
+t_gpt()   { sh ../tests/with_timeout.sh 30 ./rosetta ./guest_ports; }
+r_gpt()   { cat ../tests/guest_ports.expected; }
 t_mlte()  { ./rosetta ./mlte_rtf; }
 r_mlte()  { ./mlte_rtf.ppc; }
 t_ffu()   { ROSETTA_THRESHOLD=1 ./rosetta ./far_fusion; ROSETTA_NO_FAR=1 ROSETTA_THRESHOLD=1 ./rosetta ./far_fusion; }
@@ -136,6 +138,7 @@ same "stack slots forwarded in a block: esp/ebp aliases, read-modify-write in pl
 same "loops over the taken branch of a conditional jump (against interpreter)" t_tkl r_tkl
 same "compare and a later reader merged across instructions (against interpreter)" t_ffu r_ffu
 same "RTF through MLTE and its plug-in MLTEFile (replacement in the Intel root), against native" t_mlte r_mlte
+same "file mapping unmapped with an unrounded size, guest exception ports (Firefox 16 startup)" t_gpt r_gpt
 same "OpenAL: devices, sources, buffers, playing (silent), against native" t_al r_al
 same "MMX: 69 operations on mm registers, against a real x86 processor" t_mmx r_mmx
 same "text encodings: CFString and TEC (converters from the system's CarbonCore), against native" t_te r_te

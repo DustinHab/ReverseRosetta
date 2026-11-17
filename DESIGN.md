@@ -328,7 +328,20 @@ class, exceptions) produce byte-identical output to native (run_tests.sh: 22 com
   `MAP_SHARED` 5 us (`tools/probes/mmap_cost.c`). Without write permission the guest sees no difference; if it asks
   for it later (mprotect, vm_protect = Mach message 3803), the range is first replaced by private memory with the same
   content. `ROSETTA_NO_SHARED=1`. Rejected: writable private mappings as anonymous memory + pread
-  (`tools/probes/data_map_cost.c`: faster in isolation, 1 ms slower measured in a real run).
+  (`tools/probes/data_map_cost.c`: faster in isolation, 1 ms slower measured in a real run). Bug fixed (17 Nov):
+  the table of shared ranges kept whole pages, munmap removed an entry only when the unrounded length covered it,
+  and a new mapping over a range did not remove the old entry. dyld maps a library file whole to look at it, unmaps
+  it with the file size and maps the segments into the same place; a vm_protect with write access there then copied
+  the stale, larger range and read past the end of the mapped memory (Firefox 16 crashed while loading libnspr4).
+  Now munmap, vm_deallocate and every new mapping trim or remove overlapping entries page by page, and
+  mach_vm_protect with write access makes ranges private as vm_protect does (`tests/guest_ports.c`).
+- **Exception ports of the guest** (mach_msg.c): `task_/thread_set_exception_ports` and `..._swap_...` reach the
+  kernel with an empty mask. Firefox's crash reporter (Breakpad) set the task's exception ports; a fault in the
+  translator itself (a read probe, its own look at guest memory) then went as a Mach message to a guest thread while
+  the faulting thread stayed stopped until the reply, and that guest thread waited for the thread lock the stopped
+  one held: Firefox hung at startup. The handlers could not use PowerPC thread states anyway; guest faults reach the
+  guest as signals. The record of memory calls (`sys_mem_note`) now reads the guest's ebp chain through the read
+  probe: code without frame pointers (jemalloc) leaves anything in ebp.
 - **Own prebinding** (`tools/prebind.c`, `intel_prebind.sh`): Apple's i386 libraries are not built prebound
   (`redo_prebinding`: "file is not prebound"). dyld skips binding an image if it carries MH_PREBOUND, sits at its
   address and the timestamps of its dependencies match; then `setupLazyPointerHandler` does not reset the jump tables

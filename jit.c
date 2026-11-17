@@ -6983,6 +6983,15 @@ static int safe_read(uint32_t a, void *target, uint32_t n)
 /* 16 bytes of code from a really present (predicted targets) */
 static int code_present(uint32_t a) { uint8_t t[16]; return safe_read(a, t, 16); }
 
+/* guest word at a (little endian), if readable: for the translator's own looks at guest memory (sys.c) */
+int jit_safe_read32(uint32_t a, uint32_t *v)
+{
+    uint8_t b[4];
+    if (!safe_read(a, b, 4)) return 0;
+    *v = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
+    return 1;
+}
+
 static int word_read(uint32_t addr, uint32_t *w)
 {
     int s = page_prot(addr);

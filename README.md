@@ -147,7 +147,10 @@ is filled (4.7 s at the very first start), the native one 0.66 s.
   `NSThread` and `NSOperationQueue`.
 - Cocoa programs with windows, events and text. Of the Intel applications of the 10.5.8 update, Calculator (computing
   with the system's own engine), Terminal, Console, System Profiler, Dictionary, iCal, Address Book, Safari, Mail and
-  Keychain Access open their windows; Preview shows PDF documents; Chess draws its board with OpenGL. Transmission 2.42 downloads. Safari shows pages
+  Keychain Access open their windows; Preview shows PDF documents; Chess draws its board with OpenGL. Transmission 2.42 downloads.
+  Firefox 16.0.2 (the last release for 10.5, Intel only) opens its window and renders pages with canvas drawing; its
+  JavaScript JIT generates x86 code that rosetta translates in turn (a test loop of 3 million iterations gives the
+  right result in 1.9 s). Safari shows pages
   over HTTP with CSS, JavaScript and images (HTTPS to current servers fails on 10.5 natively too). Programs open
   documents and URLs in other applications through LaunchServices (a game's Read Me opens in TextEdit), with the
   quarantine labels of downloaded files read and written as natively. Text rendering goes through the system's

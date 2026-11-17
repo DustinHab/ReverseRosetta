@@ -58,12 +58,29 @@ static struct { uint32_t start, end; int prot; } g_shared[SHARED_N];
 static int g_nshared, g_shared_on = -1;
 static unsigned long g_st_shared, g_st_private;
 
+/* [a, a + len) is no longer (that) shared mapping: munmap, or a new mapping over it (MAP_FIXED). Whole pages, as the
+   kernel counts them: dyld maps a whole library file to look at it and unmaps it with the unrounded file size; the
+   entry stayed, its segments were mapped into the same range later, and a vm_protect there copied the stale range
+   into private memory past the end of what was mapped (Firefox 16 died while loading libnspr4) */
 static void shared_forget(uint32_t a, uint32_t len)
 {
+    uint32_t b = a + ((len + 4095) & ~4095u);
     int i;
-    for (i = 0; i < g_nshared; i++)
-        if (g_shared[i].start >= a && g_shared[i].end <= a + len) g_shared[i--] = g_shared[--g_nshared];
+    a &= ~4095u;
+    for (i = 0; i < g_nshared; i++) {
+        uint32_t s = g_shared[i].start, e = g_shared[i].end;
+        if (e <= a || s >= b) continue;
+        if (s >= a && e <= b) { g_shared[i--] = g_shared[--g_nshared]; continue; }
+        if (s < a && e > b && g_nshared < SHARED_N) {     /* hole in the middle: two entries */
+            g_shared[g_nshared] = g_shared[i];
+            g_shared[g_nshared++].start = b;
+            g_shared[i].end = a;
+        } else if (s < a) g_shared[i].end = a;
+        else g_shared[i].start = b;
+    }
 }
+
+void sys_shared_forget(uint32_t a, uint32_t len) { shared_forget(a, len); }
 
 /* before write access to [a, a + len): replace shared mappings in it with private copies */
 void sys_make_private(uint32_t a, uint32_t len)
@@ -235,13 +252,14 @@ void sys_mem_note(Cpu *c, char kind, uint32_t a, uint32_t len)
     uint32_t i = g_njump++ % MEMRING;
     g_memring[i].a = a; g_memring[i].len = len; g_memring[i].eip = c->eip; g_memring[i].caller = ld32(c->r[ESP]);
     g_memring[i].kind = kind;
-    {   /* three return addresses via ebp (mach_msg -> MIG stub -> caller) */
-        uint32_t bp = c->r[EBP], k;
+    {   /* three return addresses via ebp (mach_msg -> MIG stub -> caller); code without frame pointers (jemalloc in
+           Firefox) leaves anything in ebp: read through the probe, a fault here stopped the thread */
+        uint32_t bp = c->r[EBP], k, ret;
         for (k = 0; k < 3; k++) {
             g_memring[i].chain[k] = 0;
             if (!bp || (bp & 3) || bp < 0x1000 || bp >= 0xc0000000u) continue;
-            g_memring[i].chain[k] = ld32(bp + 4);
-            bp = ld32(bp);
+            if (!jit_safe_read32(bp + 4, &ret) || !jit_safe_read32(bp, &bp)) break;
+            g_memring[i].chain[k] = ret;
         }
     }
 }
@@ -1734,6 +1752,13 @@ void sys_bsd(Cpu *c, int sysenter)
 {
     uint64_t t0;
     int nr;
+    if (g_log > 2) {                        /* ROSETTA_LOG=3: also when each call returns (which one hangs) */
+        uint32_t n = c->r[EAX] & 0xffff;
+        sys_bsd_call(c, sysenter);
+        sys_log_stamp();
+        fprintf(stderr, "[bsd %u done] eax %08x\n", n, c->r[EAX]);
+        return;
+    }
     if (sysenter || !g_sys_measure) { sys_bsd_call(c, sysenter); return; }
     nr = (int)(c->r[EAX] & 511);
     t0 = sys_t0();
@@ -1837,13 +1862,17 @@ static void sys_bsd_call(Cpu *c, int sysenter)
         if (shared) {
             r = mmap((void *)(uintptr_t)a, len, prot, (int)((flags & ~MAP_PRIVATE) | MAP_SHARED), (int)arg(4), (off_t)arg64(5));
             if (r != MAP_FAILED) {
+                shared_forget((uint32_t)(uintptr_t)r, len);    /* what was mapped there before */
                 g_shared[g_nshared].start = (uint32_t)(uintptr_t)r;
                 g_shared[g_nshared].end = (uint32_t)(uintptr_t)r + ((len + 4095) & ~4095u);
                 g_shared[g_nshared++].prot = prot;
                 g_st_shared++;
             }
         }
-        if (r == MAP_FAILED) r = mmap((void *)(uintptr_t)a, len, prot, (int)flags, (int)arg(4), (off_t)arg64(5));
+        if (r == MAP_FAILED) {
+            r = mmap((void *)(uintptr_t)a, len, prot, (int)flags, (int)arg(4), (off_t)arg64(5));
+            if (r != MAP_FAILED) shared_forget((uint32_t)(uintptr_t)r, len);
+        }
         if (r == MAP_FAILED) { set_result(c, 0, errno); return; }
         /* Code at this address may have changed; not when dyld places a library from the translation cache at its
            address (jit_mapping_expected) */
