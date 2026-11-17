@@ -79,7 +79,9 @@ runs; the values vary by a few percent between measurement runs. `tests/measure_
 
 Library code: decoding a 2560x1600 JPEG with ImageIO and drawing it into a bitmap (`tools/probes/jpeg_decode.c`)
 takes 1.47 s translated and 0.44 s native. ImageIO's decoder is SSE2 code; before packed SSE2 integer and float
-instructions were translated to AltiVec, it took 16.3 s.
+instructions were translated to AltiVec, it took 16.3 s. QuickTime opening two H.264 movies and decoding frames of
+them (`tests/quicktime.c`): 3.43 s translated, 1.52 s native; its codecs' MMX code went through the interpreter
+before (3.82 s).
 
 OpenGL (`tests/bench_gl.c`, `tests/gl_measure.sh`): 13 workloads drawn by the Radeon 9200 into a 256x256 pbuffer,
 milliseconds per frame, fastest of 5 rounds. Translated and native builds render identical images. Where the native
@@ -176,8 +178,8 @@ its translation cache is filled (4.7 s at the very first start), the native one 
   whose encoding plugins exist only for PowerPC (`tests/textenc.c`: MacRoman, Shift-JIS, EUC-CN, EUC-KR, UTF-8/16).
 - QuickTime through its own i386 framework from Apple's QuickTime 7.6.4 for Leopard (see Setup): movies open, and
   H.264 frames decode to the same pixels as natively (`tests/quicktime.c`); QuickTime Player's own i386 build opens its
-  window, and the QuickTime messages of Cinebench, Keynote and Numbers are gone. Its codecs use MMX, which runs in the
-  interpreter (correct, `tests/mmx_ops.c` against a real x86 processor, but slow for now).
+  window, and the QuickTime messages of Cinebench, Keynote and Numbers are gone. Its codecs use MMX, which the
+  translator does with AltiVec like SSE2 (`tests/mmx_ops.c` against a real x86 processor).
 - x87, SSE and SSE2: scalar, packed double, packed integer and packed float (AltiVec), including Apple's Intel
   vDSP/vForce code and ImageIO's image decoders.
 - OpenGL with the graphics chip: the program's OpenGL calls go to the system's PowerPC OpenGL and its hardware

@@ -186,6 +186,7 @@ static int g_no_narrowfw;             /* ROSETTA_NO_NARROWFW: 8/16-bit reads of 
 static int g_no_taken;                /* ROSETTA_NO_TAKEN: blocks follow only the fall-through of conditional jumps */
 static unsigned long g_st_taken;
 static int g_no_far;                  /* ROSETTA_NO_FAR: compare and reader merged only when adjacent */
+static int g_no_mmx;                  /* ROSETTA_NO_MMX: MMX in the interpreter (as before 17.11.) */
 /* integer move, load or store whose code touches no CR field (between a merged compare and its reader) */
 static int cr0_safe(const Insn *y)
 {
@@ -901,6 +902,7 @@ static int jit_create(void)
     g_no_narrowfw = getenv("ROSETTA_NO_NARROWFW") != 0;
     g_no_taken = getenv("ROSETTA_NO_TAKEN") != 0;
     g_no_far = getenv("ROSETTA_NO_FAR") != 0;
+    g_no_mmx = getenv("ROSETTA_NO_MMX") != 0;
     g_no_dead = !getenv("ROSETTA_DEAD");   /* off: no measurable gain (sha1 1.10 s against 1.11 s, realworld equal) */
     g_dead_log = getenv("ROSETTA_DEAD_LOG") != 0;
     if (getenv("ROSETTA_DEAD_WINDOW")) sscanf(getenv("ROSETTA_DEAD_WINDOW"), "%d,%d", &g_dead_window, &g_dead_writes);
@@ -1095,10 +1097,44 @@ static uint8_t cond_mask(int k)
 
 /* SSE instructions the translator does with AltiVec (gen_sse, no flags): SSE2 integer instructions on xmm registers
    and packed floats except division and square root */
+/* MMX: integer instruction without prefix on mm0..mm7 (gen_sse does it on Cpu.mm like the SSE2 form on Cpu.xmm) */
+static int is_mmx(const Insn *b)
+{
+    int o = b->op & 0xff;
+    return b->op >= OP_0F && b->op <= (OP_0F | 0xff) && !b->p66 && !b->rep &&
+           ((o >= 0x60 && o <= 0x7f) || o == 0xc4 || o == 0xc5 || o >= 0xd0);
+}
+
+static int mmx_can(const Insn *b)
+{
+    int o = b->op & 0xff;
+    if (g_no_mmx || !is_mmx(b)) return 0;
+    switch (o) {
+    case 0x6f: case 0x7f: case 0x6e: case 0x7e: case 0x70: case 0x77:   /* movq, movd, pshufw, emms */
+        return 1;
+    case 0xe7: return b->mem;                                          /* movntq */
+    case 0xd7: case 0xc5: return !b->mem;                              /* pmovmskb, pextrw */
+    case 0xc4: return 1;                                               /* pinsrw */
+    case 0x71: case 0x72: return !b->mem && (b->reg == 2 || b->reg == 4 || b->reg == 6);
+    case 0x73: return !b->mem && (b->reg == 2 || b->reg == 6);         /* psrlq, psllq */
+    case 0xd1: case 0xd2: case 0xe1: case 0xe2: case 0xf1: case 0xf2:  /* shifts by mm/m64 */
+        return 1;
+    case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: case 0x67:
+    case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x74: case 0x75: case 0x76:
+    case 0xd5: case 0xd8: case 0xd9: case 0xda: case 0xdb: case 0xdc: case 0xdd: case 0xde: case 0xdf:
+    case 0xe0: case 0xe3: case 0xe4: case 0xe5: case 0xe8: case 0xe9: case 0xea: case 0xeb: case 0xec:
+    case 0xed: case 0xee: case 0xef: case 0xf5: case 0xf6: case 0xf8: case 0xf9: case 0xfa: case 0xfc:
+    case 0xfd: case 0xfe:
+        return 1;
+    }
+    return 0;
+}
+
 static int sse_can(const Insn *b)
 {
     int o = b->op & 0xff, p = b->p66 && !b->rep, n = !b->p66 && !b->rep;
     if (b->op < OP_0F || b->op > (OP_0F | 0xff)) return 0;
+    if (is_mmx(b)) return mmx_can(b);
     switch (o) {
     case 0x6f: case 0x7f:                   /* movdqa (66), movdqu (f3) */
         return p || (b->rep == 0xf3 && !b->p66);
@@ -1126,6 +1162,7 @@ static int sse_can(const Insn *b)
     case 0xe0: case 0xe3: case 0xe4: case 0xe5: case 0xe8: case 0xe9: case 0xea: case 0xeb: case 0xec:
     case 0xed: case 0xee: case 0xef: case 0xf5: case 0xf6: case 0xf8: case 0xf9: case 0xfa: case 0xfc:
     case 0xfd: case 0xfe:                   /* add/sub (also saturating), mul, min/max, avg, sad, logic */
+    case 0xd1: case 0xd2: case 0xe1: case 0xe2: case 0xf1: case 0xf2:  /* shifts by xmm/m128 */
         return p;
     }
     return 0;
@@ -2888,7 +2925,10 @@ static void gen_muldiv(const Insn *b, int needs)
 
 static const uint8_t g_weights[16] __attribute__((aligned(16))) = { 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128 };
 
-static int xmm_off(int n) { return OFF(xmm) + 16 * n; }
+/* gen_sse works on mm0..mm7: Cpu.mm, 16 bytes apart, the register in the first 8 (the other 8 are scratch: lane
+   operations on them do no harm, only the first 8 are ever read as the register) */
+static int g_mmx;
+static int xmm_off(int n) { return g_mmx ? OFF(mm) + 16 * n : OFF(xmm) + 16 * n; }
 
 /* address of the memory operand in a register (for lwz/stw with offset) */
 static int ea_in(const Insn *b)
@@ -2941,10 +2981,19 @@ static void vconst(int v, const uint8_t *m)
 static void vx_load(int v, int n) { e(LI(0, xmm_off(n))); e(LVX(v, RCPU, 0)); }
 static void vx_store(int v, int n) { e(LI(0, xmm_off(n))); e(STVX(v, RCPU, 0)); }
 
-/* second operand (xmm or aligned m128) into v */
+/* second operand (xmm or aligned m128; mm or m64 at any alignment, into the first 8 bytes) into v; may use v2, v3 */
 static void vsrc_load(int v, const Insn *b)
 {
     int ra, rb;
+    if (b->mem && g_mmx) {                  /* the two quadwords that hold the 8 bytes, lined up with lvsl */
+        int a = ea_in(b);
+        e(LVSL(2, 0, a));
+        e(LVX(v, 0, a));
+        e(ADDI(11, a, 7));
+        e(LVX(3, 0, 11));
+        e(VPERM(v, v, 3, 2));
+        return;
+    }
     if (b->mem) { ea_pair(b, 1, &ra, &rb); e(LVX(v, ra, rb)); }
     else vx_load(v, b->rm);
 }
@@ -2966,14 +3015,93 @@ static void gen_shift_q(int n, int c, int left)
     }
 }
 
+static void gen_sse_on(const Insn *b);
+static unsigned long g_st_mmx;
+
 static void gen_sse(const Insn *b)
+{
+    g_mmx = is_mmx(b);
+    if (g_mmx) g_st_mmx++;
+    gen_sse_on(b);
+    g_mmx = 0;
+}
+
+/* MMX where the 64-bit form is not the low half of the 128-bit one; 0: as SSE2 */
+static int gen_mmx_own(const Insn *b, int op, int d, int c)
+{
+    int a, i;
+    uint8_t m[16];
+    switch (op) {
+    case 0x77: return 1;                    /* emms: the mm registers are apart from the x87 stack */
+    case 0x6f:                              /* movq mm, mm/m64 */
+        vsrc_load(0, b);
+        vx_store(0, b->reg);
+        return 1;
+    case 0x7f: case 0xe7:                   /* movq mm/m64, mm; movntq: 8 bytes through r3/r4 (any alignment) */
+        if (!b->mem) { vx_load(0, b->reg); vx_store(0, b->rm); return 1; }
+        a = ea_in(b);
+        e(LWZ(3, d, RCPU)); e(LWZ(4, d + 4, RCPU));
+        e(STW(3, 0, a)); e(STW(4, 4, a));
+        after_save(b, 8, 0, a, -1);
+        return 1;
+    case 0x6e:                              /* movd mm, r/m32: the high half becomes 0 */
+        if (!b->mem) { e(LI(0, d)); e(STWBRX(R(b->rm), RCPU, 0)); }
+        else if ((i = slot_reg(b, 4)) >= 0) { e(LI(0, d)); e(STWBRX(i, RCPU, 0)); }
+        else { a = ea_in(b); e(LWZ(3, 0, a)); e(STW(3, d, RCPU)); }
+        e(LI(3, 0)); e(STW(3, d + 4, RCPU));
+        return 1;
+    case 0xd7:                              /* pmovmskb r32, mm: the top bits of the 8 bytes */
+        vx_load(0, b->rm);
+        e(VSPLTISB(1, 0));
+        e(VCMPGTSB(0, 1, 0));
+        load_imm(12, (uint32_t)(uintptr_t)g_weights); e(LVX(2, 0, 12));
+        e(VAND(0, 0, 2));
+        e(VSUM4UBS(0, 0, 1));
+        e(LI(0, OFF(sse_tmp))); e(STVX(0, RCPU, 0));
+        e(LWZ(3, OFF(sse_tmp), RCPU)); e(LWZ(4, OFF(sse_tmp) + 4, RCPU));
+        e(ADD(R(b->reg), 3, 4));
+        return 1;
+    case 0xc4:                              /* pinsrw mm, r32/m16, imm */
+        d += 2 * (c & 3);
+        if (!b->mem) { e(LI(0, d)); e(STHBRX(R(b->rm), RCPU, 0)); }
+        else { a = ea_in(b); e(LHZ(3, 0, a)); e(STH(3, d, RCPU)); }
+        return 1;
+    case 0xc5:                              /* pextrw r32, mm, imm */
+        e(LI(0, xmm_off(b->rm) + 2 * (c & 3))); e(LHBRX(R(b->reg), RCPU, 0));
+        return 1;
+    case 0x68: case 0x69: case 0x6a:        /* punpckh*: the low form on the high halves (bytes 4..7) */
+        vx_load(0, b->reg);
+        vsrc_load(1, b);
+        e(VSLDOI(0, 0, 0, 4)); e(VSLDOI(1, 1, 1, 4));
+        e(op == 0x68 ? VMRGHB(0, 0, 1) : op == 0x69 ? VMRGHH(0, 0, 1) : VMRGHW(0, 0, 1));
+        vx_store(0, b->reg);
+        return 1;
+    case 0x63: case 0x67: case 0x6b:        /* packs: d's lanes, then s's, into 8 bytes */
+        vx_load(0, b->reg);
+        vsrc_load(1, b);
+        for (i = 0; i < 16; i++) m[i] = (uint8_t)(i < 8 ? i : 8 + i);     /* d's 8 bytes, then s's */
+        vconst(2, m); e(VPERM(0, 0, 1, 2));
+        vconst(7, g_vrev); e(VPERM(0, 0, 0, 7));
+        e(op == 0x63 ? VPKSHSS(0, 0, 0) : op == 0x67 ? VPKSHUS(0, 0, 0) : VPKSWSS(0, 0, 0));
+        e(VPERM(0, 0, 0, 7));
+        vx_store(0, b->reg);
+        return 1;
+    }
+    return 0;
+}
+
+static void gen_sse_on(const Insn *b)
 {
     int op = b->op & 0xff, d = xmm_off(b->reg), ra, rb, a, i, c = (int)(b->imm & 0xff);
     int gpr_rm = !b->mem && (op == 0x6e || op == 0x7e || op == 0xc4);   /* rm is an integer register */
     int digit = op == 0x71 || op == 0x72 || op == 0x73;                   /* reg is part of the opcode */
     uint8_t m[16];
-    if (!digit) xf_forget(b->reg);       /* AltiVec works on Cpu.xmm */
-    if (!b->mem && !gpr_rm) xf_forget(b->rm);
+    if (g_mmx) {
+        if (gen_mmx_own(b, op, d, c)) return;
+    } else {
+        if (!digit) xf_forget(b->reg);   /* AltiVec works on Cpu.xmm */
+        if (!b->mem && !gpr_rm) xf_forget(b->rm);
+    }
     switch (op) {
     case 0x6f: case 0x10:                   /* xmm <- xmm/m128 */
         if (b->mem && (b->rep || op == 0x10)) {     /* movdqu, movups: raw bytes, without alignment */
@@ -3042,6 +3170,29 @@ static void gen_sse(const Insn *b)
         e(VPERM(0, 1, 1, 2));
         vx_store(0, b->reg);
         return;
+    case 0xd1: case 0xd2: case 0xe1: case 0xe2: case 0xf1: case 0xf2: {
+        /* shift 16/32-bit lanes by the low 64 bits of the source: psrlw/d, psraw/d, psllw/d. A count beyond the lane
+           width: srl/sll give 0, sra the sign (count = width - 1) */
+        int w = (op & 3) == 1, max = w ? 15 : 31, sra = (op & 0xf0) == 0xe0;
+        if (b->mem) { a = ea_in(b); e(LWBRX(3, 0, a)); e(ADDI(4, a, 4)); e(LWBRX(4, 0, 4)); }
+        else { e(LI(0, xmm_off(b->rm))); e(LWBRX(3, RCPU, 0)); e(LI(0, xmm_off(b->rm) + 4)); e(LWBRX(4, RCPU, 0)); }
+        e(SUBFIC(5, 3, max)); e(SUBFE(5, 5, 5));        /* -1 if count > max (unsigned) */
+        e(CNTLZW(6, 4)); e(SRWI(6, 6, 5)); e(ADDI(6, 6, -1));   /* -1 if the high word is not 0 */
+        e(OR(5, 5, 6));
+        if (sra) { e(ANDC(3, 3, 5)); e(LI(6, max)); e(AND(6, 6, 5)); e(OR(3, 3, 6)); }   /* (CR stays) */
+        e(NOR(5, 5, 5));                    /* keep mask: 0 if the result is 0 */
+        e(STW(3, OFF(sse_tmp), RCPU)); e(STW(5, OFF(sse_tmp) + 4, RCPU));
+        e(LI(0, OFF(sse_tmp))); e(LVX(1, RCPU, 0));
+        e(w ? VSPLTH(2, 1, 1) : VSPLTW(2, 1, 0));
+        vx_load(0, b->reg);
+        vconst(7, g_vrev); e(VPERM(0, 0, 0, 7));
+        if (w) e((op & 0xf0) == 0xd0 ? VSRH(0, 0, 2) : sra ? VSRAH(0, 0, 2) : VSLH(0, 0, 2));
+        else e((op & 0xf0) == 0xd0 ? VSRW(0, 0, 2) : sra ? VSRAW(0, 0, 2) : VSLW(0, 0, 2));
+        if (!sra) { e(VSPLTW(3, 1, 1)); e(VAND(0, 0, 3)); }
+        e(VPERM(0, 0, 0, 7));
+        vx_store(0, b->reg);
+        return;
+    }
     case 0x71: case 0x72:                   /* shift 16/32-bit lanes by a constant: reg 2 srl, 4 sra, 6 sll */
         i = op == 0x71 ? 15 : 31;
         if (c > i && b->reg != 4) { e(VSPLTISB(0, 0)); vx_store(0, b->rm); return; }
@@ -10255,9 +10406,9 @@ void jit_stats(void)
                 (unsigned)(((uint8_t *)g_free - (uint8_t *)g_half2_code) >> 10), g_st_far,
                 (unsigned)(((uint8_t *)g_pool[0] - (uint8_t *)g_half_end[0]) >> 10), (unsigned)(((uint8_t *)g_pool[1] - (uint8_t *)g_half_end[1]) >> 10));
     fprintf(stderr,"rosetta: %lu blocks with %lu instructions translated, %lu chained (%lu direct), %lu fused, "
-            "%lu page exits, %lu stack slots, %lu floating point (%lu loops, %lu packed), %lu x87, %lu direct (x87/SSE), %lu interpreted in block, %lu interpreted, %lu invalid, %lu flushes, %lu table misses, %lu inline caches, %lu stubs, %lu constants (%lu blocks with guard, %lu failed, %lu masks), %lu loops with prefetch (%lu streams, %lu faults), %lu mov saved, %lu forwarded, %lu calls inlined (%lu predicted, %lu wrong), %lu stack values forwarded (%lu ret without check, %lu dead stores, %lu written later), %lu math calls direct, %lu switch tables, %lu taken branches followed, %lu compares merged across instructions, cache %lu KB\n", g_st_blocks,
+            "%lu page exits, %lu stack slots, %lu floating point (%lu loops, %lu packed), %lu x87, %lu direct (x87/SSE), %lu interpreted in block, %lu interpreted, %lu invalid, %lu flushes, %lu table misses, %lu inline caches, %lu stubs, %lu constants (%lu blocks with guard, %lu failed, %lu masks), %lu loops with prefetch (%lu streams, %lu faults), %lu mov saved, %lu forwarded, %lu calls inlined (%lu predicted, %lu wrong), %lu stack values forwarded (%lu ret without check, %lu dead stores, %lu written later), %lu math calls direct, %lu switch tables, %lu taken branches followed, %lu compares merged across instructions, %lu MMX, cache %lu KB\n", g_st_blocks,
             g_st_insns, g_st_linked, g_st_direct, g_st_fusion, g_st_pages, g_st_slots, g_st_fp, g_st_fp_loops, g_st_pd, g_st_x87, g_st_fp_direct, g_st_inline, g_st_interp, g_st_invalid,
-            g_st_flushes, g_st_table_miss, g_st_ic, g_st_stubs, g_st_const, g_st_watchdog, g_st_watchdog_miss, g_st_masks, g_st_prefetch, g_st_vl_streams, g_st_vl_error, g_st_mov, g_st_fw, g_st_embed, g_st_before, g_st_before_miss, g_st_sw, g_st_sw_ret, g_st_dead, g_st_dead_flush, g_st_math_direct, g_st_jumptab, g_st_taken, g_st_fusion_far, (unsigned long)((uint8_t *)g_free - (uint8_t *)g_cache) / 1024);
+            g_st_flushes, g_st_table_miss, g_st_ic, g_st_stubs, g_st_const, g_st_watchdog, g_st_watchdog_miss, g_st_masks, g_st_prefetch, g_st_vl_streams, g_st_vl_error, g_st_mov, g_st_fw, g_st_embed, g_st_before, g_st_before_miss, g_st_sw, g_st_sw_ret, g_st_dead, g_st_dead_flush, g_st_math_direct, g_st_jumptab, g_st_taken, g_st_fusion_far, g_st_mmx, (unsigned long)((uint8_t *)g_free - (uint8_t *)g_cache) / 1024);
     {
         int i, k, best;
         {

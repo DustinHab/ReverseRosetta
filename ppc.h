@@ -124,6 +124,9 @@
 
 /* AltiVec (content of the XMM registers: raw bytes in guest byte order, element 0 = lowest address) */
 #define LVX(v, a, b)    X_(v, a, b, 103, 0)
+#define LVSL(v, a, b)   X_(v, a, b, 6, 0)     /* vperm pattern for an unaligned load from a + b */
+#define VSPLTH(d, b, u) VX_(588, d, u, b)     /* every halfword = halfword u of b */
+#define VSPLTW(d, b, u) VX_(652, d, u, b)     /* every word = word u of b */
 #define VPERM(d, a, b, c) ((uint32_t)4 << 26 | (uint32_t)(d) << 21 | (uint32_t)(a) << 16 | (uint32_t)(b) << 11 | (uint32_t)(c) << 6 | 43u)
 #define STVX(v, a, b)   X_(v, a, b, 231, 0)
 #define VX_(xo, d, a, b) ((uint32_t)4 << 26 | (uint32_t)(d) << 21 | (uint32_t)(a) << 16 | (uint32_t)(b) << 11 | (xo))

@@ -691,8 +691,16 @@ page). Running measurement series: `tests/measure_all.sh`.
   separate the two with emms). An mm register goes through an Xmm with a zero upper half, so the SSE2 element operations
   serve as they are where the 64-bit form is the low half of the 128-bit one; unpacking the high halves and packing
   differ. Also pshufw, pmovmskb, pinsrw/pextrw, maskmovq, movntq, cvtpi2ps/cvt(t)ps2pi, cvtpi2pd/cvt(t)pd2pi,
-  movdq2q/movq2dq. The JIT leaves them to the interpreter. `tests/mmx_ops.c`: 69 operations, identical to a real x86
+  movdq2q/movq2dq. `tests/mmx_ops.c`: 69 operations, identical to a real x86
   processor (the reference built with gcc for x86-64 in WSL; Apple's gcc-4.2 sign-extends `_mm_extract_pi16`).
+  Translated since 17 Nov (jit.c `mmx_can`, `gen_mmx_own`, gen_sse with `g_mmx`): Cpu.mm keeps each register in the
+  first 8 bytes of its own 16 (lvx/stvx; the other 8 are scratch, lane operations on them do no harm), and gen_sse
+  does the SSE2 form on it. An m64 operand comes in with two lvx and lvsl/vperm (any alignment; both quadwords hold
+  bytes of the access), a 64-bit store goes through r3/r4. Own forms: punpckh* (vsldoi by 4 bytes, then the low
+  merge), packs (d's and s's 8 bytes into one vector, then one pack), pmovmskb (8 bits), pinsrw/pextrw (4 lanes),
+  emms (nothing). The analyses (memory sizes, registers written) treat MMX like SSE2, which is on the safe side
+  (16 bytes). QuickTime's H.264 test: 1.9 million interpreted MMX instructions before, 3.82 s; now 3.43 s (native
+  1.52 s). `ROSETTA_NO_MMX=1` leaves them to the interpreter.
 - Real-time threads: QuickTimeComponents, CoreVideo, CoreAudio, AudioToolbox call thread_policy_set, CoreMediaPrivate
   pthread_setschedparam. Passed on, a time-constraint or fixed-priority thread of slow translated code that spins took
   the only processor: the iBook froze three times (ping answered, no process ran, not even sshd or a watchdog) as soon as
@@ -1124,8 +1132,11 @@ even when it had a handler (crash reporters, runtimes that recover from faults).
   with -0 (one rounding), minps/maxps vcmpgtfp and vsel (d < s ? d : s, exact for NaN and -0), cvtps2dq vrfin and
   vctsxs with the out-of-range lanes set to 0x80000000, 64-bit shifts through two words in GPRs (no 64-bit
   elements). AltiVec runs in Java mode (VSCR.NJ = 0, set per guest thread; Mac OS X starts threads with NJ = 1,
-  which flushes denormals to zero). Divide and square root of packed floats, the MMX forms, paddq/psubq/pmuludq and
-  shifts by a register count still go to C. The vperm patterns built at translation time live in a pool that is
+  which flushes denormals to zero). Divide and square root of packed floats, paddq/psubq/pmuludq and 64-bit shifts
+  by a register count still go to C. Shifts of 16- and 32-bit lanes by a register count (17 Nov): the count's two
+  words into GPRs, the out-of-range case computed without branches (subfic/subfe, cntlzw), the count splatted
+  through Cpu.sse_tmp (vsplth/vspltw), a keep mask zeroes the lanes for srl/sll, sra takes width - 1 (vec_ops: counts
+  0..31, 0..63 and all 64 bits). The vperm patterns built at translation time live in a pool that is
   saved with the translation cache like the floating-point constants: the code loads them by address, and a run
   from the cache first read zeros there (shufps, punpck*qdq; `run_tests.sh` now runs vec_ops twice through a cache
   file).

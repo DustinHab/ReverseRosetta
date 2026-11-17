@@ -65,6 +65,7 @@ static void pairs(void)
     for (i = 0; i < NV; i++)
         for (j = 0; j < NV; j++) {
             __m128i a = A(i), b = A(j);
+            __m128i c16 = _mm_and_si128(b, _mm_set_epi32(0, 0, 0, 31)), c32 = _mm_and_si128(b, _mm_set_epi32(0, 0, 0, 63));
             __m128 x = F(i), y = F(j);
             int k = 0;
             mix(k++, "paddb", _mm_add_epi8(a, b));
@@ -113,6 +114,14 @@ static void pairs(void)
             mix(k++, "punpckhdq", _mm_unpackhi_epi32(a, b));
             mix(k++, "punpcklqdq", _mm_unpacklo_epi64(a, b));
             mix(k++, "punpckhqdq", _mm_unpackhi_epi64(a, b));
+            mix(k++, "psllw xmm", _mm_sll_epi16(a, c16));          /* shifts by a register: counts 0..31 / 0..63 */
+            mix(k++, "psrlw xmm", _mm_srl_epi16(a, c16));
+            mix(k++, "psraw xmm", _mm_sra_epi16(a, c16));
+            mix(k++, "pslld xmm", _mm_sll_epi32(a, c32));
+            mix(k++, "psrld xmm", _mm_srl_epi32(a, c32));
+            mix(k++, "psrad xmm", _mm_sra_epi32(a, c32));
+            mix(k++, "psrlw any", _mm_srl_epi16(a, b));             /* all 64 bits of the count */
+            mix(k++, "psraw any", _mm_sra_epi16(a, b));
             mix_ps(k++, "addps", _mm_add_ps(x, y));
             mix_ps(k++, "subps", _mm_sub_ps(x, y));
             mix_ps(k++, "mulps", _mm_mul_ps(x, y));
@@ -128,7 +137,7 @@ static void pairs(void)
 
 static void singles(void)
 {
-    int i, k0 = 60;
+    int i, k0 = 70;
     for (i = 0; i < NV; i++) {
         __m128i a = A(i);
         __m128 x = F(i);
