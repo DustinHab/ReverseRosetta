@@ -130,6 +130,8 @@ t_ffu()   { ROSETTA_THRESHOLD=1 ./rosetta ./far_fusion; ROSETTA_NO_FAR=1 ROSETTA
 r_ffu()   { ROSETTA_INTERP=1 ./rosetta ./far_fusion; ROSETTA_INTERP=1 ./rosetta ./far_fusion; }
 t_frt()   { sh ../tests/with_timeout.sh 60 ./rosetta ./fault_retry; }
 r_frt()   { ./fault_retry.ppc; }
+t_jcd()   { ROSETTA_SMC=1 ROSETTA_THRESHOLD=1 ./rosetta ./jit_code; ROSETTA_SMC=1 ./rosetta ./jit_code; ./rosetta ./jit_code; }
+r_jcd()   { ROSETTA_INTERP=1 ./rosetta ./jit_code; ROSETTA_INTERP=1 ./rosetta ./jit_code; ROSETTA_INTERP=1 ./rosetta ./jit_code; }
 same raw_arith t_raw r_raw
 same "64-bit shifts, shld/shrd with flags" t_shf r_shf
 same "cmpsb (translated against interpreter)" t_cmpsb r_cmpsb
@@ -142,6 +144,7 @@ same "stack slots forwarded in a block: esp/ebp aliases, read-modify-write in pl
 same "loops over the taken branch of a conditional jump (against interpreter)" t_tkl r_tkl
 same "compare and a later reader merged across instructions (against interpreter)" t_ffu r_ffu
 same "memory fault handlers that return to retry the access (VOSF, write barriers) in translated loops, against native" t_frt r_frt
+same "generated code in a writable executable mapping, patched while in use (JIT compilers; against interpreter)" t_jcd r_jcd
 same "RTF through MLTE and its plug-in MLTEFile (replacement in the Intel root), against native" t_mlte r_mlte
 same "file mapping unmapped with an unrounded size, guest exception ports (Firefox 16 startup)" t_gpt r_gpt
 same "OpenAL: devices, sources, buffers, playing (silent), against native" t_al r_al

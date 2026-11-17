@@ -159,6 +159,8 @@ static void memfault(int sig, siginfo_t *info, void *k)
            back to this thread's dispatcher, which delivers the signal (sys_fault, jit_fault_state) */
         Cpu *c = g_thread_cur ? g_thread_cur : &cpu;
         int exact;
+        /* first: a write to a JIT code page the translator protected (jit.c, smc) */
+        if (jit_smc_fault((uint32_t)(uintptr_t)info->si_addr, k, c->host_thread == (void *)pthread_self() ? c : 0)) return;
         if (c->fault_jmp && c->host_thread == (void *)pthread_self() && (exact = jit_fault_state(c, k)) >= 0) {
             /* translated code: the handler runs nested, then the faulting instruction again (sys.c) */
             if (!exact && sys_fault_nest(c, sig, info->si_code, (uint32_t)(uintptr_t)info->si_addr, k)) return;

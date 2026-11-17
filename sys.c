@@ -60,6 +60,27 @@ static struct { uint32_t start, end; int prot; } g_shared[SHARED_N];
 static int g_nshared, g_shared_on = -1;
 static unsigned long g_st_shared, g_st_private;
 
+/* Anonymous mappings the guest made readable, writable and executable: the code buffers of JIT compilers (SpiderMonkey,
+   JavaScriptCore). The translator may write-protect pages of them it translated from (jit.c, smc) */
+#define JITR_N 256
+static struct { uint32_t a, end; } g_jitr[JITR_N];
+static int g_njitr;
+
+int sys_jit_page(uint32_t a)
+{
+    int i;
+    for (i = 0; i < g_njitr; i++) if (a >= g_jitr[i].a && a < g_jitr[i].end) return 1;
+    return 0;
+}
+
+static void jitr_forget(uint32_t a, uint32_t len)
+{
+    uint32_t e = a + len;
+    int i;
+    for (i = 0; i < g_njitr; i++)
+        if (g_jitr[i].a < e && a < g_jitr[i].end) g_jitr[i--] = g_jitr[--g_njitr];   /* (all of it: the rest checks bytes) */
+}
+
 /* [a, a + len) is no longer (that) shared mapping: munmap, or a new mapping over it (MAP_FIXED). Whole pages, as the
    kernel counts them: dyld maps a whole library file to look at it and unmaps it with the unrounded file size; the
    entry stayed, its segments were mapped into the same range later, and a vm_protect there copied the stale range
@@ -2039,6 +2060,11 @@ static void sys_bsd_call(Cpu *c, int sysenter)
             if (r != MAP_FAILED) shared_forget((uint32_t)(uintptr_t)r, len);
         }
         if (r == MAP_FAILED) { set_result(c, 0, errno); return; }
+        jitr_forget((uint32_t)(uintptr_t)r, len);
+        if ((flags & MAP_ANON) && (prot & PROT_WRITE) && (prot & PROT_EXEC) && g_njitr < JITR_N) {
+            g_jitr[g_njitr].a = (uint32_t)(uintptr_t)r;
+            g_jitr[g_njitr++].end = (uint32_t)(uintptr_t)r + ((len + 4095) & ~4095u);
+        }
         if (flags & MAP_FIXED) jit_hold_release(a, len, 1);    /* replaced what was held there for a library */
         /* Code at this address may have changed; not when dyld places a library from the translation cache at its
            address (jit_mapping_expected) */
@@ -2052,11 +2078,13 @@ static void sys_bsd_call(Cpu *c, int sysenter)
         sys_mem_note(c, 'u', arg(0), arg(1));
         if (sys_host_range(c, arg(0), arg(1), "munmap")) { set_result(c, 0, EINVAL); return; }
         jit_flush_schedule(arg(0), arg(1)); shared_forget(arg(0), arg(1)); jit_hold_release(arg(0), arg(1), 1);
+        jitr_forget(arg(0), arg(1));
         HOST(munmap(PTR_ARG(0), arg(1))); return;
     case SYS_mprotect:
         sys_mem_note(c, 'p', arg(0), arg(1));
         if (sys_host_range(c, arg(0), arg(1), "mprotect")) { set_result(c, 0, EINVAL); return; }
         jit_flush_schedule(arg(0), arg(1));
+        if ((arg(2) & (PROT_WRITE | PROT_EXEC)) != (PROT_WRITE | PROT_EXEC)) jitr_forget(arg(0), arg(1));
         if (arg(2) & PROT_WRITE) sys_make_private(arg(0), arg(1));
         HOST(mprotect(PTR_ARG(0), arg(1), (int)arg(2)));
         return;

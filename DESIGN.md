@@ -359,6 +359,15 @@ class, exceptions) produce byte-identical output to native (run_tests.sh: 22 com
   `ROSETTA_NO_HOLD=1`. With a code region of 32 MB (24 MB before) the file kept the first 20 MB (Firefox's startup
   alone is 30 MB of code; a cache with all of it left a start that loads it no room for what it translates anew, the
   region ran full and everything was discarded): first start 14.9 s, every further one 9.6 to 9.7 s.
+- **Write-protected JIT code** (17 Nov, opt-in `ROSETTA_SMC=1`; jit.c `smc_*`, `jit_smc_fault`, sys.c `g_jitr`): code
+  from writable pages is translated in blocks of at most 4 instructions that compare their bytes at entry, so
+  Firefox's JavaScript runs slowly (a loop of 3 million iterations 1.4 s, a million calls 2.3 s). Pages of anonymous
+  mappings the guest made writable and executable (the code buffers of JIT compilers) are write-protected instead
+  when a block is translated from them and translated in full; a write faults, the page becomes writable again,
+  the blocks relying on it are halted at their starts (bl interrupt) and discarded at the next dispatcher round,
+  the faulting thread's return ring starts anew, the write runs again; a page written 16 times stays writable.
+  `tests/jit_code.c` (generated code patched while in use, across a page boundary, new code in the same page) passes
+  both ways; Firefox 16 still ends with SIGBUS with it, so it stays off by default until that is found.
 - **Shared table jump for ret, shared fill exit for inline caches** (17 Nov; jit.c `tabjump_build`, `icfill_build`):
   every ret carried an inline cache of its own after the shadow check (4 entries of 5 words, the table lookup, a
   fill exit of 3 words per entry: 42 words) that ran only when the shadow entry did not match. Now it is one `b` to

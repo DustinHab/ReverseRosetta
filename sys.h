@@ -58,5 +58,6 @@ int sys_fault(Cpu *c, int sig, int code, uint32_t addr, int exact);
 /* approximate fault (translated code) for a guest handler that may return: the host context goes into a nested run of
    the handler, afterwards the faulting PowerPC instruction runs again. 1: ctx (the host signal handler's) changed */
 int sys_fault_nest(Cpu *c, int sig, int code, uint32_t addr, void *ctx);
+int sys_jit_page(uint32_t a);              /* a lies in an anonymous mapping the guest made writable and executable */
 
 #endif

@@ -189,6 +189,7 @@ static int g_no_taken;                /* ROSETTA_NO_TAKEN: blocks follow only th
 static unsigned long g_st_taken;
 static int g_no_far;                  /* ROSETTA_NO_FAR: compare and reader merged only when adjacent */
 static int g_no_mmx;                  /* ROSETTA_NO_MMX: MMX in the interpreter (as before 17.11.) */
+static int g_no_smc = -1;             /* without ROSETTA_SMC=1: JIT code in small checked blocks (smc, below) */
 static int g_ret_ic;                  /* ROSETTA_RET_IC: every ret with its own inline cache, every inline cache entry with
                                          its own fill exit (as before 17.11.) */
 /* integer move, load or store whose code touches no CR field (between a merged compare and its reader) */
@@ -660,13 +661,13 @@ int jit_interrupt(void)
     uint32_t i;
     int r = 0;
     g_patch_wants = 1;
-    if (g_in_code && !g_patched && g_cache && g_interrupt) {
+    if (g_in_code && (!g_patched || !g_no_smc) && g_cache && g_interrupt) {
         int need = (int)g_nused + VAR_N + g_nhead;
         if (g_up_max < need) {
             void *n = realloc(g_up, (size_t)need * sizeof *g_up);
             if (n) { g_up = n; g_up_max = need; }
         }
-        g_nup = 0;
+        if (!g_patched) g_nup = 0;      /* (otherwise the starts halted for written code pages stay listed) */
         for (i = 0; i < g_nused; i++) {
             uint32_t h = g_inuse[i];
             if (g_map[h].code && g_map[h].eip && g_map[h].eip != 0xffffffffu) block_starts_halt(g_map[h].code, g_map[h].eip, 0);
@@ -682,6 +683,14 @@ int jit_interrupt(void)
     }
     g_patch_wants = 0;
     return r;
+}
+
+/* dispatcher: room in the list of halted starts for every block (jit_smc_fault fills it in a signal handler) */
+static void up_reserve(void)
+{
+    int need = (int)g_nused + VAR_N + g_nhead + 1024;
+    void *n = realloc(g_up, (size_t)need * sizeof *g_up);
+    if (n) { g_up = n; g_up_max = need; }
 }
 
 /* Dispatcher (lock held, not in code): restore block starts (in reverse order: duplicates last) */
@@ -867,9 +876,12 @@ static void jit_range_changed(uint32_t a, uint32_t len, const char *why);
 
 static void ranges_forget(uint32_t a, uint32_t len);
 
+static void smc_forget(uint32_t a, uint32_t len);
+
 /* guest remapped [a, a + len) or changed its protection */
 void jit_flush_schedule(uint32_t a, uint32_t len)
 {
+    smc_forget(a, len);                 /* our write protection of code pages is gone with it */
     ranges_forget(a, len);              /* the region cache of page protections */
     memset(g_need_eip, 0, sizeof g_need_eip);     /* remembered results depended on page protection */
     memset(g_el_eip, 0, sizeof g_el_eip);
@@ -890,6 +902,88 @@ static void jit_range_changed(uint32_t a, uint32_t len, const char *why)
     } else g_flush = 1;
     if (g_cache_show) fprintf(stderr, "rosetta: %s: %s %08x+%x (eip %08x)\n", g_flush == 1 ? "flush" : "invalidate", why, a, len,
                               g_cpu ? g_cpu->eip : 0);
+}
+
+/* ---------- Code the guest writes (JIT compilers) ----------
+ * Code from writable pages is translated in blocks of at most 4 instructions that compare their bytes at entry
+ * (must_check): JavaScript in Firefox ran at a few percent of its speed. Pages of the guest's anonymous mappings that
+ * are writable and executable (sys_jit_page: the code buffers of SpiderMonkey, JavaScriptCore) are write-protected
+ * instead as soon as a block is translated from them, and their code is translated as any other. A write to such a
+ * page faults (main.c memfault, jit_smc_fault): the page becomes writable again, the blocks that rely on it are
+ * halted at their starts (bl interrupt, as the watchdog does) and discarded at the next round of the dispatcher, the
+ * faulting thread's return ring starts anew (no return into the middle of such a block), and the write runs again.
+ * A page that is written to again and again (16 times) stays writable: its code goes back to the small checked
+ * blocks. Opt-in (ROSETTA_SMC=1) until Firefox runs with it: tests/jit_code.c passes, Firefox 16 ends with SIGBUS. */
+static uint32_t g_smc_bits[1u << 15];   /* pages write-protected by us (one bit per page) */
+static uint8_t *g_smc_count;            /* write faults per page */
+static unsigned long g_st_smc_prot, g_st_smc_fault, g_st_smc_halted;
+#define SMC_PEND 64
+static volatile uint32_t g_smc_pend[SMC_PEND];  /* pages written to, for the dispatcher */
+static volatile int g_smc_npend;
+
+static int smc_ok(uint32_t a)
+{
+    if (g_no_smc < 0) g_no_smc = !getenv("ROSETTA_SMC");     /* opt-in for now: Firefox 16 still dies with it */
+    if (g_no_smc) return 0;
+    if (!g_smc_count && !(g_smc_count = calloc(1u << 20, 1))) return 0;
+    return g_smc_count[a >> 12] < 16 && sys_jit_page(a);
+}
+
+/* write-protect the page of a (writable, in a JIT buffer); 1: it is */
+static int smc_protect(uint32_t a)
+{
+    uint32_t pg = a >> 12;
+    if (g_smc_bits[pg >> 5] >> (pg & 31) & 1) return 1;
+    if (mprotect((void *)(uintptr_t)(pg << 12), 4096, PROT_READ | PROT_EXEC)) return 0;
+    g_smc_bits[pg >> 5] |= 1u << (pg & 31);
+    ranges_forget(pg << 12, 4096);
+    g_st_smc_prot++;
+    return 1;
+}
+
+static void smc_forget(uint32_t a, uint32_t len)
+{
+    uint32_t pg, last;
+    if (!len) return;
+    last = (uint32_t)(((uint64_t)a + len - 1) >> 12);
+    for (pg = a >> 12; pg <= last; pg++) g_smc_bits[pg >> 5] &= ~(1u << (pg & 31));
+}
+
+static int in_code_cache(uint32_t pc);
+
+/* main.c memfault (signal handler): a write to a page we protected? Then it is the guest's again; 1: retry. c: the
+   guest thread that faulted (0: another thread) */
+int jit_smc_fault(uint32_t addr, void *ctx, Cpu *c)
+{
+    uint32_t pg = addr >> 12, i;
+    int k;
+    if (!(g_smc_bits[pg >> 5] >> (pg & 31) & 1)) return 0;
+    g_smc_bits[pg >> 5] &= ~(1u << (pg & 31));
+    if (mprotect((void *)(uintptr_t)(pg << 12), 4096, PROT_READ | PROT_WRITE | PROT_EXEC)) return 0;
+    ranges_forget(pg << 12, 4096);
+    if (g_smc_count && g_smc_count[pg] < 255) g_smc_count[pg]++;
+    g_st_smc_fault++;
+    k = __sync_fetch_and_add(&g_smc_npend, 1);
+    if (k < SMC_PEND) g_smc_pend[k] = pg;
+    /* until the dispatcher discards them, the blocks from this page must not run */
+    for (i = 0; i < g_ndep; i++) {
+        BlockDep *d = &g_dep[i];
+        if (!(d->code & 1) && dep_hits(d, pg, pg)) { block_starts_halt(g_cache + (d->code >> 2), d->eip, 0); g_st_smc_halted++; }
+    }
+    if (g_nup) g_patched = 1;
+    if (ctx && c) {                         /* in translated code: its returns no longer into such blocks */
+        ucontext_t *u = (ucontext_t *)ctx;
+        if (in_code_cache(u->uc_mcontext->__ss.__srr0)) u->uc_mcontext->__ss.__r13 = c->shadow_base;
+    }
+    return 1;
+}
+
+/* dispatcher (lock held): the pages written to become ranges to discard */
+static void smc_drain(void)
+{
+    int n = __sync_lock_test_and_set(&g_smc_npend, 0), k;
+    if (n > SMC_PEND) { g_flush = 1; return; }      /* (too many at once: everything) */
+    for (k = 0; k < n; k++) jit_range_changed(g_smc_pend[k] << 12, 4096, "code written");
 }
 
 /* Return ring (one per thread): aligned to its size, preceded by the sentinel entry (matches no
@@ -945,6 +1039,7 @@ static int jit_create(void)
     g_no_taken = getenv("ROSETTA_NO_TAKEN") != 0;
     g_no_far = getenv("ROSETTA_NO_FAR") != 0;
     g_no_mmx = getenv("ROSETTA_NO_MMX") != 0;
+    g_no_smc = !getenv("ROSETTA_SMC");
     g_ret_ic = getenv("ROSETTA_RET_IC") != 0;
     g_no_dead = !getenv("ROSETTA_DEAD");   /* off: no measurable gain (sha1 1.10 s against 1.11 s, realworld equal) */
     g_dead_log = getenv("ROSETTA_DEAD_LOG") != 0;
@@ -7776,11 +7871,20 @@ static uint32_t *translate_block(uint32_t eip)
         if (fn) return stub_block(eip, fn);
     }
     room(8192);
+    if (page_writable(eip) && smc_ok(eip)) smc_protect(eip);     /* JIT code: write-protected, translated in full */
     if (page_writable(eip)) { if (var) return 0; must_check = 1; max = 4; }
 
     /* collect instructions: conditional jumps fall through, unconditional ones to targets not yet seen are followed */
     while (n < max) {
         int k, j;
+        if (!g_no_smc && !must_check && (((a ^ eip) | ((a + 15) ^ eip)) >> 12)) {
+            /* into another page: a writable one only write-protected (JIT code), otherwise the block ends here */
+            uint32_t q = (a ^ eip) >> 12 ? a : a + 15;
+            int stop = 0;
+            if (page_writable(q) && !(smc_ok(q) && smc_protect(q))) stop = 1;
+            if (q == a && ((a + 15) ^ a) >> 12 && page_writable(a + 15) && !(smc_ok(a + 15) && smc_protect(a + 15))) stop = 1;
+            if (stop) break;
+        }
         if (!decode(a, &b[n])) { can_not = 1; break; }
         interp[n] = 0;
         /* call to the next instruction (PIC: call 1f; 1: pop ebx) never returns: as push, without shadow stack */
@@ -10117,6 +10221,8 @@ static int dispatch_loop(Cpu *c)
         if ((!(g_dispatcher_rounds & 0x3fff) && g_checkpoint_n < 2) || g_checkpoint_idle) checkpoint_maybe();
         if (g_cap_at && (uint32_t)((uint8_t *)g_free - (uint8_t *)g_cache) >= g_cap_at) checkpoint_cap();
         if (g_patched) unpatch();       /* restore block starts (jit_interrupt) */
+        if (g_smc_npend) smc_drain();   /* code pages written to: discard their blocks below */
+        if (g_up_max < (int)g_nused + VAR_N + g_nhead + 16) up_reserve();
         if (g_state_wish) state_short(c);
         if (g_thread_waiting | c->yield) thread_yield(c);  /* other guest threads (thread.c) */
         if (g_flush) { if (g_flush == 2) invalidate_ranges(); else if (g_flush == 3) flush_full(); else flush(); }
@@ -10465,6 +10571,9 @@ void jit_stats(void)
                 (double)g_cache_time * tb.numer / tb.denom / 1e6, g_cache_error, g_st_expected, g_st_inval_cache,
                 g_st_hold >> 10, g_st_hold_given >> 10);
     }
+    if (g_st_smc_prot)
+        fprintf(stderr, "rosetta: %lu JIT code pages write-protected, %lu writes to them (%lu block starts halted)\n",
+                g_st_smc_prot, g_st_smc_fault, g_st_smc_halted);
     if (g_free >= g_half2)
         fprintf(stderr, "rosetta: code in the second half of the region (%u KB), %lu jumps into the other half, pools %u + %u KB\n",
                 (unsigned)(((uint8_t *)g_free - (uint8_t *)g_half2_code) >> 10), g_st_far,
