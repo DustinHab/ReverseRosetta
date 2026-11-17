@@ -71,8 +71,14 @@
 
 #define CACHE_ADDR 0x30000000u       /* fixed and free (0x10400000 was often already taken): the translation cache
                                            needs the same address in every run; guest libraries start at 0x40000000 */
-#define CACHE_SIZE (32u << 20)               /* at most 32 MB: blocks chain with b (reach +-32 MB). 24 MB until 17.11.:
-                                                Firefox filled it in a start and flushed */
+/* Code region: two halves of 32 MB, the reach of b (24 MB in one piece until 17 Nov: Firefox's startup alone is 30 MB
+   of code). Code fills the first half (the one the translation cache saves), then the second. Each half reaches its
+   own exits (the prologue at the start of the first, copies at the start of the second) and ends in a pool for jumps
+   into the other half; a chained exit stub jumps there in place with lis/ori/mtctr/bctr (r0 and ctr are free at every
+   block boundary) */
+#define CACHE_SIZE (64u << 20)
+#define HALF_WORDS ((32u << 20) / 4)
+#define POOL_WORDS (64u * 1024)             /* 256 KB per half: block starts redirected into the other half */
 #define TABLE 65536                   /* entries of the jump table (eip, code) */
 #define MAX_INSNS 128                 /* array size; the limit per block is g_max_insns */
 static int g_max_insns = 128;         /* ROSETTA_MAX_INSNS: Intel instructions per superblock (48 until 16.11.:
@@ -110,6 +116,10 @@ static uint32_t g_map_bits = 10, g_map_mask = (1u << 10) - 1;
 static uint32_t g_shadow_base;       /* return stack (ring buffer, aligned to its size) */
 static void (*g_entry)(Cpu *, uint32_t *);
 static uint32_t *g_exit, *g_link, *g_interrupt;
+static uint32_t *g_exit2, *g_link2, *g_interrupt2;    /* the same at the start of the second half */
+static uint32_t *g_half2, *g_half2_code;               /* second half; its code after the copies */
+static uint32_t *g_half_end[2], *g_pool[2];            /* end of each half's code (its pool follows), pool in use */
+static unsigned long g_st_far;                         /* jumps into the other half */
 static int g_flush, g_careful, g_no_fusion, g_no_slots, g_ranges_old, g_poison;
 static int g_no_narrow;                /* ROSETTA_NO_NARROW: 8/16-bit or/and/xor with a constant through extract/insert */
 static unsigned long g_st_blocks, g_st_insns, g_st_interp, g_st_linked, g_st_flushes, g_st_invalid;
@@ -320,6 +330,52 @@ static void addi_after(int t, int a, int32_t d)
 
 static void b_to(void *target) { e(B_((uint32_t)(uintptr_t)target - (uint32_t)(uintptr_t)p)); }
 
+/* b at from reaches to (+-32 MB) */
+static int b_reaches(const uint32_t *from, const uint32_t *to)
+{
+    int32_t d = (int32_t)((uint32_t)(uintptr_t)to - (uint32_t)(uintptr_t)from);
+    return d >= -0x2000000 && d < 0x2000000;
+}
+
+/* the exits of the half that holds at */
+static int half_of(const uint32_t *at) { return g_half2 && at >= g_half2; }
+static uint32_t *exit_near(const uint32_t *at) { return half_of(at) ? g_exit2 : g_exit; }
+static uint32_t *link_near(const uint32_t *at) { return half_of(at) ? g_link2 : g_link; }
+static uint32_t *interrupt_near(const uint32_t *at) { return half_of(at) ? g_interrupt2 : g_interrupt; }
+
+/* jump to target from anywhere: four words at at (r0, ctr) */
+static void far_jump(uint32_t *at, const uint32_t *target)
+{
+    uint32_t t = (uint32_t)(uintptr_t)target;
+    at[1] = ORI(0, 0, t & 0xffff);
+    at[2] = MTCTR(0);
+    at[3] = BCTR;
+    at[0] = LIS(0, t >> 16);
+    sys_icache_invalidate(at, 16);
+}
+
+/* four words in the pool of the half that holds at (0: full) */
+static uint32_t *pool_take(const uint32_t *at)
+{
+    int h = half_of(at);
+    uint32_t *end = h ? g_cache_end : g_half2;
+    if (end - g_pool[h] < 4) return 0;
+    g_pool[h] += 4;
+    return g_pool[h] - 4;
+}
+
+/* room for n words at g_free: the rest of the first half stays empty when it does not fit there any more; the second
+   half full: flush */
+static void flush_full(void);
+static void room(uint32_t n)
+{
+    if (g_free < g_half_end[0]) {
+        if ((uint32_t)(g_half_end[0] - g_free) >= n) return;
+        g_free = g_half2_code;
+    }
+    if (g_free > g_half_end[1] || (uint32_t)(g_half_end[1] - g_free) < n) flush_full();
+}
+
 static void bc_set(uint32_t *bc, uint32_t *target)
 {
     *bc = (*bc & 0xffff0003u) | (((uint32_t)(uintptr_t)target - (uint32_t)(uintptr_t)bc) & 0xfffc);
@@ -434,15 +490,37 @@ static void framecode_build(void)
     e(BLR);
     g_link = p;                    /* "bl link" from an exit stub: r4 = exit stub + 12 */
     e(MFLR(4));
-    b_to(g_exit);
+    b_to(exit_near(p));
     g_interrupt = p;                /* "bl interrupt" at a halted block start: r3 = this start */
     e(MFLR(3));
     e(ADDI(3, 3, -4));
     e(LI(4, KIND_INTERRUPT));
-    b_to(g_exit);
+    b_to(exit_near(p));
     /* code from the next page on: the translation cache is mapped there with mmap */
     g_cache_start = (uint32_t *)(((uintptr_t)p + 4095) & ~(uintptr_t)4095);
     sys_icache_invalidate(g_cache, (size_t)((uint8_t *)p - (uint8_t *)g_cache));
+    /* second half: its own exits (to the prologue's), then code; both halves end in their pools */
+    g_half2 = g_cache + HALF_WORDS;
+    p = g_half2;
+    g_exit2 = p;                    /* r0 and ctr are free here: the prologue's exit stores neither */
+    far_jump(p, g_exit);
+    p += 4;
+    g_link2 = p;
+    e(MFLR(4));
+    b_to(g_exit2);
+    g_interrupt2 = p;
+    e(MFLR(3));
+    e(ADDI(3, 3, -4));
+    e(LI(4, KIND_INTERRUPT));
+    b_to(g_exit2);
+    sys_icache_invalidate(g_half2, (size_t)((uint8_t *)p - (uint8_t *)g_half2));
+    g_half2_code = (uint32_t *)(((uintptr_t)p + 4095) & ~(uintptr_t)4095);
+    g_half_end[0] = g_half2 - POOL_WORDS;
+    g_half_end[1] = g_cache_end - POOL_WORDS;
+    if (getenv("ROSETTA_HALF1_KB")) {        /* testing: the first half ends early, code goes into the second soon */
+        uint32_t *e1 = g_cache_start + (uint32_t)atoi(getenv("ROSETTA_HALF1_KB")) * 256u;
+        if (e1 > g_cache_start && e1 < g_half_end[0]) g_half_end[0] = e1;
+    }
 }
 
 /* ---------- Interrupting ----------
@@ -480,7 +558,7 @@ static unsigned long g_st_interrupted, g_st_ub_starts;
 static void block_starts_halt(uint32_t *o, uint32_t eip, uint32_t fresh)
 {
     if (o < g_cache_start || o >= g_free || g_nup >= g_up_max) return;
-    if (!fresh) fresh = BL_((uint32_t)(uintptr_t)g_interrupt - (uint32_t)(uintptr_t)o);
+    if (!fresh) fresh = BL_((uint32_t)(uintptr_t)interrupt_near(o) - (uint32_t)(uintptr_t)o);
     if (*o == fresh) return;                  /* two entries, one block */
     g_up[g_nup].loc = o;
     g_up[g_nup].prev = *o;
@@ -625,6 +703,8 @@ static void flush(void)
     g_tab_n = 0;
     g_tab_full = 0;
     g_free = g_cache_start;
+    g_pool[0] = g_half_end[0];
+    g_pool[1] = g_half_end[1];
     g_nhead = 0;                        /* loop heads belong to the discarded code */
     if (g_once_flushed) {             /* the first time everything is still empty (saves 48 page faults, ~0.5 ms) */
         cpool_flush();                 /* constants belong to the discarded code */
@@ -758,7 +838,8 @@ void jit_flush_schedule(uint32_t a, uint32_t len)
    they, unless ROSETTA_NO_PARTIAL, page exactness is off or too many ranges are waiting: then everything) */
 static void jit_range_changed(uint32_t a, uint32_t len, const char *why)
 {
-    if (g_flush != 1 && !g_no_pageexact && !g_no_partial && !g_dep_lost && g_ninval < INVAL_N) {
+    if (g_flush == 3) ;                 /* a flush for room is waiting: it covers the range */
+    else if (g_flush != 1 && !g_no_pageexact && !g_no_partial && !g_dep_lost && g_ninval < INVAL_N) {
         g_inval[g_ninval].a = a;
         g_inval[g_ninval].len = len;
         g_ninval++;
@@ -1718,7 +1799,7 @@ static void stubby(uint32_t target, uint32_t *bc)
     if (g_sl_wb_now) sl_back_code(g_sl_wmask);
     e(LIS(3, target >> 16));
     e(ORI(3, 3, target & 0xffff));
-    e(BL_((uint32_t)(uintptr_t)g_link - (uint32_t)(uintptr_t)p));
+    e(BL_((uint32_t)(uintptr_t)link_near(p) - (uint32_t)(uintptr_t)p));
     e((uint32_t)(uintptr_t)bc);
 }
 
@@ -1727,7 +1808,7 @@ static void exit_kind(uint32_t eip, int kind)
     if (g_sl_wb_now) sl_back_code(g_sl_wmask);
     load_imm(3, eip);
     e(LI(4, kind));
-    b_to(g_exit);
+    b_to(exit_near(p));
 }
 
 /* ---------- Return stack ----------
@@ -1791,11 +1872,11 @@ static void indirect(void)
     e(MTCTR(12));
     e(BCTR);
     e(LI(4, KIND_NORMAL));
-    b_to(g_exit);
+    b_to(exit_near(p));
     for (k = 0; k < g_ic_ways; k++) {
         fill = p;
         load_imm(4, (uint32_t)(uintptr_t)ic[k] | 1);
-        b_to(g_exit);
+        b_to(exit_near(p));
         ic[k][0] = B_((uint32_t)(uintptr_t)fill - (uint32_t)(uintptr_t)ic[k]);
     }
 }
@@ -6933,7 +7014,7 @@ static void jumptab_code(int r, int t, int bb, int32_t d)
     e(STW(4, OFF(sse_tmp), RCPU));          /* save r4 (jumptab_target needs r11, r0, r3) */
     jumptab_target(r, t, bb, d);
     e(LWZ(4, OFF(sse_tmp), RCPU));
-    b_to(g_exit);
+    b_to(exit_near(p));
     bc_set(b_init, p);                   /* different table or base: as before */
     bc_set(b_b, p);
     bc_set(b_x, p);
@@ -7318,7 +7399,7 @@ static Stub commpage_stub(uint32_t eip)
 static uint32_t *stub_block(uint32_t eip, Stub fn)
 {
     uint32_t *start;
-    if (g_cache_end - g_free < 8192) flush_full();
+    room(8192);
     g_sl_active = 0; g_sl_n = 0; g_k_n = 0; g_fp_p = g_fp_t = g_fp_ph = 0; g_sl_wb = g_sl_wb_now = g_sl_budget = 0; g_xm_ok = 0;
     g_xfh_on = 0;
     fs.kind = -1; fs.sz = 4; fs.stored = 1;
@@ -7480,7 +7561,7 @@ static uint32_t *translate_block(uint32_t eip)
         Stub fn = thunk_find(eip);
         if (fn) return stub_block(eip, fn);
     }
-    if (g_cache_end - g_free < 8192) flush_full();
+    room(8192);
     if (page_writable(eip)) { if (var) return 0; must_check = 1; max = 4; }
 
     /* collect instructions: conditional jumps fall through, unconditional ones to targets not yet seen are followed */
@@ -8304,7 +8385,7 @@ static uint32_t *translate_block(uint32_t eip)
                 e(STW(5, OFF(spec_loc), RCPU));
                 e(LWZ(3, OFF(eip), RCPU));
                 e(LI(4, KIND_NORMAL));
-                b_to(g_exit);
+                b_to(exit_near(p));
                 for (k = 0; k < nv; k++) {  /* exit stub to the variant: target in Cpu.var_target, eip = call site */
                     bc_set(beq[k], p);
                     e(LIS(3, vz[k] >> 16)); e(ORI(3, 3, vz[k] & 0xffff));
@@ -8315,7 +8396,7 @@ static uint32_t *translate_block(uint32_t eip)
             }
             e(LWZ(3, OFF(eip), RCPU));
             e(LI(4, KIND_NORMAL));
-            b_to(g_exit);
+            b_to(exit_near(p));
             continue;
         }
         if (s->inner >= 0) {                /* inner jump: floating point and flags as at the merge point, then jump in */
@@ -8499,11 +8580,17 @@ static uint32_t *variant(uint32_t loc, uint32_t target)
 static void chain_to(uint32_t *st, uint32_t *target)
 {
     uint32_t *bc = (uint32_t *)(uintptr_t)st[3];
-    *st = B_((uint32_t)(uintptr_t)target - (uint32_t)(uintptr_t)st);
-    sys_icache_invalidate(st, 4);
+    if (b_reaches(st, target)) {
+        *st = B_((uint32_t)(uintptr_t)target - (uint32_t)(uintptr_t)st);
+        sys_icache_invalidate(st, 4);
+    } else {
+        far_jump(st, target);               /* the other half: the stub's four words (its last, bc, was read above) */
+        g_st_far++;
+    }
     if (bc) {
         int32_t d = (int32_t)((uint32_t)(uintptr_t)target - (uint32_t)(uintptr_t)bc);
-        if ((*bc >> 26) == 18) {            /* bl of a call: range 32 MB, always fits */
+        if ((*bc >> 26) == 18) {            /* bl of a call: within the half (otherwise it stays on the stub) */
+            if (!b_reaches(bc, target)) { g_st_linked++; return; }
             *bc = (*bc & 0xfc000003u) | ((uint32_t)d & 0x03fffffcu);
             sys_icache_invalidate(bc, 4);
             g_st_direct++;
@@ -8518,6 +8605,13 @@ static void chain_to(uint32_t *st, uint32_t *target)
 
 static void redirect(uint32_t *prev, uint32_t *fresh)
 {
+    if (!b_reaches(prev, fresh)) {          /* the other half: through the pool of prev's half */
+        uint32_t *s = pool_take(prev);
+        if (!s) { g_flush = 3; return; }    /* full: flush at the next round (the old block's checks hold until then) */
+        far_jump(s, fresh);
+        fresh = s;
+        g_st_far++;
+    }
     *prev = B_((uint32_t)(uintptr_t)fresh - (uint32_t)(uintptr_t)prev);
     sys_icache_invalidate(prev, 4);
 }
@@ -8543,7 +8637,11 @@ static void invalidate_ranges(void)
         for (r = 0; r < g_ninval && !dep_hits(d, p0[r], p1[r]); r++) ;
         if (r < g_ninval) { d->code |= 2; n++; }
     }
-    if ((uint32_t)(g_cache_end - g_free) < 4 * n + 8192) { flush_full(); return; }
+    {
+        unsigned long l = g_st_flushes;
+        room(4 * n + 8192);
+        if (l != g_st_flushes) return;     /* no room: everything went */
+    }
     g_sl_wb_now = 0;
     p = stubs = g_free;
     for (i = 0; i < g_ndep; i++) {
@@ -8555,6 +8653,22 @@ static void invalidate_ranges(void)
         if (d->code < off_loaded) loaded++;
         if (g_cache_show > 1) fprintf(stderr, "rosetta: discarded %08x%s\n", d->eip, d->code < off_loaded ? " (translation cache)" : "");
         if (map_find(d->eip) == code) map_remove(d->eip);
+        if (!b_reaches(code, p + 4)) {         /* a block in the other half: its exit stub in that half's pool */
+            uint32_t *s = pool_take(code), *q = p;
+            if (!s) {
+                p = keep;
+                g_sl_wb_now = wb;
+                flush_full();
+                return;
+            }
+            *code = B_((uint32_t)(uintptr_t)s - (uint32_t)(uintptr_t)code);
+            sys_icache_invalidate(code, 4);
+            p = s;
+            stubby(d->eip, 0);
+            sys_icache_invalidate(s, 16);
+            p = q;
+            continue;
+        }
         *code = B_((uint32_t)(uintptr_t)p - (uint32_t)(uintptr_t)code);
         sys_icache_invalidate(code, 4);
         stubby(d->eip, 0);
@@ -8803,7 +8917,7 @@ typedef struct {
 typedef struct { uint32_t start, end, size, mtime, ino, type; char path[232]; } CacheImage;
 static char g_cache_path[1024];
 static uint32_t g_written_live;         /* live blocks in the cache file written by this run (checkpoint) */
-static uint32_t g_cache_cap = 20u << 20; /* ROSETTA_CACHE_CAP_MB: code in the file at most (cache_write) */
+static uint32_t g_cache_cap;            /* ROSETTA_CACHE_CAP_MB: code in the file at most (cache_write; the first half) */
 static uint32_t g_cap_at;               /* code size at which the dispatcher writes a checkpoint (0: done) */
 static unsigned long g_inval_written;   /* g_st_inval_blocks at that write */
 static CacheImage g_vimage[CACHE_IMAGES];
@@ -9043,7 +9157,7 @@ static void cache_write(void)
     int fd, ok = 1;
     cache_path();
     if (g_flush == 2) invalidate_ranges();     /* (the dispatcher normally has done this already) */
-    if (g_flush == 1) return;                  /* everything is about to be discarded */
+    if (g_flush == 1 || g_flush == 3) return;  /* everything is about to be discarded */
     if (g_cache_show && g_cache_path[0] && g_st_flushes) fprintf(stderr, "rosetta: translation cache not written (%lu flushes)\n", g_st_flushes);
     /* loaded and flushed anyway: does not fit this program (file changed, guest changes code pages). Delete it,
        otherwise it is loaded, discarded and never replaced at every start; the next run creates it anew. Not when only
@@ -9101,7 +9215,7 @@ static void cache_write(void)
     if (nforeign) {
         uint32_t *keep = p;
         int wb = g_sl_wb_now;
-        if ((uint32_t)(g_cache_end - g_free) < 16 * nforeign + 64) { free(foreign); free(b); free(t); return; }
+        if (g_free >= g_half_end[0] || (uint32_t)(g_half_end[0] - g_free) < 16 * nforeign + 64) { free(foreign); free(b); free(t); return; }
         stub = malloc(sizeof *stub * nforeign);
         if (!stub) { free(foreign); free(b); free(t); return; }
         g_sl_wb_now = 0;
@@ -9281,8 +9395,11 @@ static void cache_load(void)
     g_free_loaded = g_free;
     cache_path();
     if (getenv("ROSETTA_CACHE_SHOW")) g_cache_show = atoi(getenv("ROSETTA_CACHE_SHOW"));
+    /* the first half (without its pool): a run that loads the file goes on in the second */
     if (getenv("ROSETTA_CACHE_CAP_MB")) g_cache_cap = (uint32_t)atoi(getenv("ROSETTA_CACHE_CAP_MB")) << 20;
-    if (g_cache_cap > CACHE_SIZE - (1u << 20) || g_cache_cap < (1u << 20)) g_cache_cap = CACHE_SIZE - (1u << 20);
+    if (!g_cache_cap || g_cache_cap > (uint32_t)((uint8_t *)g_half_end[0] - (uint8_t *)g_cache))
+        g_cache_cap = (uint32_t)((uint8_t *)g_half_end[0] - (uint8_t *)g_cache);
+    if (g_cache_cap < (1u << 20)) g_cache_cap = 1u << 20;
     if (g_cache_path[0]) g_cap_at = g_cache_cap - (256u << 10);
     if (g_cache_show)
         fprintf(stderr, "rosetta: translation cache %s, cache %08x, prologue %u\n", g_cache_path[0] ? g_cache_path : "(no path)",
@@ -9291,7 +9408,7 @@ static void cache_load(void)
     if ((fd = open(g_cache_path, O_RDONLY)) < 0) return;
     if (read(fd, &k, sizeof k) != (ssize_t)sizeof k || k.magic != CACHE_MAGIC || k.cache != CACHE_ADDR ||
         k.prolog != (uint32_t)((uint8_t *)g_cache_start - (uint8_t *)g_cache) || k.code < k.prolog ||
-        k.code > CACHE_SIZE - (1u << 20) || k.nimages > CACHE_IMAGES || k.ncpool > CPOOL || k.nvar > VAR_N ||
+        k.code > (uint32_t)((uint8_t *)g_half_end[0] - (uint8_t *)g_cache) || k.nimages > CACHE_IMAGES || k.ncpool > CPOOL || k.nvar > VAR_N ||
         k.npages > (1u << 15) || k.nvlpc > VL_PCS || k.vlring > VL_RINGS || k.ntab > TABLE || k.nhead > (1u << 20) ||
         k.ndep > (1u << 22) || k.nmapping > MAPPING_N || k.nvpool > VPOOL)
         goto way;
@@ -9787,7 +9904,7 @@ static int dispatch_loop(Cpu *c)
         if (g_patched) unpatch();       /* restore block starts (jit_interrupt) */
         if (g_state_wish) state_short(c);
         if (g_thread_waiting | c->yield) thread_yield(c);  /* other guest threads (thread.c) */
-        if (g_flush) { if (g_flush == 2) invalidate_ranges(); else flush(); }
+        if (g_flush) { if (g_flush == 2) invalidate_ranges(); else if (g_flush == 3) flush_full(); else flush(); }
         if (g_sig_pending & ~g_sig_mask) {   /* signal to the guest: build the stack frame, continue in the trampoline */
             sig_deliver(c);
             if (c->finished) return RUN_END;
@@ -9923,11 +10040,12 @@ static int dispatch_loop(Cpu *c)
             }
             /* cold target: the entry stays free (next time it is counted again) */
             if (!cold && !g_flush && l == g_st_flushes && ic >= g_cache_start && ic < g_free) {
-                if (target) {
+                if (target && b_reaches(&ic[4], target)) {
                     ic[1] = ORI(4, 4, c->eip & 0xffff);
                     ic[4] = B_((uint32_t)(uintptr_t)target - (uint32_t)(uintptr_t)&ic[4]);
                     ic[0] = LIS(4, c->eip >> 16);
-                } else {                    /* commpage without stub: never direct, always via table and dispatcher */
+                } else {                    /* commpage without stub, or a target in the other half: never direct, always via
+                                               the table (and the dispatcher) */
                     ic[1] = ORI(4, 4, 0xffff);
                     ic[0] = LIS(4, 0xffff);
                 }
@@ -9942,8 +10060,13 @@ static int dispatch_loop(Cpu *c)
                 target = variant(c->eip, c->var_target);
                 if (target && !g_flush && l == g_st_flushes && var_start >= g_cache_start && stubby_start < g_free) {
                     int32_t d;
-                    *var_start = B_((uint32_t)(uintptr_t)target - (uint32_t)(uintptr_t)var_start);
-                    sys_icache_invalidate(var_start, 4);
+                    if (b_reaches(var_start, target)) {
+                        *var_start = B_((uint32_t)(uintptr_t)target - (uint32_t)(uintptr_t)var_start);
+                        sys_icache_invalidate(var_start, 4);
+                    } else {
+                        far_jump(var_start, target);   /* lis/ori/stw of the target and the stub's first word */
+                        g_st_far++;
+                    }
                     d = (int32_t)((uint32_t)(uintptr_t)target - (uint32_t)(uintptr_t)bc);
                     if (bc && d >= -32768 && d < 32768) { bc_set(bc, target); sys_icache_invalidate(bc, 4); }
                     g_st_linked++;
@@ -10127,6 +10250,10 @@ void jit_stats(void)
                 (double)g_cache_time * tb.numer / tb.denom / 1e6, g_cache_error, g_st_expected, g_st_inval_cache,
                 g_st_hold >> 10, g_st_hold_given >> 10);
     }
+    if (g_free >= g_half2)
+        fprintf(stderr, "rosetta: code in the second half of the region (%u KB), %lu jumps into the other half, pools %u + %u KB\n",
+                (unsigned)(((uint8_t *)g_free - (uint8_t *)g_half2_code) >> 10), g_st_far,
+                (unsigned)(((uint8_t *)g_pool[0] - (uint8_t *)g_half_end[0]) >> 10), (unsigned)(((uint8_t *)g_pool[1] - (uint8_t *)g_half_end[1]) >> 10));
     fprintf(stderr,"rosetta: %lu blocks with %lu instructions translated, %lu chained (%lu direct), %lu fused, "
             "%lu page exits, %lu stack slots, %lu floating point (%lu loops, %lu packed), %lu x87, %lu direct (x87/SSE), %lu interpreted in block, %lu interpreted, %lu invalid, %lu flushes, %lu table misses, %lu inline caches, %lu stubs, %lu constants (%lu blocks with guard, %lu failed, %lu masks), %lu loops with prefetch (%lu streams, %lu faults), %lu mov saved, %lu forwarded, %lu calls inlined (%lu predicted, %lu wrong), %lu stack values forwarded (%lu ret without check, %lu dead stores, %lu written later), %lu math calls direct, %lu switch tables, %lu taken branches followed, %lu compares merged across instructions, cache %lu KB\n", g_st_blocks,
             g_st_insns, g_st_linked, g_st_direct, g_st_fusion, g_st_pages, g_st_slots, g_st_fp, g_st_fp_loops, g_st_pd, g_st_x87, g_st_fp_direct, g_st_inline, g_st_interp, g_st_invalid,

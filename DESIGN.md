@@ -356,13 +356,26 @@ class, exceptions) produce byte-identical output to native (run_tests.sh: 22 com
   temporary mapping no longer lands on translated pages either: Firefox maps libxul (68 MB) whole to read it ahead
   and unmaps it before dyld loads it; landing on the saved libxul it discarded 13,000 blocks. Fixed requests of the
   guest (`vm_allocate`/`mach_vm_allocate` without anywhere, `mmap(MAP_FIXED)`) take a held range over;
-  `ROSETTA_NO_HOLD=1`. The code region grew from 24 to 32 MB, the reach of `b` (blocks chain with relative jumps).
-  Firefox's startup alone is 30 MB of code: a cache with all of it left a start that loads it no room for what it
-  translates anew (the JIT's code, other paths), the region ran full and everything was discarded. The file
-  therefore keeps the code up to 20 MB (`ROSETTA_CACHE_CAP_MB`; a checkpoint is written when the code reaches it,
-  later writes of the run leave it), and a flush only because the region is full no longer deletes it. Firefox:
-  first start 14.9 s (9.5 s processor), every further one 9.6 to 9.7 s (4.5 s); 32 libraries placed, nothing
-  discarded, no flush up to the idle moment.
+  `ROSETTA_NO_HOLD=1`. With a code region of 32 MB (24 MB before) the file kept the first 20 MB (Firefox's startup
+  alone is 30 MB of code; a cache with all of it left a start that loads it no room for what it translates anew, the
+  region ran full and everything was discarded): first start 14.9 s, every further one 9.6 to 9.7 s.
+- **Code region of two halves** (17 Nov; jit.c `room`, `far_jump`, `pool_take`, `exit_near`): 64 MB instead of 32. `b`
+  reaches 32 MB, so the region is two halves of 32 MB. Code fills the first half (the part the translation cache
+  saves: `ROSETTA_CACHE_CAP_MB`, by default all of it; a checkpoint is written when the code reaches it), then the
+  second; a block never straddles the boundary (`room`: the rest of the first half stays empty). Each half reaches
+  its own exits: the prologue's at the start of the first, at the start of the second copies (exit: lis/ori/mtctr/bctr
+  to the prologue's, link and interrupt as in the prologue). Jumps into the other half: a chained exit stub becomes
+  `lis r0; ori r0; mtctr r0; bctr` in its own four words (r0 and ctr are free at every block boundary; the stub's
+  fourth word, the address of the jump that leads to it, has been read by then); a variant's chaining point likewise
+  (its three preceding words and the stub's first); a `bl` of a call whose target lies in the other half stays on its
+  stub; an inline cache entry does not take a target in the other half (the table finds it). Block starts take one
+  word only (a return address can lie in the second word of a block whose first instruction is a call into the
+  interpreter): a redirect to a new translation and the exit stub of a discarded block go through a pool of 256 KB at
+  the end of the block's half; a full pool flushes. A flush only because the region is full no longer deletes the
+  translation cache file. Testing: `ROSETTA_HALF1_KB=N` ends the first half after N KB (the suite passes with 256:
+  60 of 60, outputs as native). Firefox: the first start writes 30 MB (110,000 blocks), the second 32 MB; from then on
+  a start translates 1,000 to 6,000 blocks and is idle after 2.8 to 6.0 s with 1.1 to 2.7 s of processor time (with 32
+  MB and a 20 MB file 9.6 s and 4.5 s).
 - **Own prebinding** (`tools/prebind.c`, `intel_prebind.sh`): Apple's i386 libraries are not built prebound
   (`redo_prebinding`: "file is not prebound"). dyld skips binding an image if it carries MH_PREBOUND, sits at its
   address and the timestamps of its dependencies match; then `setupLazyPointerHandler` does not reset the jump tables
