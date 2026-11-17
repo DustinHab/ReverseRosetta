@@ -77,10 +77,12 @@ t_flt()   { sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
 r_flt()   { cat ../tests/faults.expected; }
 t_flti()  { ROSETTA_INTERP=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
 t_fltj()  { ROSETTA_THRESHOLD=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults; }
-# a handler that makes the page writable and returns: repeated exactly by the interpreter; translated the state is
-# approximate, the program ends with SIGBUS (138) after the handler instead of running on with a wrong state
-t_fltr()  { ROSETTA_INTERP=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults retry; ROSETTA_THRESHOLD=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults retry 2>/dev/null; echo "code $?"; }
+# a handler that makes the page writable and returns: repeated exactly by the interpreter, and translated too (the
+# handler runs nested, the PowerPC store again; before 17.11. the program ended with SIGBUS, 138); the old way stays
+t_fltr()  { ROSETTA_INTERP=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults retry; ROSETTA_THRESHOLD=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults retry 2>/dev/null; echo "code $?";
+            ROSETTA_NO_NEST=1 ROSETTA_THRESHOLD=1 sh ../tests/with_timeout.sh 20 ./rosetta ./faults retry 2>/dev/null; echo "code $?"; }
 r_fltr()  { echo "handler: signal 10 at the page yes, making it writable"; echo "repeated write: value 7";
+            echo "handler: signal 10 at the page yes, making it writable"; echo "repeated write: value 7"; echo "code 0";
             echo "handler: signal 10 at the page yes, making it writable"; echo "code 138"; }
 t_calc()  { ./rosetta ./calculate; }
 r_calc()  { ./calculate.ppc; }
@@ -126,6 +128,8 @@ t_mlte()  { ./rosetta ./mlte_rtf; }
 r_mlte()  { ./mlte_rtf.ppc; }
 t_ffu()   { ROSETTA_THRESHOLD=1 ./rosetta ./far_fusion; ROSETTA_NO_FAR=1 ROSETTA_THRESHOLD=1 ./rosetta ./far_fusion; }
 r_ffu()   { ROSETTA_INTERP=1 ./rosetta ./far_fusion; ROSETTA_INTERP=1 ./rosetta ./far_fusion; }
+t_frt()   { sh ../tests/with_timeout.sh 60 ./rosetta ./fault_retry; }
+r_frt()   { ./fault_retry.ppc; }
 same raw_arith t_raw r_raw
 same "64-bit shifts, shld/shrd with flags" t_shf r_shf
 same "cmpsb (translated against interpreter)" t_cmpsb r_cmpsb
@@ -137,6 +141,7 @@ same "conditions of 8/16/32-bit cmp and test across blocks (against interpreter)
 same "stack slots forwarded in a block: esp/ebp aliases, read-modify-write in place, reloads, xchg, dead stores (against interpreter)" t_sfw r_sfw
 same "loops over the taken branch of a conditional jump (against interpreter)" t_tkl r_tkl
 same "compare and a later reader merged across instructions (against interpreter)" t_ffu r_ffu
+same "memory fault handlers that return to retry the access (VOSF, write barriers) in translated loops, against native" t_frt r_frt
 same "RTF through MLTE and its plug-in MLTEFile (replacement in the Intel root), against native" t_mlte r_mlte
 same "file mapping unmapped with an unrounded size, guest exception ports (Firefox 16 startup)" t_gpt r_gpt
 same "OpenAL: devices, sources, buffers, playing (silent), against native" t_al r_al
@@ -163,7 +168,7 @@ same "processes, kqueue, locks, semaphores, files, blocked signals, pty" t_sys r
 same "exceptions to the program's handlers (SIGFPE, SIGILL, SIGTRAP)" t_flt r_flt
 same "exceptions, interpreter only" t_flti r_flt
 same "exceptions, translated at once" t_fltj r_flt
-same "memory fault handler that returns (exact in the interpreter, translated ends)" t_fltr r_fltr
+same "memory fault handler that returns (exact in the interpreter and translated; the old way ends)" t_fltr r_fltr
 same "processor identity (Intel Core Duo, SSE3)" t_id r_id
 same "code replaced by remapping and writing (with translation cache)" t_remap r_remap
 same "translation cache: another file at the address of inlined code" t_remapc r_remapc

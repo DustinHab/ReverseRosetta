@@ -3,7 +3,7 @@
  * int3 (SIGTRAP, continues after it), a handler that skips the faulting instruction via the saved context.
  * Memory faults (writing a read-only page, reading a page without access and address 8, in a hot loop that runs
  * translated, a handler that continues in another function). "faults retry": the handler makes the page writable and returns,
- * the write is repeated (exact state: interpreter; translated, the program ends with the signal instead). */
+ * the write is repeated (interpreter: exact state; translated: the handler runs nested, the store again). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

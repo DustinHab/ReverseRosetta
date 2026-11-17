@@ -20,6 +20,7 @@ int jit_probe_fault(void);                       /* a read probe of the translat
 int jit_safe_read32(uint32_t a, uint32_t *v);    /* guest word at a if readable (a probe: no fault) */
 uint32_t jit_cached_image(int fd, uint32_t off);  /* address of that library in the translation cache's run (0: none) */
 void jit_hold_release(uint32_t a, uint32_t len, int gone);   /* the guest takes a range held for a library */
+unsigned long jit_flushes(void);                  /* flushes of the code region so far */
 int jit_fault_state(Cpu *c, void *ctx);          /* memory fault: guest state (1 exact, 0 approximate, -1 not the guest's) */
 
 /* crash dump (cache, registers, return ring buffer) to stderr */

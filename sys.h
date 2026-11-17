@@ -55,5 +55,8 @@ extern int g_end_signal;
 /* memory fault of guest code (SIGSEGV/SIGBUS, si_code, fault address; exact = state is exact): 1 = pending for the
    guest's handler, 0 = no handler (or blocked) */
 int sys_fault(Cpu *c, int sig, int code, uint32_t addr, int exact);
+/* approximate fault (translated code) for a guest handler that may return: the host context goes into a nested run of
+   the handler, afterwards the faulting PowerPC instruction runs again. 1: ctx (the host signal handler's) changed */
+int sys_fault_nest(Cpu *c, int sig, int code, uint32_t addr, void *ctx);
 
 #endif

@@ -359,6 +359,13 @@ class, exceptions) produce byte-identical output to native (run_tests.sh: 22 com
   `ROSETTA_NO_HOLD=1`. With a code region of 32 MB (24 MB before) the file kept the first 20 MB (Firefox's startup
   alone is 30 MB of code; a cache with all of it left a start that loads it no room for what it translates anew, the
   region ran full and everything was discarded): first start 14.9 s, every further one 9.6 to 9.7 s.
+- **Shared table jump for ret, shared fill exit for inline caches** (17 Nov; jit.c `tabjump_build`, `icfill_build`):
+  every ret carried an inline cache of its own after the shadow check (4 entries of 5 words, the table lookup, a
+  fill exit of 3 words per entry: 42 words) that ran only when the shadow entry did not match. Now it is one `b` to
+  a table lookup in the prologue (a copy in the second half). A free inline cache entry starts with `bl icfill`
+  (r4 = lr - 3, the entry | 1, as before) instead of a b to its own exit. Calculator's translation cache 16.3 ->
+  14.3 MB, Foundation's code 772 -> 600 KB; perl, bzip2 and Foundation run as fast as before, Calculator starts in
+  2.02-2.05 s (1.36 s processor) against 2.06-2.08 s (1.38 s). `ROSETTA_RET_IC=1`: the old layout.
 - **Code region of two halves** (17 Nov; jit.c `room`, `far_jump`, `pool_take`, `exit_near`): 64 MB instead of 32. `b`
   reaches 32 MB, so the region is two halves of 32 MB. Code fills the first half (the part the translation cache
   saves: `ROSETTA_CACHE_CAP_MB`, by default all of it; a checkpoint is written when the code reaches it), then the
@@ -1035,6 +1042,21 @@ even when it had a handler (crash reporters, runtimes that recover from faults).
   a hot loop that runs translated over the end of its mapping (1024 elements, then the fault in the block), a
   handler that continues in another function; `faults retry` (make the page writable and return) repeats the write
   in the interpreter and ends with SIGBUS (138) when translated.
+- Handlers that return (17 Nov; sys.c `sys_fault_nest`, `fault_upcall`): SheepShaver ended a few seconds after its
+  start this way (its screen is read-only, VOSF), and garbage collectors with write barriers need the same. The
+  guest's state in the block is unknown, the host's is not: `memfault` copies the whole PowerPC context (ucontext and
+  mcontext, with floating-point and vector state) and changes the live one so that the return from the host signal
+  handler leads into `fault_upcall` on the same stack (16 KB below, past the kernel's signal frame). There the
+  guest's handler runs in the interpreter, from a signal frame built as for any approximate fault, with the Cpu of
+  the suspended code saved aside; a fault in the handler is delivered within this run (its own jmp_buf). When its
+  sigreturn comes back to the faulting eip, Cpu is put back (except what belongs to the host thread: message buffer,
+  OpenGL context) and `sigreturn` (flavor 30/35 by the size of the mcontext) restores the PowerPC context: the
+  faulting load or store runs again. A handler that leaves by `siglongjmp` (esp above the frame), changes eip or
+  ends the program leaves the suspended code behind: `_longjmp` to the dispatcher, which goes on from the guest's
+  state. A flush meanwhile (another thread, the code region full) leaves nothing to go back into: then the old
+  ending. `tests/fault_retry.c`: 16 pages made read-only 60 times in hot loops with byte and word stores and
+  memset, 960 faults, 960 back into translated code, memory identical to native, and three siglongjmp out of a
+  translated loop. `ROSETTA_NO_NEST=1` restores the old way.
 - Unmapped memory makes no reliable test: guest and translator share the address space, the host can reuse a page
   the guest gave back right away. The first version of the test read after `munmap` and hung there; the hot loop
   without `volatile` hung too (gcc drops the loads of a function that never returns).

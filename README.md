@@ -383,10 +383,11 @@ well.
 ## Limitations
 
 - i386 only; x86_64 code is not supported.
-- Memory faults (SIGSEGV, SIGBUS) reach the program's handler, but inside translated code the state is approximate
-  (registers exact, eip the start of the translated block). A handler that ends the program, jumps away with
-  `siglongjmp` or continues elsewhere works; one that returns to retry the access (garbage collectors with write
-  barriers) works only for interpreted code, translated code then ends with the signal.
+- Memory faults (SIGSEGV, SIGBUS) reach the program's handler, but inside translated code the state the handler sees
+  is approximate (registers exact, eip the start of the translated block). A handler that returns to retry the access
+  (SheepShaver's screen tracking, write barriers of garbage collectors) works: the access runs again exactly
+  (`tests/fault_retry.c`). One that ends the program or jumps away with `siglongjmp` works; one that changes the
+  context to continue elsewhere continues from that approximate state.
 - Guest and translator share one address space: memory the guest gives back with `munmap` can be reused by the
   translator, so a later access there does not always fault as it would natively.
 - Threads do not run in parallel (global lock). The test machine has one CPU core.

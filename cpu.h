@@ -93,6 +93,7 @@ typedef struct Cpu {
     void *gl_ctx;
     uint32_t gl_proxy;
     uint32_t mach_thread;         /* kernel port of the host thread that runs this guest thread (thread_get_state) */
+    void *nest;                   /* memory fault in translated code whose guest handler runs nested (sys.c fault_nest) */
     uint8_t mm[8][16] __attribute__((aligned(16)));   /* MMX registers, raw Intel bytes in the first 8 of each 16 (the
                                      translator loads them with lvx; apart from the x87 stack: programs separate the two
                                      with emms; sse.c) */

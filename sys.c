@@ -41,6 +41,8 @@
 #include <pthread.h>
 #include <utmpx.h>
 #include <signal.h>
+#include <setjmp.h>
+#include <sys/ucontext.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <mach/mach_time.h>
@@ -1127,6 +1129,147 @@ int sys_fault(Cpu *c, int sig, int code, uint32_t addr, int exact)
     return 1;
 }
 
+/* ---------- Handlers that return to retry the access ----------
+ * A memory fault in translated code (or in a native function called from it) whose guest handler returns: natively
+ * the instruction runs again (SheepShaver tracks writes to its screen this way, VOSF: the frame buffer is read-only,
+ * the handler records the page, allows writing and returns; so do garbage collectors with write barriers). The state
+ * of the guest in the middle of a translated block is not exactly known, but the host's is: the host signal handler
+ * saves the whole PowerPC context (registers, floating point, vectors) and returns into fault_upcall, outside the
+ * signal handler. That runs the guest's handler in the interpreter, with the Cpu state of the translated code saved
+ * aside; when the handler returns to the same place, sigreturn restores the saved context and the PowerPC executes
+ * its faulting load or store again, exactly as the program expects. A handler that goes elsewhere (siglongjmp, a
+ * changed eip, exit) leaves the suspended translated code behind: the dispatcher continues from the state it left.
+ * The same if the code region was flushed meanwhile (another thread): then nothing can go back into it, the program
+ * ends with the signal as before. ROSETTA_NO_NEST=1: the old way (a handler that returns ends the program). */
+#define HOST_UC_FLAVOR 30                   /* PowerPC signal frame flavors (xnu bsd/dev/ppc/unix_signal.c) */
+#define HOST_UC_FLAVOR_VEC 35
+typedef struct {
+    ucontext_t uc;                          /* the context of the fault (its uc_mcontext points to mc) */
+    struct __darwin_mcontext mc;
+    int flavor, sig, code, done, escaped;
+    uint32_t addr, uctx, outer_esp, eip0;  /* the guest frame of the handler, esp and eip it was built from */
+    unsigned long flushes;
+    Cpu saved;                              /* Cpu as the suspended translated code has it */
+} Nest;
+volatile int g_nest_depth;
+static unsigned long g_st_nested, g_st_nest_back;
+
+static void fault_upcall(Cpu *c) __attribute__((noreturn));
+
+/* main.c memfault, inside the host signal handler: an approximate fault (exact = 0) for a guest handler. 1: the
+   context now leads into fault_upcall */
+int sys_fault_nest(Cpu *c, int sig, int code, uint32_t addr, void *ctx)
+{
+    static int off = -1;
+    ucontext_t *u = (ucontext_t *)ctx;
+    Nest *n;
+    uint32_t r1;
+    if (off < 0) off = getenv("ROSETTA_NO_NEST") != 0;
+    if (off || c->nest || (sig != SIGSEGV && sig != SIGBUS) || g_handler[sig] <= 1 || (g_sig_mask & SIG_BIT(sig))) return 0;
+    if (u->uc_mcsize != sizeof(struct __darwin_mcontext) && u->uc_mcsize != offsetof(struct __darwin_mcontext, __vs))
+        return 0;                            /* a frame of another kind (64-bit, G5): as before */
+    if (!(n = calloc(1, sizeof *n))) return 0;
+    memcpy(&n->uc, u, sizeof n->uc);
+    memcpy(&n->mc, u->uc_mcontext, u->uc_mcsize);
+    n->uc.uc_mcontext = &n->mc;
+    n->flavor = u->uc_mcsize == sizeof(struct __darwin_mcontext) ? HOST_UC_FLAVOR_VEC : HOST_UC_FLAVOR;
+    n->sig = sig; n->code = code; n->addr = addr;
+    n->flushes = jit_flushes();
+    c->nest = n;
+    /* leave the signal handler into fault_upcall(c) on the same stack, well below the frames of the fault and of
+       this handler (r1 - 16 KB; the red zone and the kernel's signal frame lie in the first few KB) */
+    r1 = (u->uc_mcontext->__ss.__r1 - 16384) & ~15u;
+    *(uint32_t *)(uintptr_t)r1 = 0;         /* end of the frame chain */
+    u->uc_mcontext->__ss.__r1 = r1;
+    u->uc_mcontext->__ss.__r3 = (uint32_t)(uintptr_t)c;
+    u->uc_mcontext->__ss.__lr = 0;
+    u->uc_mcontext->__ss.__srr0 = (uint32_t)(uintptr_t)fault_upcall;
+    return 1;
+}
+
+/* sig_deliver: the frame of the nested handler; sig_back: its sigreturn */
+static void nest_frame(Cpu *c, int sig, uint32_t uctx)
+{
+    Nest *n = (Nest *)c->nest;
+    if (n && !n->uctx && sig == n->sig) n->uctx = uctx;
+}
+
+static int nest_back(Cpu *c, uint32_t uctx)
+{
+    Nest *n = (Nest *)c->nest;
+    if (!n || uctx != n->uctx) return 0;
+    n->done = 1;
+    return 1;
+}
+
+static void fault_upcall(Cpu *c)
+{
+    Nest *n = (Nest *)c->nest;
+    jmp_buf jb;
+    void *prev = c->fault_jmp;
+    int in_code = g_in_code, back;
+    /* guest state for the handler: registers from the host, eip the block (jit_fault_state in memfault; approximate,
+       handlers of this kind look at the fault address only) */
+    memcpy(&n->saved, c, sizeof *c);
+    g_nest_depth++;
+    g_st_nested++;
+    g_in_code = 0;
+    n->outer_esp = c->r[ESP];
+    n->eip0 = c->eip;
+    sig_schedule(n->sig, n->code);
+    g_sig_info[n->sig].addr = n->addr;
+    if (_setjmp(jb)) interp_fault_landing(c);     /* a fault in the handler itself: delivered below, nested further */
+    c->fault_jmp = (void *)jb;
+    while (!n->done && !c->finished) {
+        int r;
+        if (g_sig_pending & ~g_sig_mask) sig_deliver(c);
+        if (n->uctx && c->r[ESP] >= n->outer_esp && !n->done) { n->escaped = 1; break; }   /* siglongjmp out of it */
+        r = step(c);
+        if (r != RUN_OK && r != RUN_SIGNAL) { n->escaped = 1; break; }
+    }
+    c->fault_jmp = prev;
+    g_nest_depth--;
+    back = n->done && !n->escaped && !c->finished && c->eip == n->eip0 && jit_flushes() == n->flushes;
+    if (back) {
+        /* the handler returned to the faulting place: the translated code runs on from its own context, Cpu as it had
+           it (apart from what belongs to the thread, not to the guest state) */
+        Cpu now;
+        memcpy(&now, c, sizeof now);
+        memcpy(c, &n->saved, sizeof *c);
+        c->msg = now.msg; c->msg_size = now.msg_size;
+        c->gl_ctx = now.gl_ctx; c->gl_proxy = now.gl_proxy;
+        c->fault_jmp = prev;
+        c->nest = 0;
+        g_in_code = in_code;
+        g_st_nest_back++;
+        {
+            ucontext_t uc;
+            struct __darwin_mcontext mc;
+            int flavor = n->flavor;
+            memcpy(&uc, &n->uc, sizeof uc);  /* (copied to this stack: sigreturn reads them there) */
+            memcpy(&mc, &n->mc, sizeof mc);
+            uc.uc_mcontext = &mc;
+            free(n);
+            syscall(SYS_sigreturn, &uc, flavor);
+        }
+        fprintf(stderr, "rosetta: sigreturn into the suspended translated code failed\n");
+        abort();
+    }
+    /* the handler went elsewhere, or the program ended: the dispatcher continues from the state the guest has now */
+    if (n->done && !n->escaped && !c->finished && c->eip == n->eip0) {
+        /* returned to the faulting place, but the code region was flushed meanwhile: as before (sig_back) */
+        main_crash_begin();
+        state_show(c, "memory fault in translated code, the handler returned to the same place after a flush");
+        main_crash_end("memory fault in translated code, handler returned after a flush");
+        c->finished = 1;
+        c->end_code = 128 + n->sig;
+        g_end_signal = n->sig;
+    }
+    c->nest = 0;
+    free(n);
+    _longjmp(*(jmp_buf *)prev, 1);
+}
+
 /* deliver a pending, unblocked signal (called at the dispatcher, guest state complete in Cpu) */
 void sig_deliver(Cpu *c)
 {
@@ -1156,6 +1299,7 @@ void sig_deliver(Cpu *c)
     st32(fp, 0xffffffffu); st32(fp + 4, h);
     st32(fp + 8, (g_handler_flags[sig] & SA_SIGINFO) ? UC_FLAVOR : UC_TRAD);
     st32(fp + 12, (uint32_t)sig); st32(fp + 16, sinfo); st32(fp + 20, uctx);
+    nest_frame(c, sig, uctx);
     /* ucontext32 */
     st32(uctx, 0); st32(uctx + 4, saved); st32(uctx + 8, fp); st32(uctx + 12, 0); st32(uctx + 16, 0);
     st32(uctx + 20, 0); st32(uctx + 24, MCTX32); st32(uctx + 28, mctx);
@@ -1200,6 +1344,7 @@ static void sig_back(Cpu *c, uint32_t uctx)
 {
     uint32_t mctx = ld32(uctx + 28), f = mctx + 76;
     int k;
+    nest_back(c, uctx);                     /* the handler of a nested fault returns (fault_upcall decides where to) */
     g_sig_mask = ld32(uctx + 4) & ~SIG_NEVER;
     sig_sync();
     c->r[EAX] = ld32(mctx + 12); c->r[EBX] = ld32(mctx + 16); c->r[ECX] = ld32(mctx + 20); c->r[EDX] = ld32(mctx + 24);
@@ -2945,6 +3090,8 @@ void sys_stats(void)
     mach_timebase_info_data_t tb;
     int k, best, z;
     uint64_t sum = 0;
+    if (g_st_nested) fprintf(stderr, "rosetta: %lu memory faults in translated code to a nested guest handler, %lu went back\n",
+                             g_st_nested, g_st_nest_back);
     if (g_sys_measure <= 0) return;
     if (g_intel_on > 0) fprintf(stderr, "rosetta: %lu paths redirected to Intel versions (%s); path lookups %lu, remembered %lu, "
                                 "stat in the root %lu, not remembered %lu, i386 checks %lu\n", g_st_redirected, g_intel,

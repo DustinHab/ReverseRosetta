@@ -117,6 +117,8 @@ static uint32_t g_shadow_base;       /* return stack (ring buffer, aligned to it
 static void (*g_entry)(Cpu *, uint32_t *);
 static uint32_t *g_exit, *g_link, *g_interrupt;
 static uint32_t *g_exit2, *g_link2, *g_interrupt2;    /* the same at the start of the second half */
+static uint32_t *g_tabjump, *g_tabjump2;               /* guest eip in r3 through the jump table (both halves) */
+static uint32_t *g_icfill, *g_icfill2;                 /* "bl icfill" at a free inline cache entry: r4 = entry | 1 */
 static uint32_t *g_half2, *g_half2_code;               /* second half; its code after the copies */
 static uint32_t *g_half_end[2], *g_pool[2];            /* end of each half's code (its pool follows), pool in use */
 static unsigned long g_st_far;                         /* jumps into the other half */
@@ -187,6 +189,8 @@ static int g_no_taken;                /* ROSETTA_NO_TAKEN: blocks follow only th
 static unsigned long g_st_taken;
 static int g_no_far;                  /* ROSETTA_NO_FAR: compare and reader merged only when adjacent */
 static int g_no_mmx;                  /* ROSETTA_NO_MMX: MMX in the interpreter (as before 17.11.) */
+static int g_ret_ic;                  /* ROSETTA_RET_IC: every ret with its own inline cache, every inline cache entry with
+                                         its own fill exit (as before 17.11.) */
 /* integer move, load or store whose code touches no CR field (between a merged compare and its reader) */
 static int cr0_safe(const Insn *y)
 {
@@ -343,6 +347,33 @@ static int half_of(const uint32_t *at) { return g_half2 && at >= g_half2; }
 static uint32_t *exit_near(const uint32_t *at) { return half_of(at) ? g_exit2 : g_exit; }
 static uint32_t *link_near(const uint32_t *at) { return half_of(at) ? g_link2 : g_link; }
 static uint32_t *interrupt_near(const uint32_t *at) { return half_of(at) ? g_interrupt2 : g_interrupt; }
+static uint32_t *tabjump_near(const uint32_t *at) { return half_of(at) ? g_tabjump2 : g_tabjump; }
+static uint32_t *icfill_near(const uint32_t *at) { return half_of(at) ? g_icfill2 : g_icfill; }
+
+/* a free inline cache entry starts with "bl icfill" (before 17.11. a b to its own three-word exit per entry): the
+   entry's address | 1 as the exit kind, the dispatcher fills it in. LR is free: returns take it from the shadow ring */
+static void icfill_build(void)
+{
+    e(MFLR(4));
+    e(ADDI(4, 4, -3));                  /* the bl is the entry's first word: (lr - 4) | 1 */
+    b_to(exit_near(p));
+}
+
+/* shared by every ret whose shadow entry does not match (before 17.11. each one had its own inline cache, 42 words that
+   hardly ever ran): the guest eip in r3 through the jump table, otherwise to the dispatcher */
+static void tabjump_build(void)
+{
+    e(RLWINM(11, 3, 3, 13, 28));        /* (eip & 0xffff) * 8 */
+    e(LWZX(12, RTAB, 11));
+    e(CMPLW(0, 12, 3));
+    e(BC_(BO_FALSE, CR_EQ, 20));
+    e(ADDI(11, 11, 4));
+    e(LWZX(12, RTAB, 11));
+    e(MTCTR(12));
+    e(BCTR);
+    e(LI(4, KIND_NORMAL));
+    b_to(exit_near(p));
+}
 
 /* jump to target from anywhere: four words at at (r0, ctr) */
 static void far_jump(uint32_t *at, const uint32_t *target)
@@ -376,6 +407,9 @@ static void room(uint32_t n)
     }
     if (g_free > g_half_end[1] || (uint32_t)(g_half_end[1] - g_free) < n) flush_full();
 }
+
+/* flushes so far (sys.c: a thread suspended in translated code can go back into it only if there was none) */
+unsigned long jit_flushes(void) { return g_st_flushes; }
 
 static void bc_set(uint32_t *bc, uint32_t *target)
 {
@@ -497,6 +531,10 @@ static void framecode_build(void)
     e(ADDI(3, 3, -4));
     e(LI(4, KIND_INTERRUPT));
     b_to(exit_near(p));
+    g_tabjump = p;
+    tabjump_build();
+    g_icfill = p;
+    icfill_build();
     /* code from the next page on: the translation cache is mapped there with mmap */
     g_cache_start = (uint32_t *)(((uintptr_t)p + 4095) & ~(uintptr_t)4095);
     sys_icache_invalidate(g_cache, (size_t)((uint8_t *)p - (uint8_t *)g_cache));
@@ -514,6 +552,10 @@ static void framecode_build(void)
     e(ADDI(3, 3, -4));
     e(LI(4, KIND_INTERRUPT));
     b_to(g_exit2);
+    g_tabjump2 = p;
+    tabjump_build();
+    g_icfill2 = p;
+    icfill_build();
     sys_icache_invalidate(g_half2, (size_t)((uint8_t *)p - (uint8_t *)g_half2));
     g_half2_code = (uint32_t *)(((uintptr_t)p + 4095) & ~(uintptr_t)4095);
     g_half_end[0] = g_half2 - POOL_WORDS;
@@ -903,6 +945,7 @@ static int jit_create(void)
     g_no_taken = getenv("ROSETTA_NO_TAKEN") != 0;
     g_no_far = getenv("ROSETTA_NO_FAR") != 0;
     g_no_mmx = getenv("ROSETTA_NO_MMX") != 0;
+    g_ret_ic = getenv("ROSETTA_RET_IC") != 0;
     g_no_dead = !getenv("ROSETTA_DEAD");   /* off: no measurable gain (sha1 1.10 s against 1.11 s, realworld equal) */
     g_dead_log = getenv("ROSETTA_DEAD_LOG") != 0;
     if (getenv("ROSETTA_DEAD_WINDOW")) sscanf(getenv("ROSETTA_DEAD_WINDOW"), "%d,%d", &g_dead_window, &g_dead_writes);
@@ -1896,7 +1939,8 @@ static void indirect(void)
     int k;
     for (k = 0; k < g_ic_ways; k++) {
         ic[k] = p;
-        e(B_(0));                       /* becomes lis r4,eip>>16 */
+        if (g_ret_ic) e(B_(0));         /* (fill exit of its own, below) */
+        else e(BL_((uint32_t)(uintptr_t)icfill_near(p) - (uint32_t)(uintptr_t)p));   /* becomes lis r4,eip>>16 */
         e(ORI(4, 4, 0));
         e(CMPLW(0, 3, 4));
         e(BC_(BO_FALSE, CR_EQ, 8));    /* no: next entry */
@@ -1912,7 +1956,7 @@ static void indirect(void)
     e(BCTR);
     e(LI(4, KIND_NORMAL));
     b_to(exit_near(p));
-    for (k = 0; k < g_ic_ways; k++) {
+    for (k = 0; k < g_ic_ways && g_ret_ic; k++) {
         fill = p;
         load_imm(4, (uint32_t)(uintptr_t)ic[k] | 1);
         b_to(exit_near(p));
@@ -7624,7 +7668,7 @@ static uint32_t *stub_block(uint32_t eip, Stub fn)
     e(LWBRX(3, 0, R(ESP)));
     e(ADDI(R(ESP), R(ESP), 4));
     shadow_back();
-    indirect();
+    b_to(tabjump_near(p));
     g_free = p;
     sys_icache_invalidate(start, (size_t)((uint8_t *)p - (uint8_t *)start));
     map_add(eip, start);
@@ -8404,7 +8448,8 @@ static uint32_t *translate_block(uint32_t eip)
             e(ADDI(R(ESP), R(ESP), x->op == 0xc2 ? 4 + (int)(x->imm & 0xffff) : 4));
             if (afterwards[i]) flags_put();
             shadow_back();
-            indirect();                     /* shadow stack does not match: through the table */
+            if (g_ret_ic) indirect();       /* shadow stack does not match: through the table */
+            else b_to(tabjump_near(p));
             break;
         case JUMP_IND: case CALL_IND: {
             int v;
