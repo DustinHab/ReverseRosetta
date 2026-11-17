@@ -419,8 +419,8 @@ well.
 
 ## License
 
-You may build and use ReverseRosetta, privately and professionally, also with changes of your own; publishing,
-redistributing or selling it, changed or not, is not permitted. See [LICENSE](LICENSE).
+MIT License, see [LICENSE](LICENSE). The Intel libraries the translator needs are not part of this repository; they
+come from Apple's own update under Apple's terms (see [Getting the Intel libraries](#getting-the-intel-libraries)).
 
 Apple, Mac, Mac OS X, macOS and Rosetta are trademarks of Apple Inc. This project is not affiliated with or
 endorsed by Apple. Transmission is a trademark of its respective owners.
