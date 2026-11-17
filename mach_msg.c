@@ -13,6 +13,7 @@
 #include "thread.h"
 #include "jit.h"
 #include "gl.h"
+#include "macho.h"
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -840,8 +841,46 @@ void mach_trap(Cpu *c, int n, uint32_t base)
                                ld32(m + 48));
             st32(m + 48, 0);
         }
-        if (id == 3802 && ld32(m + 8) == mach_task_self() && arg(2) >= 40) sys_shared_forget(ld32(m + 32), ld32(m + 36));
-        if (id == 4801 && ld32(m + 8) == mach_task_self() && arg(2) >= 48) sys_shared_forget(ld32(m + 32), ld32(m + 40));
+        /* vm_allocate(anywhere) right after dyld read a library's Mach header: first at the place the run that wrote
+           the translation cache had it (jit_cached_image), so the translated blocks of a library without a fixed
+           address stay valid; if that place is taken, as the guest asked */
+        /* vm_allocate / mach_vm_allocate at a fixed address: a range held for a library of the saved run gives way */
+        if (id == 3801 && ld32(m + 8) == mach_task_self() && send_size >= 44 && !(ld32(m + 40) & VM_FLAGS_ANYWHERE))
+            jit_hold_release(ld32(m + 32), ld32(m + 36), 0);
+        if (id == 4800 && ld32(m + 8) == mach_task_self() && send_size >= 52 && !(ld32(m + 48) & VM_FLAGS_ANYWHERE))
+            jit_hold_release(ld32(m + 32), ld32(m + 40), 0);
+        if (id == 3801 && ld32(m + 8) == mach_task_self() && send_size >= 44 && (opt & MACH_RCV_MSG) &&
+            (ld32(m + 40) & VM_FLAGS_ANYWHERE)) {
+            uint32_t off, want;
+            int fd = sys_macho_taken(&off);
+            if (fd >= 0 && (want = jit_cached_image(fd, off)) >= RESERVE_END) {
+                uint8_t save[44];
+                memcpy(save, (void *)(uintptr_t)m, sizeof save);
+                jit_hold_release(want, ld32(m + 36), 0);
+                st32(m + 32, want);
+                st32(m + 40, ld32(m + 40) & ~(uint32_t)VM_FLAGS_ANYWHERE);
+                c->r[EAX] = (uint32_t)guest_mach_msg(c, m, (mach_msg_option_t)opt, send_size, arg(3), arg(4), arg(5), arg(6));
+                /* the body of the reply comes in the kernel's byte order, its NDR record says which (int_rep at 28:
+                   0 big endian); the guest's MIG stub converts it itself */
+                if (c->r[EAX] == 0 && ld32(m + 4) >= 40 && ld32(m + 32) == 0 &&
+                    (ld8(m + 28) ? ld32(m + 36) : swap32(ld32(m + 36))) == want) {
+                    if (g_log) fprintf(stderr, "[vm_allocate] library at %08x as in the translation cache\n", want);
+                    return;
+                }
+                if (g_log) fprintf(stderr, "[vm_allocate] library at %08x as in the translation cache: taken (%x, reply %u %08x %08x)\n",
+                                   want, c->r[EAX], ld32(m + 4), ld32(m + 32), ld32(m + 36));
+                memcpy((void *)(uintptr_t)m, save, sizeof save);    /* taken: as the guest asked */
+            } else if (g_log && fd >= 0) fprintf(stderr, "[vm_allocate] after the Mach header of descriptor %d (offset %x): %08x in the translation cache\n",
+                                      fd, off, fd >= 0 ? jit_cached_image(fd, off) : 0);
+        }
+        if (id == 3802 && ld32(m + 8) == mach_task_self() && arg(2) >= 40) {
+            sys_shared_forget(ld32(m + 32), ld32(m + 36));
+            jit_hold_release(ld32(m + 32), ld32(m + 36), 1);
+        }
+        if (id == 4801 && ld32(m + 8) == mach_task_self() && arg(2) >= 48) {
+            sys_shared_forget(ld32(m + 32), ld32(m + 40));
+            jit_hold_release(ld32(m + 32), ld32(m + 40), 1);
+        }
         /* freeing or protecting in the own task (vm_deallocate, vm_protect, mach_vm_deallocate/-protect): never in the
            host library range */
         if ((id == 3802 || id == 3803) && ld32(m + 8) == mach_task_self() && arg(2) >= 40)

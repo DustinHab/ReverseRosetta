@@ -34,6 +34,9 @@ void sig_deliver(Cpu *c);
 void sys_make_private(uint32_t a, uint32_t len);
 /* [a, a + len) freed or mapped anew (vm_deallocate): no longer a shared-mapped file range */
 void sys_shared_forget(uint32_t a, uint32_t len);
+/* descriptor and architecture offset of the i386 Mach header the guest read last with pread (-1: none since the
+   last call); taken once */
+int sys_macho_taken(uint32_t *off);
 
 /* [a, a + len) touches the shared library region of the host (0x90000000-0xb0000000): freeing, mapping over or
    changing protection there destroys rosetta itself. Reports with the caller (was) and returns 1 */

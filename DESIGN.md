@@ -342,6 +342,27 @@ class, exceptions) produce byte-identical output to native (run_tests.sh: 22 com
   one held: Firefox hung at startup. The handlers could not use PowerPC thread states anyway; guest faults reach the
   guest as signals. The record of memory calls (`sys_mem_note`) now reads the guest's ebp chain through the read
   probe: code without frame pointers (jemalloc) leaves anything in ebp.
+- **Translation cache for programs with their own libraries** (17 Nov; jit.c `jit_cached_image`, holds,
+  `g_cache_cap`; mach_msg.c, vm_allocate): Firefox's 32 libraries have no fixed address (vmaddr 0). dyld reserves
+  space for each with `vm_allocate(anywhere)`, so they landed elsewhere in every run and their cached blocks were
+  discarded; a start that loaded the cache flushed and deleted it, the next one wrote it again (14 and 7 s in turn).
+  Now: dyld reads a library's Mach header with `pread` before it reserves space (sys.c notes descriptor and offset);
+  the `vm_allocate(anywhere)` right after it first tries, at a fixed address, the place the cache's run had for that
+  file (inode, size, time, offset); if that is taken, as the guest asked. The body of the reply comes in the kernel's
+  byte order, which its NDR record states (the guest's MIG stub converts it itself), so the check reads it that way.
+  Holds: the address ranges of the saved run's libraries are reserved without access as soon as the cache file's
+  image list is read, before the translator allocates the tables of the loaded cache (those landed exactly where the
+  saved run, which had no such tables, put the first libraries) and before any allocation of the guest. A
+  temporary mapping no longer lands on translated pages either: Firefox maps libxul (68 MB) whole to read it ahead
+  and unmaps it before dyld loads it; landing on the saved libxul it discarded 13,000 blocks. Fixed requests of the
+  guest (`vm_allocate`/`mach_vm_allocate` without anywhere, `mmap(MAP_FIXED)`) take a held range over;
+  `ROSETTA_NO_HOLD=1`. The code region grew from 24 to 32 MB, the reach of `b` (blocks chain with relative jumps).
+  Firefox's startup alone is 30 MB of code: a cache with all of it left a start that loads it no room for what it
+  translates anew (the JIT's code, other paths), the region ran full and everything was discarded. The file
+  therefore keeps the code up to 20 MB (`ROSETTA_CACHE_CAP_MB`; a checkpoint is written when the code reaches it,
+  later writes of the run leave it), and a flush only because the region is full no longer deletes it. Firefox:
+  first start 14.9 s (9.5 s processor), every further one 9.6 to 9.7 s (4.5 s); 32 libraries placed, nothing
+  discarded, no flush up to the idle moment.
 - **Own prebinding** (`tools/prebind.c`, `intel_prebind.sh`): Apple's i386 libraries are not built prebound
   (`redo_prebinding`: "file is not prebound"). dyld skips binding an image if it carries MH_PREBOUND, sits at its
   address and the timestamps of its dependencies match; then `setupLazyPointerHandler` does not reset the jump tables

@@ -123,9 +123,13 @@ from the third start on almost nothing is translated:
 |---|---|---|---|
 | Calculator.app | 5.6 s / 4.7 s | 2.0 s / 1.7 s | 1.8 s / 1.6 s |
 | Transmission 2.42 | 10.4 s / 7.4 s | 3.5 s / 3.1 s | 3.5 to 4.0 s / 3.0 s |
+| Firefox 16.0.2 (a local page) | 14.9 s / 9.5 s | 9.7 s / 4.6 s | 9.6 to 9.7 s / 4.5 s |
 
 Transmission's wall time includes waiting for name lookups (DirectoryService answered its three queries in 1.4 s
-in one start); its processor time is what the translation costs. Measured on 17 Nov with the translator of that day.
+in one start); its processor time is what the translation costs. Firefox's startup alone is 30 MB of translated code;
+its translation cache keeps the first 20 MB of it, so that a start that loads it has room in the 32 MB code region for
+the rest and for the code its JavaScript JIT generates: every start translates the last third again. Measured on
+17 Nov with the translator of that day.
 
 Measured from outside in the same way for both (the window polled every 0.2 s, which costs processor time
 itself), Calculator's window appears after 3.6 to 3.9 s with a filled translation cache and after 2.3 to 2.6 s for
@@ -336,6 +340,7 @@ functions report `rosetta-stub: NAME missing` on the first call and return an er
 | `ROSETTA_NO_CHECKPOINT=1` | write the translation cache only at the end |
 | `ROSETTA_CACHE_FILE=FILE` | use this file as the translation cache (tests) |
 | `ROSETTA_CACHE_MAX_MB=N` | translation caches of all programs together at most N MB (default 256; the ones used longest ago are deleted) |
+| `ROSETTA_CACHE_CAP_MB=N` | code in one program's translation cache at most N MB (default 20 of the 32 MB code region) |
 | `ROSETTA_HOST_CPU=1` | show the guest the real PowerPC processor instead of the Intel one |
 | `ROSETTA_STATS=1` | translator counters and times at exit; at the first idle moment processor time, page faults, system calls, Mach messages by id and interpreted opcodes of the startup |
 | `ROSETTA_LOG=1` | log of system calls and Mach traps, with paths and service names (`=2`: with time and thread, `=3`: also the words of every Mach message) |

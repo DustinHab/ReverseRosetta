@@ -82,6 +82,19 @@ static void shared_forget(uint32_t a, uint32_t len)
 
 void sys_shared_forget(uint32_t a, uint32_t len) { shared_forget(a, len); }
 
+/* the i386 Mach header the guest read last with pread (descriptor, file offset of the architecture): dyld does this
+   right before it reserves space for a library that has no fixed address */
+static int g_macho_fd = -1;
+static uint32_t g_macho_off;
+
+int sys_macho_taken(uint32_t *off)
+{
+    int fd = g_macho_fd;
+    *off = g_macho_off;
+    g_macho_fd = -1;
+    return fd;
+}
+
 /* before write access to [a, a + len): replace shared mappings in it with private copies */
 void sys_make_private(uint32_t a, uint32_t len)
 {
@@ -1800,6 +1813,7 @@ static void sys_bsd_call(Cpu *c, int sysenter)
     }
     case SYS_close:
         if (sys_own_fd((int)arg(0))) { set_result(c, 0, 0); return; }   /* the translator's: the guest never had it */
+        if ((int)arg(0) == g_macho_fd) g_macho_fd = -1;
         jit_fd_off((int)arg(0));
         HOST(close((int)arg(0)));
         return;
@@ -1836,7 +1850,13 @@ static void sys_bsd_call(Cpu *c, int sysenter)
         set_result(c, (uint32_t)p[0], 0);
         return;
     }
-    case SYS_pread: HOST(pread((int)arg(0), PTR_ARG(1), arg(2), (off_t)arg64(3))); return;
+    case SYS_pread: {
+        ssize_t r = pread((int)arg(0), PTR_ARG(1), arg(2), (off_t)arg64(3));
+        /* dyld reads the Mach header of a library before it reserves space for it (mach_msg.c, vm_allocate) */
+        if (r >= 28 && ld32(arg(1)) == 0xfeedface && ld32(arg(1) + 4) == 7) { g_macho_fd = (int)arg(0); g_macho_off = arg(3); }
+        HOST(r);
+        return;
+    }
     case 313 ... 320: sys_aio(c, n); return;  /* asynchronous I/O (synchronously) */
     case SYS_pwrite: HOST(pwrite((int)arg(0), PTR_ARG(1), arg(2), (off_t)arg64(3))); return;
     case SYS_lseek: {
@@ -1874,6 +1894,7 @@ static void sys_bsd_call(Cpu *c, int sysenter)
             if (r != MAP_FAILED) shared_forget((uint32_t)(uintptr_t)r, len);
         }
         if (r == MAP_FAILED) { set_result(c, 0, errno); return; }
+        if (flags & MAP_FIXED) jit_hold_release(a, len, 1);    /* replaced what was held there for a library */
         /* Code at this address may have changed; not when dyld places a library from the translation cache at its
            address (jit_mapping_expected) */
         if (flags & MAP_FIXED)
@@ -1885,7 +1906,8 @@ static void sys_bsd_call(Cpu *c, int sysenter)
     case SYS_munmap:
         sys_mem_note(c, 'u', arg(0), arg(1));
         if (sys_host_range(c, arg(0), arg(1), "munmap")) { set_result(c, 0, EINVAL); return; }
-        jit_flush_schedule(arg(0), arg(1)); shared_forget(arg(0), arg(1)); HOST(munmap(PTR_ARG(0), arg(1))); return;
+        jit_flush_schedule(arg(0), arg(1)); shared_forget(arg(0), arg(1)); jit_hold_release(arg(0), arg(1), 1);
+        HOST(munmap(PTR_ARG(0), arg(1))); return;
     case SYS_mprotect:
         sys_mem_note(c, 'p', arg(0), arg(1));
         if (sys_host_range(c, arg(0), arg(1), "mprotect")) { set_result(c, 0, EINVAL); return; }
