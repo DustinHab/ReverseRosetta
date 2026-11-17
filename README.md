@@ -123,7 +123,7 @@ from the third start on almost nothing is translated:
 
 | Program | 1st start | 2nd start | from the 3rd start |
 |---|---|---|---|
-| Calculator.app | 5.6 s / 4.7 s | 2.0 s / 1.7 s | 1.8 s / 1.6 s |
+| Calculator.app | 5.7 s / 4.3 s | 2.1 s / 1.4 s | 2.0 s / 1.4 s |
 | Transmission 2.42 | 10.4 s / 7.4 s | 3.5 s / 3.1 s | 3.5 to 4.0 s / 3.0 s |
 | Firefox 16.0.2 (a local page) | 12.8 s / 9.2 s | 8.1 s / 2.7 s | 2.8 to 6.0 s / 1.1 to 2.7 s |
 
@@ -135,8 +135,8 @@ it is idle for the first time varies with the page and the JIT. Measured on 17 N
 
 Measured from outside in the same way for both (the window polled every 0.2 s, which costs processor time
 itself), Calculator's window appears after 3.6 to 3.9 s with a filled translation cache and after 2.3 to 2.6 s for
-the native PowerPC build (measured on 16 Nov). At startup the translated Calculator uses 1.6 s of processor time once
-its translation cache is filled (4.7 s at the very first start), the native one 0.66 s.
+the native PowerPC build (measured on 16 Nov). At startup the translated Calculator uses 1.4 s of processor time once
+its translation cache is filled (4.3 s at the very first start; measured on 17 Nov), the native one 0.66 s.
 
 ## What runs
 
@@ -400,7 +400,7 @@ well.
   (`tools/sdk_stubs_all.sh`, `tools/app_stubs.sh`, `tools/stubs_rebuild_all.sh`). Calculator's engine is the exception: it runs as the native
   PowerPC function.
 - Programs with windows start slowly the first two times (see the table under Performance). With the translation
-  cache filled, Calculator still uses about 2.5 times the processor time of the native build at startup, most of it
+  cache filled, Calculator still uses about 2 times the processor time of the native build at startup, most of it
   in translated guest code (dyld binding, the Objective-C runtime, CoreFoundation).
 - OpenGL: immediate mode with scalar arguments and glGet reach about 80 % of the native speed (the table under
   Performance). Tested with NSOpenGLView windows and CGL pbuffers; AGL and GLUT programs are untested.
